@@ -1,0 +1,8 @@
+/target/
+/dist/
+/.cef/
+/.test-data/
+/artifacts/*.log
+.DS_Store
+__pycache__/
+*.pyc

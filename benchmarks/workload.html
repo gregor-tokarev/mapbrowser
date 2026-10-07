@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Controlled browser workload</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f4f3f0; color: #253630; font: 15px/1.5 system-ui, sans-serif; }
+    main { width: 760px; margin: 32px auto; padding: 28px; background: white; border: 1px solid #ddd; border-radius: 12px; }
+    h1 { font-size: 28px; margin: 0 0 8px; }
+    p { margin: 8px 0 20px; }
+    #status { padding: 12px; background: #e7efe9; font-variant-numeric: tabular-nums; }
+    canvas { display: block; width: 620px; height: 220px; margin: 20px auto; border: 1px solid #ccd8ce; }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td { text-align: left; padding: 7px 12px; border-bottom: 1px solid #e9e9e9; }
+    .changed { background: #e7efe9; }
+  </style>
+  <script src="/workload.js" defer></script>
+</head>
+<body>
+  <main>
+    <h1 id="heading">Controlled browser workload</h1>
+    <p>Local content with identical work in each browser. No remote fonts, images or network requests during the measured interval.</p>
+    <div id="status">Preparing workload</div>
+    <canvas id="chart" width="620" height="220"></canvas>
+    <table><thead><tr><th>Item</th><th>Category</th><th>Value</th></tr></thead><tbody id="rows"></tbody></table>
+  </main>
+</body>
+</html>

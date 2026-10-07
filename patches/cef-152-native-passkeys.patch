@@ -1,0 +1,26 @@
+diff --git a/chrome/browser/webauthn/chrome_authenticator_request_delegate.cc b/chrome/browser/webauthn/chrome_authenticator_request_delegate.cc
+--- a/chrome/browser/webauthn/chrome_authenticator_request_delegate.cc
++++ b/chrome/browser/webauthn/chrome_authenticator_request_delegate.cc
+@@ -1200,11 +1200,18 @@
+   // into a new profile does not. Thus the NSWindow is fetched more directly.
+   const views::Widget* widget = views::Widget::GetTopLevelWidgetForNativeView(
+       web_contents->GetNativeView());
++  gfx::NativeWindow window;
+   if (widget) {
+-    const gfx::NativeWindow window = widget->GetNativeWindow();
+-    if (window) {
+-      discovery_factory->set_nswindow(window);
+-    }
++    window = widget->GetNativeWindow();
++  }
++  if (!window) {
++    // Native embedders such as CEF Alloy can attach WebContents directly to
++    // an NSWindow without a Views Widget. On macOS this resolves the window
++    // from the in-process WebContents NSView before consulting its delegate.
++    window = web_contents->GetTopLevelNativeWindow();
++  }
++  if (window) {
++    discovery_factory->set_nswindow(window);
+   }
+ }
+ void ChromeAuthenticatorRequestDelegate::ConfigureICloudKeychain(

@@ -1,0 +1,4 @@
+[env]
+# Share one CEF download between cargo check, debug builds and release builds.
+# cef-dll-sys downloads this automatically on the first build.
+CEF_PATH = { value = "target/cef", relative = true }
