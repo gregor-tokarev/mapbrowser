@@ -2,11 +2,16 @@
 //! process lifetime; GPUI only draws the browser controls.
 
 mod blocking;
+mod commands;
+mod find;
 mod modifiers;
+mod page_keys;
+mod popups;
+mod protocols;
 
 use super::{
     EditCommand, EngineEvent, Modifiers, edit_command, merge_features, opens_in_tab,
-    progress_worth_reporting, shortcut_character, shortcut_for_key,
+    progress_worth_reporting,
 };
 use crate::blocker::ContentBlocker;
 use crate::native::CornerCaps;
@@ -21,10 +26,10 @@ use objc2::{
     sel,
 };
 use objc2_app_kit::{
-    NSApplication, NSAutoresizingMaskOptions, NSEvent, NSEventMask, NSEventModifierFlags, NSView,
-    NSWindow,
+    NSApplication, NSAutoresizingMaskOptions, NSEvent, NSEventMask, NSView, NSWindow,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSPoint, NSRect, NSSize};
+use page_keys::{KEY_ESCAPE, KeyPress};
 use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
@@ -70,8 +75,6 @@ const FAVICON_SIZE: u32 = 32;
 const FAVICON_SCALE: f32 = 2.;
 const MENU_OPEN_LINK: i32 = sys::cef_menu_id_t::MENU_ID_USER_FIRST as i32;
 const MENU_COPY_LINK: i32 = MENU_OPEN_LINK + 1;
-/// kVK_Escape.
-const KEY_ESCAPE: u16 = 53;
 
 /// Browser lifecycle state shared with CEF callbacks. A tab can be closed (or
 /// unloaded) and created again before Chromium has finished closing its old
@@ -88,6 +91,15 @@ struct PendingBrowsers {
     live: HashMap<u64, Browser>,
     started_navigation: HashSet<u64>,
     initialized_surface: HashSet<u64>,
+    /// Popup and DevTools windows by browser identifier; see `popups`.
+    popups: HashMap<i32, Browser>,
+}
+
+impl PendingBrowsers {
+    /// Whether every browser has closed, so quitting can go on.
+    fn all_closed(&self) -> bool {
+        self.live.is_empty() && self.requested.is_empty() && self.popups.is_empty()
+    }
 }
 
 struct ReadyBrowser {
@@ -214,6 +226,8 @@ wrap_client! {
         life: LifeSpanHandler,
         menu: ContextMenuHandler,
         requests: RequestHandler,
+        keys: KeyboardHandler,
+        find: FindHandler,
     }
     impl Client {
         fn display_handler(&self) -> Option<DisplayHandler> {
@@ -231,6 +245,12 @@ wrap_client! {
         fn request_handler(&self) -> Option<RequestHandler> {
             Some(self.requests.clone())
         }
+        fn keyboard_handler(&self) -> Option<KeyboardHandler> {
+            Some(self.keys.clone())
+        }
+        fn find_handler(&self) -> Option<FindHandler> {
+            Some(self.find.clone())
+        }
     }
 }
 
@@ -242,7 +262,9 @@ fn tab_client(link: BrowserLink) -> Client {
         TabLoad::new(link.clone()),
         TabLife::new(link.clone()),
         TabMenu::new(link.clone()),
-        TabRequests::new(link),
+        TabRequests::new(link.clone()),
+        page_keys::PageKeys::new(link.clone(), false),
+        find::TabFind::new(link),
     )
 }
 
@@ -318,8 +340,10 @@ wrap_download_image_callback! {
                 if png.is_none() && !matches!(http_status_code, 200..=299 | 404 | 410) { return; }
                 page.favicon_done = Some(self.key.clone());
             }
-            if let Some(png) = png {
-                self.link.send(EngineEvent::Favicon { tab_id: self.link.tab_id, png });
+            // Filed under the page it was fetched for, which the tab may
+            // have left meanwhile; pages without a host get none.
+            if let (Some(png), Some(host)) = (png, self.key.0.clone()) {
+                self.link.send(EngineEvent::Favicon { tab_id: self.link.tab_id, host, png });
             }
         }
     }
@@ -390,16 +414,13 @@ wrap_life_span_handler! {
                 link.send(EngineEvent::Created { tab_id: link.tab_id });
             }
         }
-        fn on_before_popup(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, _popup_id: i32, target_url: Option<&CefString>, _target_frame_name: Option<&CefString>, target_disposition: WindowOpenDisposition, user_gesture: i32, _popup_features: Option<&PopupFeatures>, _window_info: Option<&mut WindowInfo>, _client: Option<&mut Option<Client>>, _settings: Option<&mut BrowserSettings>, _extra_info: Option<&mut Option<DictionaryValue>>, _no_javascript_access: Option<&mut i32>) -> i32 {
-            // target=_blank links and window.open. ⌘- and middle-clicks on
-            // them ask for a tab behind this one; the same clicks on plain
-            // links arrive in TabRequests::on_open_urlfrom_tab instead.
-            if user_gesture != 0 {
-                let background = target_disposition == WindowOpenDisposition::NEW_BACKGROUND_TAB;
-                let url = target_url.map(ToString::to_string).unwrap_or_default();
-                request_tab(&self.link, frame.as_deref(), url, background);
-            }
-            1
+        fn on_before_popup(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, _popup_id: i32, target_url: Option<&CefString>, _target_frame_name: Option<&CefString>, target_disposition: WindowOpenDisposition, user_gesture: i32, popup_features: Option<&PopupFeatures>, window_info: Option<&mut WindowInfo>, client: Option<&mut Option<Client>>, _settings: Option<&mut BrowserSettings>, _extra_info: Option<&mut Option<DictionaryValue>>, _no_javascript_access: Option<&mut i32>) -> i32 {
+            // target=_blank links and window.open: tabs, or popup windows
+            // for sign-in. ⌘- and middle-clicks on them ask for a tab behind
+            // this one; the same clicks on plain links arrive in
+            // TabRequests::on_open_urlfrom_tab instead.
+            let url = target_url.map(ToString::to_string).unwrap_or_default();
+            i32::from(popups::before_popup(&self.link, frame.as_deref(), url, target_disposition, user_gesture != 0, popup_features, window_info, client))
         }
         fn do_close(&self, browser: Option<&mut Browser>) -> i32 {
             // Closing a tab must destroy its child NSView, never its GPUI window.
@@ -437,7 +458,7 @@ wrap_life_span_handler! {
                 if !superseded {
                     pending.current.remove(&link.tab_id);
                 }
-                (pending.shutting_down && pending.live.is_empty() && pending.requested.is_empty(), !superseded)
+                (pending.shutting_down && pending.all_closed(), !superseded)
             };
             let was_fullscreen = {
                 let mut keys = link.keys();
@@ -502,7 +523,8 @@ fn frame_url(frame: Option<&Frame>) -> String {
 }
 
 /// Asks the shell for a tab showing `url` if a tab can show it; `opener` is
-/// the frame that asked. See `opens_in_tab`.
+/// the frame that asked. See `opens_in_tab`. Mail and phone links open their
+/// app instead; callers only get here after a click.
 fn request_tab(link: &BrowserLink, opener: Option<&Frame>, url: String, background: bool) {
     if opens_in_tab(&url, &frame_url(opener)) {
         link.send(EngineEvent::OpenTab {
@@ -510,6 +532,8 @@ fn request_tab(link: &BrowserLink, opener: Option<&Frame>, url: String, backgrou
             url,
             background,
         });
+    } else {
+        protocols::open_in_app(&url);
     }
 }
 
@@ -530,6 +554,10 @@ wrap_request_handler! {
                 request_tab(&self.link, frame.as_deref(), url, background);
             }
             1
+        }
+        fn on_before_browse(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, request: Option<&mut Request>, user_gesture: i32, _is_redirect: i32) -> i32 {
+            let url = request.map(|request| CefString::from(&request.url()).to_string()).unwrap_or_default();
+            i32::from(protocols::handled_outside(&url, user_gesture != 0))
         }
     }
 }
@@ -663,10 +691,9 @@ impl Engine {
             let (browsers, can_quit) = {
                 let mut pending = quit_pending.lock().expect("pending browser state");
                 pending.shutting_down = true;
-                (
-                    pending.live.values().cloned().collect::<Vec<_>>(),
-                    pending.live.is_empty() && pending.requested.is_empty(),
-                )
+                // Popup and DevTools windows close with the tabs.
+                let browsers = pending.live.values().chain(pending.popups.values());
+                (browsers.cloned().collect::<Vec<_>>(), pending.all_closed())
             };
             if can_quit {
                 quit_message_loop();
@@ -1055,7 +1082,6 @@ impl Engine {
             browser.reload();
         }
     }
-    #[allow(dead_code)]
     pub fn stop(&self, tab_id: u64) {
         if let Some(browser) = self.live_browser(tab_id) {
             browser.stop_load();
@@ -1127,10 +1153,16 @@ impl Engine {
             keys.browser = None;
             keys.fullscreen = None;
         }
-        self.pending
-            .lock()
-            .expect("pending browser state")
-            .shutting_down = true;
+        let popups: Vec<Browser> = {
+            let mut pending = self.pending.lock().expect("pending browser state");
+            pending.shutting_down = true;
+            pending.popups.values().cloned().collect()
+        };
+        // Popup and DevTools windows normally closed with the quit request;
+        // the wait below covers them too.
+        for host in popups.iter().filter_map(|browser| browser.host()) {
+            host.close_browser(1);
+        }
         let ready = std::mem::take(&mut self.pending.lock().expect("pending browser state").ready);
         for ReadyBrowser { browser, .. } in ready {
             if let Some(view) = browser_view(&browser) {
@@ -1260,6 +1292,14 @@ impl Engine {
         }
     }
 
+    /// Moves an attached child window's top-left corner to `x`, `y` in the
+    /// browser window (top-left logical pixels, as GPUI measures).
+    pub fn place_child_window(&self, child_view: *mut c_void, x: f64, y: f64) {
+        if let (Some(parent), Some(child)) = (self.parent_view(), child_view_ref(child_view)) {
+            crate::native::place_child_window(parent, child, NSPoint::new(x, y));
+        }
+    }
+
     /// Hides the close, minimize and zoom buttons while the sidebar is hidden.
     pub fn set_traffic_lights_hidden(&self, hidden: bool) {
         if let Some(parent) = self.parent_view() {
@@ -1340,8 +1380,8 @@ fn install_key_monitor(
         let e = unsafe { event.as_ref() };
         let mtm = MainThreadMarker::new().expect("native event on main thread");
         // Only keys for the browser window itself. The command bar handles
-        // its own (GPUI binds the same shortcuts there), and file panels,
-        // dialogs and other sheets keep theirs.
+        // its own (GPUI binds the same shortcuts there), popup windows have
+        // PageKeys, and file panels, dialogs and other sheets keep theirs.
         let container = keys.lock().expect("key routing state").container;
         let Some(window) = e
             .window(mtm)
@@ -1356,36 +1396,29 @@ fn install_key_monitor(
         {
             return event.as_ptr();
         }
-        let flags = e.modifierFlags();
-        let modifiers = Modifiers {
-            command: flags.contains(NSEventModifierFlags::Command),
-            control: flags.contains(NSEventModifierFlags::Control),
-            option: flags.contains(NSEventModifierFlags::Option),
-            shift: flags.contains(NSEventModifierFlags::Shift),
-        };
-        let key = e.keyCode();
-        let character = shortcut_character(
-            &text(e.characters()),
-            &text(e.charactersIgnoringModifiers()),
-            key,
-        );
-        if handle_in_page(&window, key, character, modifiers, &keys) {
+        let press = KeyPress::from_ns_event(e);
+        if handle_in_page(&window, press.key, press.character, press.modifiers, &keys) {
             return std::ptr::null_mut();
         }
-        if let Some(shortcut) = shortcut_for_key(key, character, modifiers) {
-            let _ = events.try_send(EngineEvent::Shortcut(shortcut));
-            std::ptr::null_mut()
-        } else {
-            event.as_ptr()
+        let Some(shortcut) = press.shortcut() else {
+            return event.as_ptr();
+        };
+        // A focused page gets all but the reserved shortcuts first. GPUI's
+        // view would claim them before the page's view is asked, so the
+        // page's view gets them directly; PageKeys runs those it ignores.
+        if !shortcut.reserved() && page_has_focus(&window, container) {
+            return if page_keys::send_to_page(&window, e) {
+                std::ptr::null_mut()
+            } else {
+                event.as_ptr()
+            };
         }
+        let _ = events.try_send(EngineEvent::Shortcut(shortcut));
+        std::ptr::null_mut()
     });
     // SAFETY: The handler returns either the event or null to consume it, as
     // local monitors must; AppKit copies the block.
     unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &block) }
-}
-
-fn text(string: Option<Retained<NSString>>) -> String {
-    string.map(|string| string.to_string()).unwrap_or_default()
 }
 
 /// Whether `window` holds the web container, at address `container` (or 0

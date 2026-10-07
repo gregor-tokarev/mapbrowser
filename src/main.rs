@@ -89,6 +89,16 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-d", Browse(TogglePin), None),
         KeyBinding::new("cmd-shift-c", Browse(CopyUrl), None),
         KeyBinding::new("cmd-shift-k", Browse(ClearToday), None),
+        // The first binding of an action is the one the menu bar shows.
+        KeyBinding::new("cmd-+", Browse(ZoomIn), None),
+        KeyBinding::new("cmd-=", Browse(ZoomIn), None),
+        KeyBinding::new("cmd--", Browse(ZoomOut), None),
+        KeyBinding::new("cmd-0", Browse(ZoomReset), None),
+        KeyBinding::new("cmd-.", Browse(Stop), None),
+        KeyBinding::new("alt-cmd-i", Browse(DevTools), None),
+        KeyBinding::new("cmd-f", Browse(Find), None),
+        KeyBinding::new("cmd-g", Browse(FindNext), None),
+        KeyBinding::new("cmd-shift-g", Browse(FindPrevious), None),
     ];
     for digit in 1..=9u8 {
         bindings.push(KeyBinding::new(
@@ -146,6 +156,15 @@ fn menus() -> Vec<Menu> {
                 MenuItem::os_action("Copy", input::Copy, OsAction::Copy),
                 MenuItem::os_action("Paste", input::Paste, OsAction::Paste),
                 MenuItem::os_action("Select All", input::SelectAll, OsAction::SelectAll),
+                MenuItem::separator(),
+                MenuItem::submenu(Menu {
+                    name: "Find".into(),
+                    items: vec![
+                        MenuItem::action("Find…", Browse(Find)),
+                        MenuItem::action("Find Next", Browse(FindNext)),
+                        MenuItem::action("Find Previous", Browse(FindPrevious)),
+                    ],
+                }),
             ],
         ),
         menu(
@@ -154,8 +173,15 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Toggle Sidebar", Browse(ToggleSidebar)),
                 MenuItem::separator(),
                 MenuItem::action("Reload Page", Browse(Reload)),
+                MenuItem::action("Stop", Browse(Stop)),
                 MenuItem::action("Back", Browse(Back)),
                 MenuItem::action("Forward", Browse(Forward)),
+                MenuItem::separator(),
+                MenuItem::action("Actual Size", Browse(ZoomReset)),
+                MenuItem::action("Zoom In", Browse(ZoomIn)),
+                MenuItem::action("Zoom Out", Browse(ZoomOut)),
+                MenuItem::separator(),
+                MenuItem::action("Developer Tools", Browse(DevTools)),
             ],
         ),
         menu(
@@ -210,6 +236,7 @@ fn main() -> anyhow::Result<()> {
     application.run(move |cx: &mut App| {
         input::init(cx);
         ui::command_bar::init(cx);
+        ui::find_bar::init(cx);
         cx.bind_keys(key_bindings());
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(|_: &About, _| native::show_about_panel());

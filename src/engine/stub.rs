@@ -3,7 +3,7 @@
 //! reports the events a quick page load would, so the shell's flows (titles,
 //! progress, navigation buttons, closing) behave as they do on macOS.
 
-use super::EngineEvent;
+use super::{EngineEvent, ZoomStep, step_zoom};
 use crate::blocker::ContentBlocker;
 use anyhow::Result;
 use async_channel::{Receiver, Sender};
@@ -25,6 +25,10 @@ pub struct Engine {
 struct History {
     entries: Vec<String>,
     index: usize,
+    /// Page zoom in percent.
+    zoom: u32,
+    /// The selected find match, 1-based; 0 without one.
+    find_active: u32,
 }
 
 impl History {
@@ -125,6 +129,8 @@ impl Engine {
             History {
                 entries: vec![url.to_owned()],
                 index: 0,
+                zoom: 100,
+                find_active: 0,
             },
         );
         self.send(EngineEvent::Created { tab_id });
@@ -169,8 +175,57 @@ impl Engine {
         self.load(tab_id);
     }
 
-    #[allow(dead_code)]
+    /// Loads finish at once here, so there is nothing to stop.
     pub fn stop(&self, _tab_id: u64) {}
+
+    /// The tab's zoom after `step`, in percent, in Chrome's steps.
+    pub fn zoom(&self, tab_id: u64, step: ZoomStep) -> Option<u32> {
+        let mut pages = self.pages.borrow_mut();
+        let page = pages.get_mut(&tab_id)?;
+        page.zoom = step_zoom(page.zoom, step);
+        Some(page.zoom)
+    }
+
+    pub fn toggle_dev_tools(&self, _tab_id: u64) {}
+
+    /// Previews have no page text: matches are counted in the page's
+    /// stand-in title and address, so the find bar shows real numbers.
+    pub fn find(&self, tab_id: u64, text: &str, forward: bool, find_next: bool) {
+        let (count, active) = {
+            let mut pages = self.pages.borrow_mut();
+            let Some(page) = pages.get_mut(&tab_id) else {
+                return;
+            };
+            let url = &page.entries[page.index];
+            let text = text.to_lowercase();
+            let count = if text.is_empty() {
+                0
+            } else {
+                let page_text = format!("{} {url}", page_title(url)).to_lowercase();
+                page_text.matches(text.as_str()).count() as u32
+            };
+            let current = page.find_active.clamp(1, count.max(1));
+            page.find_active = match count {
+                0 => 0,
+                _ if !find_next => 1,
+                _ if forward => current % count + 1,
+                _ => (current + count - 2) % count + 1,
+            };
+            (count, page.find_active)
+        };
+        self.send(EngineEvent::FindResult {
+            tab_id,
+            count,
+            active,
+            final_update: true,
+        });
+    }
+
+    pub fn stop_finding(&self, tab_id: u64) {
+        if let Some(page) = self.pages.borrow_mut().get_mut(&tab_id) {
+            page.find_active = 0;
+        }
+    }
 
     /// Whether the tab has a page. As on macOS, a `Closed` for a tab that has
     /// one again (closed and created in one go) is stale.
@@ -258,6 +313,8 @@ impl Engine {
     pub fn attach_child_window(&self, _child_view: *mut c_void) {}
     #[allow(dead_code)]
     pub fn detach_child_window(&self, _child_view: *mut c_void) {}
+    #[allow(dead_code)]
+    pub fn place_child_window(&self, _child_view: *mut c_void, _x: f64, _y: f64) {}
 }
 
 #[cfg(test)]
@@ -398,6 +455,43 @@ mod tests {
         ));
         // The shell ignores `Closed` while the tab has a page, as on macOS.
         assert!(engine.has_tab(1));
+    }
+
+    #[test]
+    fn zoom_steps_like_chrome_per_tab() {
+        let (mut engine, _events) = Engine::initialize(Path::new("/unused")).unwrap();
+        engine.create_tab(1, 1, "https://a.test/").unwrap();
+        engine.create_tab(2, 1, "https://b.test/").unwrap();
+        assert_eq!(engine.zoom(1, ZoomStep::In), Some(110));
+        assert_eq!(engine.zoom(1, ZoomStep::In), Some(125));
+        assert_eq!(engine.zoom(2, ZoomStep::Out), Some(90));
+        assert_eq!(engine.zoom(1, ZoomStep::Reset), Some(100));
+        assert_eq!(engine.zoom(3, ZoomStep::In), None);
+    }
+
+    #[test]
+    fn find_counts_matches_and_wraps_around() {
+        let (mut engine, events) = Engine::initialize(Path::new("/unused")).unwrap();
+        engine
+            .create_tab(1, 1, "https://example.com/wiki/Example")
+            .unwrap();
+        drain(&events);
+        let result = |events: &Receiver<EngineEvent>| match drain(events).as_slice() {
+            [EngineEvent::FindResult { count, active, .. }] => (*count, *active),
+            other => panic!("{other:?}"),
+        };
+        // The title "Example" and twice in the address.
+        engine.find(1, "EXAMPLE", true, false);
+        assert_eq!(result(&events), (3, 1));
+        engine.find(1, "example", true, true);
+        assert_eq!(result(&events), (3, 2));
+        engine.find(1, "example", true, true);
+        engine.find(1, "example", true, true);
+        assert_eq!(drain(&events).len(), 2);
+        engine.find(1, "example", false, true);
+        assert_eq!(result(&events), (3, 3));
+        engine.find(1, "nowhere", true, false);
+        assert_eq!(result(&events), (0, 0));
     }
 
     #[test]

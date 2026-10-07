@@ -41,8 +41,14 @@ Your tabs live in a sidebar instead of across the top. Group them into spaces, o
 | `⌘R` | Reload |
 | `⌘[` / `⌘]` | Back and forward |
 | `⇧⌘C` | Copy the address |
+| `⌘F` | Find on the page |
+| `⌘+` / `⌘−` / `⌘0` | Zoom in, out, or back to actual size |
+
+Web apps keep their own shortcuts: in an editor such as VS Code for the web or Google Docs, keys like `⇧⌘K`, `⌘[` or `⌘F` do what the app says. Opening, closing and switching tabs and spaces always works.
 
 Drag the sidebar's edge to resize it; double-click the edge to reset it. The shield beside the address turns ad and tracker blocking off for that site.
+
+Sign-in and payment windows, such as "Continue with Google" or PayPal, open as small windows and finish signing you in on the page that asked. Email and phone links open Mail and FaceTime.
 
 Spaces, tabs and selections come back when you reopen Map Browser, and the window opens where you left it, at the same size. Your browsing data stays on your Mac.
 

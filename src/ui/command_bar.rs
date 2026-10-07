@@ -36,7 +36,7 @@ const LIST_PADDING_TOP: f32 = 7.;
 const LIST_PADDING_BOTTOM: f32 = 8.;
 /// Transparent room around the panel for its shadow. X11 previews have no
 /// compositor, so there the window is exactly the panel.
-const TRANSPARENT: bool = cfg!(target_os = "macos");
+pub(super) const TRANSPARENT: bool = cfg!(target_os = "macos");
 const MARGIN: f32 = if TRANSPARENT { 48. } else { 0. };
 const MARGIN_BOTTOM: f32 = if TRANSPARENT { 72. } else { 0. };
 

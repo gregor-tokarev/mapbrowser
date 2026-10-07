@@ -36,6 +36,8 @@ icons! {
     ArrowRight => "arrow-right",
     Broom => "brush-cleaning",
     Check => "check",
+    ChevronDown => "chevron-down",
+    ChevronUp => "chevron-up",
     Close => "x",
     Copy => "copy",
     Ellipsis => "ellipsis",

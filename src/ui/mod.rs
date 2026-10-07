@@ -4,6 +4,7 @@
 pub mod command_bar;
 mod content;
 pub mod drag;
+pub mod find_bar;
 pub mod icons;
 pub mod menu;
 pub mod redraw;
@@ -125,6 +126,7 @@ impl Render for BrowserApp {
             _ => self.theme(),
         };
         let card = self.card_bounds(viewport);
+        self.sync_find_bar(card, window, cx);
         let sidebar = self
             .sidebar_width()
             .map(|width| self.render_sidebar(width, &theme, frame, cx));

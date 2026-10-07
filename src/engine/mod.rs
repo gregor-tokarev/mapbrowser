@@ -12,8 +12,10 @@ mod stub;
 #[cfg(not(target_os = "macos"))]
 pub use stub::Engine;
 
-/// Browser shortcuts. On macOS the engine's key monitor reports those pressed
-/// in the browser window, even while a web page has keyboard focus.
+/// Browser shortcuts. On macOS the engine reports those pressed in the
+/// browser window. A focused web page gets all but the reserved ones
+/// (`Shortcut::reserved`) first, as in Chrome; they run only if the page
+/// leaves the key alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shortcut {
     /// ⌘T: open the command bar to start a new tab.
@@ -54,6 +56,57 @@ pub enum Shortcut {
     CopyUrl,
     /// ⇧⌘K
     ClearToday,
+    /// ⌘+ (or ⌘=): the page larger, in Chrome's zoom steps.
+    ZoomIn,
+    /// ⌘−
+    ZoomOut,
+    /// ⌘0: the page at its default size.
+    ZoomReset,
+    /// ⌘.: stop loading the page.
+    Stop,
+    /// ⌥⌘I: open or close the page's developer tools.
+    DevTools,
+    /// ⌘F: find in the page.
+    Find,
+    /// ⌘G
+    FindNext,
+    /// ⇧⌘G
+    FindPrevious,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Shortcut {
+    /// Shortcuts taken before a focused page sees the key, Chrome's reserved
+    /// commands: opening, closing and switching tabs and spaces, and ⌘L. A
+    /// page can't keep the user in it by claiming them. Pages get every other
+    /// shortcut first (⇧⌘K deletes a line in web editors, ⌘D duplicates in
+    /// Figma, ⌘F opens Google Docs' own search) and the browser acts only
+    /// if the page leaves it unhandled.
+    pub fn reserved(self) -> bool {
+        matches!(
+            self,
+            Self::CommandBar
+                | Self::EditAddress
+                | Self::CloseTab
+                | Self::ReopenClosedTab
+                | Self::NextTab
+                | Self::PreviousTab
+                | Self::NextTabInList
+                | Self::PreviousTabInList
+                | Self::SelectTab(_)
+                | Self::SelectSpace(_)
+                | Self::PreviousSpace
+                | Self::NextSpace
+        )
+    }
+}
+
+/// Page zoom, in Chrome's steps (90%, 100%, 110%, 125%, ...).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZoomStep {
+    In,
+    Out,
+    Reset,
 }
 
 #[derive(Clone, Debug)]
@@ -85,9 +138,12 @@ pub enum EngineEvent {
         tab_id: u64,
         progress: f64,
     },
-    /// The page's favicon as PNG bytes, rendered for 2x displays.
+    /// The page's favicon as PNG bytes, rendered for 2x displays. `host` is
+    /// the page host it was fetched for: the tab may be on another site by
+    /// the time the download finishes.
     Favicon {
         tab_id: u64,
+        host: String,
         png: Vec<u8>,
     },
     /// A main-frame load failed. `url` is the address that failed: failed
@@ -130,6 +186,14 @@ pub enum EngineEvent {
     /// Only macOS reports it, as GPUI doesn't see keys while a page has
     /// keyboard focus.
     ControlReleased,
+    /// Progress of a find in the page: `count` matches so far, the
+    /// `active` one (1-based) selected. `final_update` ends the search.
+    FindResult {
+        tab_id: u64,
+        count: u32,
+        active: u32,
+        final_update: bool,
+    },
 }
 
 /// Modifier keys held with a key press.
@@ -172,12 +236,12 @@ pub fn shortcut_character(characters: &str, ignoring_modifiers: &str, key: u16) 
         })
 }
 
-/// Maps a key press to a browser shortcut. Letter shortcuts follow the
-/// character the layout types (`shortcut_character`), as the rest of macOS
-/// and the menu bar do, so ⌘Z on AZERTY undoes instead of closing the tab.
-/// Tab, the arrows, the brackets and the digits stay on their physical keys,
-/// which every layout has. Every shortcut needs ⌘ or ⌃, so typing is never
-/// intercepted.
+/// Maps a key press to a browser shortcut. Letter and symbol shortcuts
+/// follow the character the layout types (`shortcut_character`), as the
+/// rest of macOS and the menu bar do, so ⌘Z on AZERTY undoes instead of
+/// closing the tab and ⌘+ zooms on German keyboards. Tab, the arrows, the
+/// brackets and the digits stay on their physical keys, which every layout
+/// has. Every shortcut needs ⌘ or ⌃, so typing is never intercepted.
 #[cfg(any(target_os = "macos", test))]
 pub fn shortcut_for_key(
     key: u16,
@@ -204,6 +268,15 @@ pub fn shortcut_for_key(
         (true, false, false, false, Some('d')) => Some(Shortcut::TogglePin),
         (true, false, false, true, Some('c')) => Some(Shortcut::CopyUrl),
         (true, false, false, true, Some('k')) => Some(Shortcut::ClearToday),
+        (true, false, false, false, Some('f')) => Some(Shortcut::Find),
+        (true, false, false, false, Some('g')) => Some(Shortcut::FindNext),
+        (true, false, false, true, Some('g')) => Some(Shortcut::FindPrevious),
+        (true, false, true, false, Some('i')) => Some(Shortcut::DevTools),
+        (true, false, false, false, Some('.')) => Some(Shortcut::Stop),
+        // "+" needs ⇧ on many layouts, where ⌘= means the same.
+        (true, false, false, _, Some('=' | '+')) => Some(Shortcut::ZoomIn),
+        (true, false, false, false, Some('-')) => Some(Shortcut::ZoomOut),
+        (true, false, false, false, Some('0')) => Some(Shortcut::ZoomReset),
         _ => None,
     };
     if letter.is_some() {
@@ -218,6 +291,8 @@ pub fn shortcut_for_key(
         (true, false, true, false, 124) => Shortcut::NextSpace,
         (true, false, false, false, 33) => Shortcut::Back,
         (true, false, false, false, 30) => Shortcut::Forward,
+        // kVK_ANSI_0, like the digits for layouts that type no "0" there.
+        (true, false, false, false, 29) => Shortcut::ZoomReset,
         (true, false, false, false, _) => Shortcut::SelectTab(digit?),
         (false, true, false, false, _) => Shortcut::SelectSpace(digit?),
         _ => return None,
@@ -277,6 +352,132 @@ pub fn opens_in_tab(url: &str, opener_url: &str) -> bool {
         Some("file") => scheme(opener_url).as_deref() == Some("file"),
         _ => false,
     }
+}
+
+/// What becomes of a navigation to a URL, by its scheme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Navigation {
+    /// Web pages and Chromium's own documents load as usual.
+    Load,
+    /// Mail, phone, messages and FaceTime links open in their macOS app.
+    OpenInApp,
+    /// Any other app's protocol (zoommtg:, slack:, ...) is dropped quietly:
+    /// no prompt, no error page, and never saved as a tab's address.
+    Block,
+}
+
+pub fn navigation_for(url: &str) -> Navigation {
+    let scheme = url
+        .split_once(':')
+        .map(|(scheme, _)| scheme.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    match scheme.as_str() {
+        // Chromium's own schemes, including the PDF viewer's extension
+        // frame and error pages. No scheme: Chromium resolves it.
+        "" | "http" | "https" | "ws" | "wss" | "file" | "blob" | "data" | "filesystem"
+        | "about" | "javascript" | "chrome" | "chrome-untrusted" | "chrome-extension"
+        | "chrome-error" | "chrome-search" | "devtools" | "view-source" | "urn"
+        | "uuid-in-package" => Navigation::Load,
+        "mailto" | "tel" | "sms" | "facetime" | "facetime-audio" => Navigation::OpenInApp,
+        _ => Navigation::Block,
+    }
+}
+
+/// How a page asked for a new window (Chromium's window disposition).
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowRequest {
+    /// `window.open` with a size or the `popup` feature.
+    Popup,
+    ForegroundTab,
+    /// ⌘- or middle-click.
+    BackgroundTab,
+    /// ⇧-click, and anything else.
+    Window,
+}
+
+/// Where a page's new window opens.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewWindow {
+    /// A small window of its own whose `window.opener` stays connected, so
+    /// sign-in and payment popups can report back to the page.
+    Popup,
+    /// A tab in the opener's space; see `opens_in_tab`.
+    Tab { background: bool },
+    /// Nothing opens.
+    Blocked,
+}
+
+/// Popups need a click, as with Chrome's popup blocker. `target=_blank`
+/// links and plain `window.open(url)` open tabs, Arc-style; script that
+/// opens a blank window to fill in or navigate later (MSAL, PayPal) keeps
+/// it as a popup, since only a popup keeps its opener.
+#[cfg(any(target_os = "macos", test))]
+pub fn new_window_for(request: WindowRequest, url: &str, user_gesture: bool) -> NewWindow {
+    if !user_gesture {
+        return NewWindow::Blocked;
+    }
+    match request {
+        WindowRequest::Popup => NewWindow::Popup,
+        _ if url.is_empty() || url == "about:blank" => NewWindow::Popup,
+        request => NewWindow::Tab {
+            background: request == WindowRequest::BackgroundTab,
+        },
+    }
+}
+
+/// A rectangle on screen in points, from the top-left of the main display,
+/// as Chromium measures windows.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScreenRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// A popup's content area: the size and place the page asked for (pages
+/// usually centre sign-in popups themselves), else 500 × 600 points
+/// centred over the window it came from.
+#[cfg(any(target_os = "macos", test))]
+pub fn popup_rect(requested: [Option<i32>; 4], opener: ScreenRect) -> ScreenRect {
+    let [x, y, width, height] = requested;
+    let width = width.filter(|&width| width > 0).unwrap_or(500);
+    let height = height.filter(|&height| height > 0).unwrap_or(600);
+    ScreenRect {
+        x: x.unwrap_or(opener.x + (opener.width - width) / 2),
+        y: y.unwrap_or(opener.y + (opener.height - height) / 2),
+        width,
+        height,
+    }
+}
+
+/// Chromium's zoom level as a percentage: each level is a factor of 1.2.
+#[cfg(any(target_os = "macos", test))]
+pub fn zoom_percent(level: f64) -> u32 {
+    (1.2f64.powf(level) * 100.).round() as u32
+}
+
+/// Chrome's zoom presets, in percent.
+#[cfg(any(not(target_os = "macos"), test))]
+const ZOOM_PRESETS: [u32; 17] = [
+    25, 33, 50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400, 500,
+];
+
+/// The zoom after `step` from `percent`, through Chrome's presets.
+#[cfg(any(not(target_os = "macos"), test))]
+pub fn step_zoom(percent: u32, step: ZoomStep) -> u32 {
+    match step {
+        ZoomStep::In => ZOOM_PRESETS.into_iter().find(|&preset| preset > percent),
+        ZoomStep::Out => ZOOM_PRESETS
+            .into_iter()
+            .rev()
+            .find(|&preset| preset < percent),
+        ZoomStep::Reset => Some(100),
+    }
+    .unwrap_or(percent)
 }
 
 /// Progress callbacks arrive many times per load. Report only steps of at
@@ -373,6 +574,16 @@ mod tests {
             (us('d'), COMMAND, Shortcut::TogglePin),
             (us('c'), SHIFT_COMMAND, Shortcut::CopyUrl),
             (us('k'), SHIFT_COMMAND, Shortcut::ClearToday),
+            ((24, Some('=')), COMMAND, Shortcut::ZoomIn),
+            ((24, Some('+')), SHIFT_COMMAND, Shortcut::ZoomIn),
+            ((69, Some('+')), COMMAND, Shortcut::ZoomIn),
+            ((27, Some('-')), COMMAND, Shortcut::ZoomOut),
+            ((29, Some('0')), COMMAND, Shortcut::ZoomReset),
+            ((47, Some('.')), COMMAND, Shortcut::Stop),
+            (us('i'), OPTION_COMMAND, Shortcut::DevTools),
+            (us('f'), COMMAND, Shortcut::Find),
+            (us('g'), COMMAND, Shortcut::FindNext),
+            (us('g'), SHIFT_COMMAND, Shortcut::FindPrevious),
         ] {
             assert_eq!(
                 shortcut_for_key(key, character, modifiers),
@@ -399,8 +610,15 @@ mod tests {
             }
             assert_eq!(shortcut_for_key(key, None, SHIFT_COMMAND), None);
         }
-        // kVK_ANSI_0 selects nothing.
-        assert_eq!(shortcut_for_key(29, Some('0'), COMMAND), None);
+        // kVK_ANSI_0 resets the zoom, also where it types "à" (AZERTY).
+        assert_eq!(
+            shortcut_for_key(29, Some('0'), COMMAND),
+            Some(Shortcut::ZoomReset)
+        );
+        assert_eq!(
+            shortcut_for_key(29, None, COMMAND),
+            Some(Shortcut::ZoomReset)
+        );
     }
 
     #[test]
@@ -419,7 +637,7 @@ mod tests {
 
     #[test]
     fn leaves_editing_and_unknown_commands_to_the_focused_view() {
-        // ⌘A, ⌘Z, ⌘X, ⌘C, ⌘V, ⌘Q, ⌘F, ⌘⇧Z, ⌘⌃F (window fullscreen), and the
+        // ⌘A, ⌘Z, ⌘X, ⌘C, ⌘V, ⌘Q, ⌘B, ⌘⇧Z, ⌘⌃F (window fullscreen), and the
         // text field motions ⌃A, ⌃E and ⌃K.
         for (letter, modifiers) in [
             ('a', CONTROL),
@@ -431,7 +649,7 @@ mod tests {
             ('c', COMMAND),
             ('v', COMMAND),
             ('q', COMMAND),
-            ('f', COMMAND),
+            ('b', COMMAND),
             ('z', SHIFT_COMMAND),
             (
                 'f',
@@ -448,6 +666,87 @@ mod tests {
                 "{letter}"
             );
         }
+    }
+
+    #[test]
+    fn pages_get_shortcuts_first_except_for_tab_and_space_switching() {
+        let reserved = |letter: char, modifiers| {
+            let (key, character) = us(letter);
+            shortcut_for_key(key, character, modifiers).map(Shortcut::reserved)
+        };
+        // A page can't keep the user from opening, closing or leaving it.
+        for (letter, modifiers) in [
+            ('t', COMMAND),
+            ('t', SHIFT_COMMAND),
+            ('w', COMMAND),
+            ('l', COMMAND),
+        ] {
+            assert_eq!(reserved(letter, modifiers), Some(true), "{letter}");
+        }
+        for (key, modifiers) in [
+            (48, CONTROL),
+            (48, SHIFT_CONTROL),
+            (18, COMMAND),
+            (25, CONTROL),
+            (123, OPTION_COMMAND),
+            (126, OPTION_COMMAND),
+        ] {
+            assert_eq!(
+                shortcut_for_key(key, None, modifiers).map(Shortcut::reserved),
+                Some(true),
+                "{key}"
+            );
+        }
+        // Web apps use these: ⇧⌘K deletes a line in VS Code, ⌘D duplicates
+        // in Figma, ⌘S saves, ⌘F searches Google Docs, ⌘[ indents.
+        for (letter, modifiers) in [
+            ('k', SHIFT_COMMAND),
+            ('d', COMMAND),
+            ('s', COMMAND),
+            ('r', COMMAND),
+            ('c', SHIFT_COMMAND),
+            ('f', COMMAND),
+            ('g', COMMAND),
+            ('g', SHIFT_COMMAND),
+            ('i', OPTION_COMMAND),
+        ] {
+            assert_eq!(reserved(letter, modifiers), Some(false), "{letter}");
+        }
+        for (key, character) in [
+            (33, '['),
+            (30, ']'),
+            (24, '='),
+            (27, '-'),
+            (29, '0'),
+            (47, '.'),
+        ] {
+            assert_eq!(
+                shortcut_for_key(key, Some(character), COMMAND).map(Shortcut::reserved),
+                Some(false),
+                "{character}"
+            );
+        }
+    }
+
+    #[test]
+    fn zoom_keys_follow_the_layout() {
+        // German: "+" has its own key (the US "]"), where ⌘ zooms rather
+        // than going forward; "-" is on the US "/" key.
+        assert_eq!(
+            shortcut_for_key(30, Some('+'), COMMAND),
+            Some(Shortcut::ZoomIn)
+        );
+        assert_eq!(
+            shortcut_for_key(44, Some('-'), COMMAND),
+            Some(Shortcut::ZoomOut)
+        );
+        // AZERTY types "-" on the 6 key, like its menu bar.
+        assert_eq!(
+            shortcut_for_key(22, Some('-'), COMMAND),
+            Some(Shortcut::ZoomOut)
+        );
+        // ⇧⌘- types "_", which is no shortcut.
+        assert_eq!(shortcut_for_key(27, Some('_'), SHIFT_COMMAND), None);
     }
 
     #[test]
@@ -556,6 +855,129 @@ mod tests {
         // Local pages may open other local files.
         assert!(opens_in_tab("file:///tmp/b.html", "file:///tmp/a.html"));
         assert!(opens_in_tab("https://example.com/", "file:///tmp/a.html"));
+    }
+
+    #[test]
+    fn app_links_open_their_app_and_other_protocols_go_nowhere() {
+        for url in [
+            "https://example.com/",
+            "HTTP://example.com/",
+            "file:///tmp/a.html",
+            "about:blank",
+            "data:text/html,hi",
+            "blob:https://example.com/1",
+            "chrome://version",
+            "devtools://devtools/bundled/inspector.html",
+            "chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/index.html",
+            "chrome-error://chromewebdata/",
+            "javascript:void(0)",
+            "",
+        ] {
+            assert_eq!(navigation_for(url), Navigation::Load, "{url}");
+        }
+        for url in [
+            "mailto:alice@corp.com",
+            "MAILTO:alice@corp.com",
+            "tel:+15550100",
+            "sms:+15550100",
+            "facetime:alice@corp.com",
+            "facetime-audio:+15550100",
+        ] {
+            assert_eq!(navigation_for(url), Navigation::OpenInApp, "{url}");
+        }
+        for url in [
+            "zoommtg://zoom.us/join?confno=1",
+            "slack://open",
+            "itms-apps://apps.apple.com/app/id1",
+            "ftp://example.com/file",
+            "x-apple.systempreferences:com.apple.preference.security",
+        ] {
+            assert_eq!(navigation_for(url), Navigation::Block, "{url}");
+        }
+    }
+
+    #[test]
+    fn sign_in_popups_get_windows_and_links_get_tabs() {
+        let sign_in = "https://accounts.google.com/o/oauth2/auth";
+        assert_eq!(
+            new_window_for(WindowRequest::Popup, sign_in, true),
+            NewWindow::Popup
+        );
+        // MSAL and PayPal open a blank window, then navigate it.
+        for url in ["", "about:blank"] {
+            assert_eq!(
+                new_window_for(WindowRequest::ForegroundTab, url, true),
+                NewWindow::Popup
+            );
+        }
+        assert_eq!(
+            new_window_for(WindowRequest::ForegroundTab, sign_in, true),
+            NewWindow::Tab { background: false }
+        );
+        assert_eq!(
+            new_window_for(WindowRequest::BackgroundTab, sign_in, true),
+            NewWindow::Tab { background: true }
+        );
+        assert_eq!(
+            new_window_for(WindowRequest::Window, sign_in, true),
+            NewWindow::Tab { background: false }
+        );
+        // Without a click nothing opens, as with Chrome's popup blocker.
+        for request in [WindowRequest::Popup, WindowRequest::ForegroundTab] {
+            assert_eq!(new_window_for(request, sign_in, false), NewWindow::Blocked);
+        }
+    }
+
+    #[test]
+    fn popups_take_the_requested_rect_or_centre_over_the_opener() {
+        let opener = ScreenRect {
+            x: 100,
+            y: 50,
+            width: 1280,
+            height: 820,
+        };
+        assert_eq!(
+            popup_rect([Some(10), Some(20), Some(400), Some(300)], opener),
+            ScreenRect {
+                x: 10,
+                y: 20,
+                width: 400,
+                height: 300
+            }
+        );
+        assert_eq!(
+            popup_rect([None, None, Some(400), Some(300)], opener),
+            ScreenRect {
+                x: 100 + 440,
+                y: 50 + 260,
+                width: 400,
+                height: 300
+            }
+        );
+        assert_eq!(
+            popup_rect([None; 4], opener),
+            ScreenRect {
+                x: 100 + 390,
+                y: 50 + 110,
+                width: 500,
+                height: 600
+            }
+        );
+        // A zero size means none was given.
+        assert_eq!(popup_rect([None, None, Some(0), None], opener).width, 500);
+    }
+
+    #[test]
+    fn zoom_follows_chromes_steps() {
+        assert_eq!(zoom_percent(0.), 100);
+        assert_eq!(zoom_percent(1.1f64.ln() / 1.2f64.ln()), 110);
+        assert_eq!(zoom_percent(0.9f64.ln() / 1.2f64.ln()), 90);
+        assert_eq!(step_zoom(100, ZoomStep::In), 110);
+        assert_eq!(step_zoom(110, ZoomStep::Out), 100);
+        assert_eq!(step_zoom(105, ZoomStep::Out), 100);
+        assert_eq!(step_zoom(500, ZoomStep::In), 500);
+        assert_eq!(step_zoom(25, ZoomStep::Out), 25);
+        assert_eq!(step_zoom(175, ZoomStep::Reset), 100);
     }
 
     #[test]
