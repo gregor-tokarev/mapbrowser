@@ -189,13 +189,14 @@ fn action(
 fn actions(context: &CommandContext) -> Vec<(CommandItem, &'static str)> {
     let mut actions = Vec::new();
     if let Some(active) = &context.active {
-        actions.push(if active.pin == Pin::Pinned {
+        // ⌘D returns pinned tabs and favorites to Today.
+        actions.push(if active.pin == Pin::Today {
+            (action(Command::TogglePin, "Pin Tab", Icon::Pin, "⌘D"), "")
+        } else {
             (
                 action(Command::TogglePin, "Unpin Tab", Icon::PinOff, "⌘D"),
                 "",
             )
-        } else {
-            (action(Command::TogglePin, "Pin Tab", Icon::Pin, "⌘D"), "")
         });
         actions.push(if active.pin == Pin::Favorite {
             let item = action(
@@ -849,6 +850,23 @@ mod tests {
             Some(Command::ToggleBlocking("en.wikipedia.org".into()))
         );
         assert_eq!(first_action("personal"), None);
+    }
+
+    #[test]
+    fn pinned_tabs_and_favorites_offer_unpinning() {
+        for (pin, title) in [
+            (Pin::Today, "Pin Tab"),
+            (Pin::Pinned, "Unpin Tab"),
+            (Pin::Favorite, "Unpin Tab"),
+        ] {
+            let mut context = context();
+            context.active.as_mut().unwrap().pin = pin;
+            let item = results(CommandMode::NewTab, "pin", &context)
+                .into_iter()
+                .find(|item| item.command == Command::TogglePin)
+                .unwrap();
+            assert_eq!(item.title, title, "{pin:?}");
+        }
     }
 
     #[test]

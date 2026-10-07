@@ -117,12 +117,13 @@ impl BrowserApp {
                 let Some(tab) = self.state.tab(id) else {
                     return Vec::new();
                 };
+                // ⌘D pins Today tabs and returns pinned tabs and favorites to Today.
                 let mut entries = vec![
                     Entry::item(
-                        if tab.pin == Pin::Pinned {
-                            "Unpin Tab"
-                        } else {
+                        if tab.pin == Pin::Today {
                             "Pin Tab"
+                        } else {
+                            "Unpin Tab"
                         },
                         "⌘D",
                         Action::TogglePin(id),
