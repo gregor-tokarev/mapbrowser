@@ -30,8 +30,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Saves wait for a pause in changes, so bursts of page events write once.
+/// Changes are saved this long after the first one, so a burst writes once.
 const SAVE_DELAY: Duration = Duration::from_millis(500);
+/// Page titles and addresses can change every second (timers, chat badges,
+/// tickers), in every space: those changes alone are saved this rarely.
+const PAGE_SAVE_DELAY: Duration = Duration::from_secs(10);
 const TOAST_DURATION: Duration = Duration::from_millis(1500);
 /// Closed Today tabs that ⇧⌘T and the library can bring back.
 const REOPEN_LIMIT: usize = 20;
@@ -109,6 +112,8 @@ pub struct BrowserApp {
     window_fullscreen_for_page: bool,
     pub focus_handle: FocusHandle,
     save_task: Option<Task<()>>,
+    /// When `save_task` writes.
+    save_due: Option<Instant>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -127,6 +132,16 @@ pub fn external_web_url(value: &str) -> Option<Url> {
     }
     let url = Url::parse(value).ok()?;
     url.has_host().then_some(url)
+}
+
+/// What the shell draws of a tab's URL: on macOS the host (the URL pill,
+/// the favicon) or, without one, the whole URL. Linux previews print the
+/// whole URL on the card.
+fn shown_url(url: &str) -> String {
+    match host_of(url) {
+        Some(host) if cfg!(target_os = "macos") => host,
+        _ => model::display_url(url),
+    }
 }
 
 fn is_dark(appearance: WindowAppearance) -> bool {
@@ -194,6 +209,7 @@ impl BrowserApp {
             window_fullscreen_for_page: false,
             focus_handle: cx.focus_handle(),
             save_task: None,
+            save_due: None,
             _subscriptions: Vec::new(),
         };
         this._subscriptions.extend([
@@ -1212,7 +1228,7 @@ impl BrowserApp {
                 if tab.title != title {
                     let url = tab.url.clone();
                     self.state.update_tab(tab_id, url, title);
-                    self.persist_later(cx);
+                    self.persist_page_later(cx);
                     if self.is_visible(tab_id) {
                         cx.notify();
                     }
@@ -1222,11 +1238,12 @@ impl BrowserApp {
                 let Some(tab) = self.state.tab(tab_id) else {
                     return;
                 };
-                if tab.url != model::display_url(&url) {
-                    let title = tab.title.clone();
-                    self.state.update_tab(tab_id, &url, title);
-                    self.persist_later(cx);
-                    if self.is_visible(tab_id) {
+                let (shown, title) = (shown_url(&tab.url), tab.title.clone());
+                if self.state.update_tab(tab_id, &url, title) {
+                    self.persist_page_later(cx);
+                    // Paths, queries and fragments (map pans, scroll spies)
+                    // change nothing on screen.
+                    if shown_url(&url) != shown && self.is_visible(tab_id) {
                         if let Some(host) = host_of(&url) {
                             self.load_favicons(vec![host], cx);
                         }
@@ -1382,9 +1399,29 @@ impl BrowserApp {
     }
 
     fn persist_later(&mut self, cx: &mut Context<Self>) {
+        self.schedule_save(SAVE_DELAY, cx);
+    }
+
+    /// For changes pages make on their own: titles and addresses.
+    fn persist_page_later(&mut self, cx: &mut Context<Self>) {
+        self.schedule_save(PAGE_SAVE_DELAY, cx);
+    }
+
+    /// A pending save is never put off, so changes that never pause are
+    /// saved too; a sooner one replaces it. The snapshot is taken when the
+    /// save runs, so it has every change up to then.
+    fn schedule_save(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        let due = Instant::now() + delay;
+        if self.save_due.is_some_and(|pending| pending <= due) {
+            return;
+        }
+        self.save_due = Some(due);
         self.save_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(SAVE_DELAY).await;
-            let Ok(snapshot) = this.update(cx, |this, _| this.state.snapshot()) else {
+            cx.background_executor().timer(delay).await;
+            let Ok(snapshot) = this.update(cx, |this, _| {
+                this.save_due = None;
+                this.state.snapshot()
+            }) else {
                 return;
             };
             match snapshot {
@@ -1404,6 +1441,7 @@ impl BrowserApp {
 
     fn save_now(&mut self) {
         self.save_task = None;
+        self.save_due = None;
         if let Err(error) = self.state.save() {
             eprintln!("Couldn't save this session: {error}");
         }
