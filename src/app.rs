@@ -110,6 +110,8 @@ pub struct BrowserApp {
     pub fullscreen: bool,
     /// The window entered fullscreen for the page and leaves with it.
     window_fullscreen_for_page: bool,
+    /// Whether the window was fullscreen when its bounds last changed.
+    window_fullscreen: bool,
     pub focus_handle: FocusHandle,
     save_task: Option<Task<()>>,
     /// When `save_task` writes.
@@ -207,6 +209,7 @@ impl BrowserApp {
             dark: is_dark(window.appearance()),
             fullscreen: false,
             window_fullscreen_for_page: false,
+            window_fullscreen: window.is_fullscreen(),
             focus_handle: cx.focus_handle(),
             save_task: None,
             save_due: None,
@@ -232,6 +235,14 @@ impl BrowserApp {
                 if this.dark != dark {
                     this.dark = dark;
                     cx.notify();
+                }
+            }),
+            // Only the change from fullscreen to windowed: entering is
+            // asynchronous, and a page's request must not be undone early.
+            cx.observe_window_bounds(window, |this, window, cx| {
+                let fullscreen = window.is_fullscreen();
+                if std::mem::replace(&mut this.window_fullscreen, fullscreen) && !fullscreen {
+                    this.window_left_fullscreen(window, cx);
                 }
             }),
             cx.on_app_quit(|this, _| {
@@ -1438,6 +1449,19 @@ impl BrowserApp {
             self.engine.borrow().exit_fullscreen(tab_id);
             return;
         }
+        self.set_fullscreen(fullscreen, window, cx);
+    }
+
+    /// The window left fullscreen on its own (the green button, ⌃⌘F): a page
+    /// in HTML fullscreen leaves it too, and the sidebar and insets return
+    /// at once rather than when the page confirms.
+    fn window_left_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.window_fullscreen_for_page = false;
+        self.exit_page_fullscreen();
+        self.set_fullscreen(false, window, cx);
+    }
+
+    fn set_fullscreen(&mut self, fullscreen: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.fullscreen == fullscreen {
             return;
         }
