@@ -458,6 +458,21 @@ pub fn detach_child_window(parent: &NSView, child: &NSView) {
     }
 }
 
+/// Moves the child window holding `child` so its top-left corner is at
+/// `point` in `parent` (top-left origin, as GPUI measures).
+pub fn place_child_window(parent: &NSView, child: &NSView, point: NSPoint) {
+    let (Some(window), Some(child)) = (parent.window(), child.window()) else {
+        return;
+    };
+    let point = if parent.isFlipped() {
+        point
+    } else {
+        NSPoint::new(point.x, parent.bounds().size.height - point.y)
+    };
+    let in_window = parent.convertPoint_toView(point, None);
+    child.setFrameTopLeftPoint(window.convertPointToScreen(in_window));
+}
+
 /// Rounds the web card's corners with four tiny shapes, each filled with the
 /// window colour behind its corner. Masking the container instead
 /// (cornerRadius + masksToBounds over every web view) can force an offscreen

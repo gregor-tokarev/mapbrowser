@@ -15,6 +15,7 @@ use super::{
 };
 use crate::{
     app::BrowserApp,
+    engine::Shortcut,
     favicons::host_of,
     model::{Pin, Space, Tab, TabId},
 };
@@ -240,15 +241,21 @@ impl BrowserApp {
                             .tooltip(tooltip("Forward", "⌘]"))
                             .on_click(cx.listener(|this, _, _, _| this.forward())),
                     )
-                    .child(
+                    .child(if page.loading {
+                        tool_button("stop", Icon::Close, 18., true, theme)
+                            .tooltip(tooltip("Stop", "⌘."))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.shortcut(Shortcut::Stop, window, cx)
+                            }))
+                    } else {
                         tool_button("reload", Icon::Reload, 18., has_tab, theme)
                             .tooltip(tooltip("Reload", "⌘R"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(id) = this.active_tab_id() {
                                     this.reload(id, cx);
                                 }
-                            })),
-                    ),
+                            }))
+                    }),
             )
     }
 

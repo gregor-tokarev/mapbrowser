@@ -2,7 +2,7 @@
 //! page events, the command bar and persistence. Rendering lives in `ui`.
 
 use crate::{
-    engine::{Engine, EngineEvent, Shortcut},
+    engine::{Engine, EngineEvent, Navigation, Shortcut, ZoomStep, navigation_for},
     favicons::{FaviconStore, host_of},
     input::{InputEvent, InputStyle, TextInput},
     model::{self, BrowserState, Pin, Space, SpaceId, Tab, TabId},
@@ -13,6 +13,7 @@ use crate::{
             TabEntry,
         },
         drag::{self, DropZones, TabDrag},
+        find_bar::Find,
         menu::{MenuKind, OpenMenu},
         swipe::SwipeTracker,
         theme::Theme,
@@ -117,6 +118,7 @@ pub struct BrowserApp {
     /// When `save_task` writes.
     save_due: Option<Instant>,
     _subscriptions: Vec<Subscription>,
+    pub find: Find,
 }
 
 /// OS open-URL events are web addresses, never address-bar search queries.
@@ -214,6 +216,7 @@ impl BrowserApp {
             save_task: None,
             save_due: None,
             _subscriptions: Vec::new(),
+            find: Find::default(),
         };
         this._subscriptions.extend([
             cx.subscribe_in(
@@ -371,7 +374,7 @@ impl BrowserApp {
         self.engine.borrow_mut().activate_tab(active.unwrap_or(0));
     }
 
-    fn focus_page(&self) {
+    pub(crate) fn focus_page(&self) {
         if let Some(id) = self.active_tab_id() {
             self.engine.borrow().focus_tab(id);
         }
@@ -1245,6 +1248,30 @@ impl BrowserApp {
                 }
             }
             Shortcut::ClearToday => self.clear_today(cx),
+            Shortcut::ZoomIn | Shortcut::ZoomOut | Shortcut::ZoomReset => {
+                let step = match shortcut {
+                    Shortcut::ZoomIn => ZoomStep::In,
+                    Shortcut::ZoomOut => ZoomStep::Out,
+                    _ => ZoomStep::Reset,
+                };
+                let percent = active.and_then(|id| self.engine.borrow().zoom(id, step));
+                if let Some(percent) = percent {
+                    self.show_toast(format!("Zoom {percent}%"), cx);
+                }
+            }
+            Shortcut::Stop => {
+                if let Some(id) = active {
+                    self.engine.borrow().stop(id);
+                }
+            }
+            Shortcut::DevTools => {
+                if let Some(id) = active {
+                    self.engine.borrow().toggle_dev_tools(id);
+                }
+            }
+            Shortcut::Find => self.find_in_page(window, cx),
+            Shortcut::FindNext => self.find_again(true, window, cx),
+            Shortcut::FindPrevious => self.find_again(false, window, cx),
         }
     }
 
@@ -1324,10 +1351,7 @@ impl BrowserApp {
                     cx.notify();
                 }
             }
-            EngineEvent::Favicon { tab_id, png } => {
-                let Some(host) = self.state.tab(tab_id).and_then(|tab| host_of(&tab.url)) else {
-                    return;
-                };
+            EngineEvent::Favicon { host, png, .. } => {
                 let shown = self
                     .state
                     .active_space()
@@ -1343,6 +1367,11 @@ impl BrowserApp {
                 url,
                 message,
             } => {
+                // Links to apps never load; one that slipped through is
+                // neither the tab's address nor an error worth showing.
+                if navigation_for(&url) != Navigation::Load {
+                    return;
+                }
                 if let Some(page) = self.pages.get_mut(&tab_id) {
                     page.loading = false;
                 }
@@ -1375,10 +1404,16 @@ impl BrowserApp {
             }
             EngineEvent::Closed { tab_id } => {
                 self.engine.borrow_mut().forget_closed(tab_id);
-                // A browser that went away on its own leaves the tab unloaded.
+                // A browser that went away on its own (the page called
+                // window.close()) leaves the tab unloaded.
                 if !self.engine.borrow().has_tab(tab_id) && self.loaded.remove(&tab_id) {
                     self.pages.remove(&tab_id);
                     if self.is_active(tab_id) {
+                        // Hides the emptied web container and gives keyboard
+                        // focus back to the shell; the tab loads again when
+                        // selected.
+                        self.engine.borrow_mut().activate_tab(tab_id);
+                        window.focus(&self.focus_handle);
                         cx.notify();
                     }
                 }
@@ -1395,6 +1430,12 @@ impl BrowserApp {
                     cx.notify();
                 }
             }
+            EngineEvent::FindResult {
+                tab_id,
+                count,
+                active,
+                ..
+            } => self.find_result(tab_id, count, active, cx),
         }
     }
 
