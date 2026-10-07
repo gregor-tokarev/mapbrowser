@@ -217,6 +217,7 @@ class BundleArtifactTests(unittest.TestCase):
             output.write_text(f"cargo:metadata=CEF_DIR={runtime}\n")
             (profile / "mapbrowser").write_bytes(b"synthetic main executable")
             (profile / "mapbrowser-helper").write_bytes(b"synthetic helper executable")
+            write_filter_lists(root)
             with patch.object(bundle, "ROOT", root), patch.object(bundle.sys, "platform", "darwin"), patch.object(bundle.sys, "argv", ["bundle.py", "--skip-build", "--name", "Browser Test", "--identifier", "dev.test.browser"]), patch.object(bundle.subprocess, "check_output", return_value=json.dumps({"target_directory": str(target)}).encode()), patch.object(bundle, "run") as commands, patch.object(bundle.subprocess, "run") as external, patch("sys.stdout", new=io.StringIO()):
                 bundle.main()
             external.assert_not_called()
@@ -235,6 +236,43 @@ class BundleArtifactTests(unittest.TestCase):
                 self.assertTrue(helper_info["CFBundleIdentifier"].startswith("dev.test.browser.helper"))
             signatures = [call.args for call in commands.call_args_list if call.args[0] == "codesign" and "--sign" in call.args]
             self.assertTrue(all(command[command.index("--sign") + 1] == "-" for command in signatures))
+            filters = app / "Contents" / "Resources" / "filters"
+            self.assertEqual(sorted(path.name for path in filters.iterdir()), ["easylist.txt", "easyprivacy.txt"])
+            self.assertEqual((filters / "easylist.txt").read_text(), "||ads.example^\n")
+
+
+class FilterListTests(unittest.TestCase):
+    def test_lists_replace_stale_bundle_copies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_filter_lists(root)
+            (root / "resources" / "filters" / "notes.md").write_text("not a list")
+            resources = root / "Mapbrowser.app" / "Contents" / "Resources"
+            (resources / "filters").mkdir(parents=True)
+            (resources / "filters" / "removed-list.txt").write_text("||stale.example^\n")
+            with patch.object(bundle, "ROOT", root):
+                bundle.copy_filter_lists(resources)
+            self.assertEqual(sorted(path.name for path in (resources / "filters").iterdir()), ["easylist.txt", "easyprivacy.txt"])
+
+    def test_missing_lists_stop_the_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(bundle, "ROOT", root), self.assertRaisesRegex(SystemExit, "content-blocking lists"):
+                bundle.copy_filter_lists(root / "Resources")
+
+    def test_repository_ships_easylist_and_easyprivacy(self):
+        lists = Path(bundle.__file__).resolve().parent.parent / "resources" / "filters"
+        for name, title in [("easylist.txt", "EasyList"), ("easyprivacy.txt", "EasyPrivacy")]:
+            with self.subTest(name=name):
+                header = (lists / name).read_text().splitlines()[:5]
+                self.assertIn(f"! Title: {title}", header)
+
+
+def write_filter_lists(root):
+    filters = root / "resources" / "filters"
+    filters.mkdir(parents=True)
+    (filters / "easylist.txt").write_text("||ads.example^\n")
+    (filters / "easyprivacy.txt").write_text("||tracker.example^\n")
 
 
 if __name__ == "__main__":
