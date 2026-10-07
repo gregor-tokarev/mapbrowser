@@ -1,14 +1,24 @@
 mod engine;
 mod input;
 mod model;
+#[cfg(target_os = "macos")]
 mod native;
 mod ui;
+
+#[cfg(not(target_os = "macos"))]
+mod native {
+    /// Previews have no system setting; MAPBROWSER_REDUCE_MOTION stands in.
+    pub fn reduce_motion() -> bool {
+        std::env::var_os("MAPBROWSER_REDUCE_MOTION").is_some()
+    }
+}
 
 use engine::{Engine, EngineEvent, Shortcut};
 use gpui::http_client::Url;
 use gpui::{prelude::*, *};
 use input::{InputEvent, TextInput};
 use model::{BrowserState, Space};
+#[cfg(target_os = "macos")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{
     cell::RefCell,
@@ -558,6 +568,7 @@ fn main() -> anyhow::Result<()> {
                 ..Default::default()
             },
             |window, cx| {
+                #[cfg(target_os = "macos")]
                 if let RawWindowHandle::AppKit(handle) = HasWindowHandle::window_handle(window)
                     .expect("native window handle")
                     .as_raw()

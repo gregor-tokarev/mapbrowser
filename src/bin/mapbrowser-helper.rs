@@ -1,4 +1,5 @@
 //! CEF subprocess entry point. Sandbox initialization must precede framework load.
+#[cfg(target_os = "macos")]
 fn main() {
     let args = cef::args::Args::new();
     let mut sandbox = cef::sandbox::Sandbox::new();
@@ -11,4 +12,11 @@ fn main() {
     let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
     let exit_code = cef::execute_process(Some(args.as_main_args()), None, std::ptr::null_mut());
     std::process::exit(exit_code.max(0));
+}
+
+/// Only the macOS app embeds Chromium; other platforms have no subprocesses.
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("mapbrowser-helper is only used by the macOS app");
+    std::process::exit(1);
 }

@@ -16,6 +16,12 @@ const PANEL: u32 = 0x1b1e22;
 const TEXT: u32 = 0xe9ecef;
 const MUTED: u32 = 0x8c929c;
 const BORDER: u32 = 0x2a2e34;
+#[cfg(target_os = "macos")]
+const UI_FONT: &str = ".AppleSystemUIFont";
+/// Previews use Inter, the closest open font to SF Pro. Without it, GPUI uses
+/// its fallback stack (Ubuntu, Noto Sans, DejaVu Sans, ...).
+#[cfg(not(target_os = "macos"))]
+const UI_FONT: &str = "Inter";
 
 fn icon_button(id: &'static str, symbol: &'static str) -> Stateful<Div> {
     div()
@@ -57,6 +63,22 @@ fn error_message(error: &str) -> String {
         }
         _ => error.to_owned(),
     }
+}
+
+/// Without a page engine (Linux previews), label the page area instead.
+fn page_placeholder(url: &str) -> Div {
+    div()
+        .absolute()
+        .size_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(6.))
+        .text_size(px(12.))
+        .text_color(rgb(MUTED))
+        .child("Web pages are not rendered in this preview")
+        .child(div().text_color(rgb(0x656c76)).child(url.to_owned()))
 }
 
 impl BrowserApp {
@@ -384,7 +406,7 @@ impl Render for BrowserApp {
             .flex()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
-            .font_family(".AppleSystemUIFont")
+            .font_family(UI_FONT)
             .key_context("Browser")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &FocusAddress, window, cx| {
@@ -658,6 +680,9 @@ impl Render for BrowserApp {
                             )
                             .children(outgoing_welcome)
                             .children(incoming_welcome)
+                            .when(cfg!(not(target_os = "macos")) && !is_blank, |content| {
+                                content.child(page_placeholder(&tab.url))
+                            })
                             .when_some(
                                 self.error.clone().filter(|_| is_blank),
                                 |content, error| {

@@ -1,6 +1,7 @@
 //! Chromium runs in native child NSViews. Pages keep their own compositor and
 //! process lifetime; GPUI only draws the browser controls.
 
+use super::{EngineEvent, Shortcut};
 use anyhow::{Context, Result, bail, ensure};
 use async_channel::{Receiver, Sender};
 use block2::RcBlock;
@@ -26,52 +27,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-
-#[derive(Clone, Debug)]
-pub enum Shortcut {
-    Address,
-    NewTab,
-    CloseTab,
-    NextTab,
-    PreviousSpace,
-    NextSpace,
-    Reload,
-    Back,
-    Forward,
-}
-
-#[derive(Clone, Debug)]
-pub enum EngineEvent {
-    Created {
-        tab_id: u64,
-    },
-    Title {
-        tab_id: u64,
-        title: String,
-    },
-    Address {
-        tab_id: u64,
-        url: String,
-    },
-    Loading {
-        tab_id: u64,
-        loading: bool,
-        can_go_back: bool,
-        can_go_forward: bool,
-    },
-    LoadError {
-        tab_id: u64,
-        message: String,
-    },
-    OpenTab {
-        opener_tab_id: u64,
-        url: String,
-    },
-    Closed {
-        tab_id: u64,
-    },
-    Shortcut(Shortcut),
-}
 
 #[derive(Default)]
 struct PendingBrowsers {
