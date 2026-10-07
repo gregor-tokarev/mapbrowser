@@ -400,8 +400,7 @@ impl BrowserApp {
             .rounded(px(10.))
             .bg(control)
             .when(interactive, |pill| {
-                press_only(pill)
-                    .cursor_pointer()
+                pill.cursor_pointer()
                     .hover(move |style| style.bg(control_hover))
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                         if this.url_pill_hovered != *hovered {
@@ -409,9 +408,14 @@ impl BrowserApp {
                             cx.notify();
                         }
                     }))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_command_bar(CommandMode::EditAddress, window, cx)
-                    }))
+                    // On the press, like "+ New Tab".
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.toggle_command_bar(CommandMode::EditAddress, window, cx)
+                        }),
+                    )
             })
             .map(|pill| match &label {
                 Some(label) => pill.child(
@@ -702,10 +706,17 @@ impl BrowserApp {
                     .text_color(label)
                     .child("New Tab"),
             )
+            // Toggles on the press, while the bar it closes is still open:
+            // the press takes key status from the bar, which closes itself
+            // before a click could tell.
             .when(interactive, |row| {
-                press_only(row).on_click(cx.listener(|this, _, window, cx| {
-                    this.toggle_command_bar(CommandMode::NewTab, window, cx)
-                }))
+                row.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.toggle_command_bar(CommandMode::NewTab, window, cx)
+                    }),
+                )
             })
     }
 
