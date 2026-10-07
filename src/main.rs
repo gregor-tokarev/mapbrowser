@@ -187,9 +187,12 @@ fn main() -> anyhow::Result<()> {
                             .attach(view)
                             .expect("attach browser view");
                     }
+                    // The close button quits the way ⌘Q does. The window, and
+                    // with it the browser state that saves on quit, must stay
+                    // until App::shutdown has run the quit observers.
                     window.on_window_should_close(cx, |_, cx| {
                         cx.quit();
-                        true
+                        false
                     });
                     cx.new(|cx| {
                         BrowserApp::new(state, engine, events, external_urls_rx, window, cx)
