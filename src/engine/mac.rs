@@ -743,7 +743,6 @@ impl Engine {
     }
 
     /// Takes page hosts as persisted; subdomains are covered too.
-    #[allow(dead_code)] // Wired up by the per-site toggle.
     pub fn set_blocking_exceptions(&self, hosts: HashSet<String>) {
         self.blocker.set_exceptions(hosts);
     }
@@ -1076,8 +1075,6 @@ impl Engine {
 }
 
 /// Window and card chrome.
-// The redesigned shell calls these.
-#[allow(dead_code)]
 impl Engine {
     /// Rounds the web card with `radius`, using the window colours
     /// (0xAARRGGBB) behind its top-left, top-right, bottom-left and

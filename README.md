@@ -19,13 +19,18 @@ The bundle contains Chromium, its sandboxed helper processes, and a local ad hoc
 
 ## Use
 
-- Enter an address or search in the address field. Bare domains use HTTPS; loopback addresses use HTTP.
-- Use **New tab** or `⌘T`. Close a tab with its × or `⌘W`.
-- Select a space at the bottom of the sidebar. Use + to create a space and ··· beside its name to rename it.
-- Use `⌘⌥←` and `⌘⌥→` to switch spaces with a 240 ms slide. `Ctrl+Tab` switches tabs within the current space.
-- Use `⌘L` to edit the address, `⌘R` to reload, and `⌘[` / `⌘]` for back / forward.
+Map Browser looks and works like Arc: one sidebar holds your spaces and tabs, and the page sits on a card inside the space's colour.
 
-Switching spaces keeps opened pages alive. Chromium can apply its normal background scheduling, but the app does not discard or suspend pages when a space becomes inactive. Blank new tabs use GPUI and do not create a page renderer until you navigate.
+- `⌘T` opens the command bar. Type an address or a search, pick an open tab from any space, or run an action such as Pin Tab, Clear Today Tabs or Switch to Space. There are no blank tabs: a tab exists once you pick a result. Bare domains use HTTPS; loopback addresses use HTTP.
+- `⌘L` (or a click on the address at the top of the sidebar) edits the current tab's address. Pressing Return on the unchanged address reloads it.
+- New tabs land in **Today** at the top of the list. `⌘D` pins a tab above the line; right-click a tab to make it a **Favorite**, shown as a tile at the top. Pinned tabs and favorites stay; closing one (`⌘W` or its –) only unloads it.
+- `⌘W` closes a Today tab and `⇧⌘T` brings it back; the library button at the bottom left lists recently closed tabs. **Clear** (`⇧⌘K`) closes all Today tabs.
+- Spaces are listed at the bottom of the sidebar. Click one, use `⌃1`–`⌃9`, or `⌥⌘←` / `⌥⌘→` to switch. The "…" beside a space's name renames it and sets its colour and icon; + creates a space.
+- `⌘S` hides the sidebar, `⌘1`–`⌘9` pick tabs, `⌃Tab` and `⌥⌘↑` / `⌥⌘↓` move between them, `⌘R` reloads, `⌘[` / `⌘]` go back and forward, and `⇧⌘C` copies the address.
+- The shield beside the address turns ad and tracker blocking off for that site.
+- Map Browser follows the system's light or dark appearance.
+
+Only the tab you're looking at loads when Map Browser starts; other tabs load the first time you select them. Pages you have opened keep running when you switch away, under Chromium's normal background throttling; the app never discards them on its own. "Unload Space" in a space's menu frees the pages of a space you're done with.
 
 State lives in `~/Library/Application Support/MapBrowser` unless `MAPBROWSER_DATA_DIR` is set. Spaces, tab URLs, and selections restore on launch. Cookies and site storage persist in separate profile directories. In-page navigation history is not restored across application restarts.
 
@@ -55,7 +60,7 @@ make test-server
 
 Open `http://127.0.0.1:8765/` in two spaces. Save different test values in each. The page shows server cookies, local storage, and background activity. See [the test plan](docs/test-plan.md) for native UI checks and a controlled energy comparison.
 
-Set `MAPBROWSER_TRACE_ANIMATION=1` when launching the bundled executable to print per-transition render timestamps. The animation requests frames only until the transition ends and respects macOS Reduce Motion. Chromium uses its native macOS message loop through the GPUI application. There is no fixed polling timer for browser work.
+Set `MAPBROWSER_TRACE_ANIMATION=1` when launching the bundled executable to print the render timestamps of each space switch. The animation requests frames only until the transition ends and respects macOS Reduce Motion. Chromium uses its native macOS message loop through the GPUI application. There is no fixed polling timer for browser work.
 
 CEF 152 needs a native compositor initialization workaround in this host: after the first real main-frame load, the app changes the native view width by one logical pixel and immediately restores it. This runs once per browser instance, without reloading the page or scheduling continuing work. `MAPBROWSER_TRACE_CEF=1` records the initial native geometry and this adjustment.
 

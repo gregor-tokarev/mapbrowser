@@ -15,8 +15,6 @@ pub use stub::Engine;
 /// Browser shortcuts. On macOS the engine's key monitor reports them even
 /// while a web page has keyboard focus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-// Only the macOS key monitor produces every shortcut.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum Shortcut {
     /// ⌘T: open the command bar to start a new tab.
     CommandBar,

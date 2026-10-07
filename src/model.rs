@@ -161,19 +161,29 @@ impl Space {
         self.tabs.partition_point(|tab| tab.pin <= pin)
     }
 
-    /// Selection moves to the next tab of the same section, else the previous
-    /// one there, else the nearest tab in sidebar order.
+    /// The tab that takes over the selection from `tab_id` when it is closed
+    /// or unloaded: the next tab of the same section, else the previous one
+    /// there, else the nearest tab in sidebar order.
+    pub fn successor_of(&self, tab_id: TabId) -> Option<TabId> {
+        self.successor(self.tab_index(tab_id)?)
+    }
+
+    fn successor(&self, index: usize) -> Option<TabId> {
+        let pin = self.tabs[index].pin;
+        let next = self.tabs.get(index + 1);
+        let previous = index.checked_sub(1).and_then(|index| self.tabs.get(index));
+        next.filter(|next| next.pin == pin)
+            .or(previous.filter(|previous| previous.pin == pin))
+            .or(next)
+            .or(previous)
+            .map(|tab| tab.id)
+    }
+
     fn remove_at(&mut self, index: usize) -> Tab {
+        let successor = self.successor(index);
         let tab = self.tabs.remove(index);
         if self.selected_tab_id == Some(tab.id) {
-            let next = self.tabs.get(index);
-            let previous = index.checked_sub(1).and_then(|index| self.tabs.get(index));
-            self.selected_tab_id = next
-                .filter(|next| next.pin == tab.pin)
-                .or(previous.filter(|previous| previous.pin == tab.pin))
-                .or(next)
-                .or(previous)
-                .map(|tab| tab.id);
+            self.selected_tab_id = successor;
         }
         tab
     }
@@ -348,6 +358,11 @@ impl BrowserState {
 
     pub fn set_sidebar_width(&mut self, width: f32) {
         self.sidebar_width = clamp_sidebar_width(width);
+    }
+
+    /// Hosts where content blocking is off, as the engine takes them.
+    pub fn blocking_exceptions(&self) -> HashSet<String> {
+        self.blocking_exceptions.iter().cloned().collect()
     }
 
     pub fn is_blocking_disabled(&self, host: &str) -> bool {
@@ -744,6 +759,17 @@ pub fn normalize_address(input: &str) -> String {
     if input.is_empty() {
         return "about:blank".into();
     }
+    web_address(input).unwrap_or_else(|| search_url(input))
+}
+
+/// Whether address-bar text is searched for rather than opened as a URL.
+pub fn is_search_query(input: &str) -> bool {
+    let input = input.trim();
+    !input.is_empty() && web_address(input).is_none()
+}
+
+/// The URL that trimmed, non-empty text names, or `None` for a search query.
+fn web_address(input: &str) -> Option<String> {
     let lower = input.to_ascii_lowercase();
     if [
         "http://",
@@ -757,7 +783,7 @@ pub fn normalize_address(input: &str) -> String {
     .iter()
     .any(|prefix| lower.starts_with(prefix))
     {
-        return input.to_owned();
+        return Some(input.to_owned());
     }
     // These are commands or external protocols, not schemeless HTTP credentials.
     let non_web_scheme = [
@@ -789,12 +815,16 @@ pub fn normalize_address(input: &str) -> String {
             || host == "0.0.0.0"
             || server.starts_with("[::1]");
         if local {
-            return format!("http://{schemeless}");
+            return Some(format!("http://{schemeless}"));
         }
         if host.contains('.') || server.starts_with('[') {
-            return format!("https://{schemeless}");
+            return Some(format!("https://{schemeless}"));
         }
     }
+    None
+}
+
+fn search_url(input: &str) -> String {
     let mut query = String::new();
     for byte in input.bytes() {
         match byte {
@@ -932,6 +962,23 @@ mod tests {
         assert!(state.active_space().tabs.is_empty());
         assert_eq!(state.close_tab(space, today_old), None);
         assert_eq!(state.close_tab(12345, today_old), None);
+    }
+
+    #[test]
+    fn successor_follows_the_close_selection_rules_without_removing() {
+        let mut state = BrowserState::default();
+        let space = state.selected_space_id;
+        let pinned = state.new_tab(space, "a.com").unwrap();
+        state.set_pin(pinned, Pin::Pinned);
+        let older = state.new_tab(space, "b.com").unwrap();
+        let newer = state.new_tab(space, "c.com").unwrap();
+        let active = state.active_space();
+        assert_eq!(active.successor_of(newer), Some(older));
+        assert_eq!(active.successor_of(older), Some(newer));
+        assert_eq!(active.successor_of(pinned), Some(newer));
+        assert_eq!(active.successor_of(12345), None);
+        assert_eq!(sidebar(&state, space), [pinned, newer, older]);
+        assert_eq!(active_id(&state), Some(newer));
     }
 
     #[test]
@@ -1319,6 +1366,10 @@ mod tests {
         assert!(state.is_blocking_disabled("example.com"));
         assert!(state.is_blocking_disabled("www.example.com"));
         assert!(!state.is_blocking_disabled("sub.example.com"));
+        assert_eq!(
+            state.blocking_exceptions(),
+            HashSet::from(["example.com".to_owned()])
+        );
         assert!(!state.set_blocking_disabled("", true));
         assert!(state.set_blocking_disabled("www.example.com", false));
         assert!(!state.set_blocking_disabled("example.com", false));
@@ -1328,8 +1379,10 @@ mod tests {
     #[test]
     fn newer_schema_is_preserved_and_reported_instead_of_reset() {
         let root = TestDir::new();
-        let mut state = BrowserState::default();
-        state.schema_version = SCHEMA_VERSION + 1;
+        let state = BrowserState {
+            schema_version: SCHEMA_VERSION + 1,
+            ..BrowserState::default()
+        };
         let bytes = serde_json::to_vec(&state).unwrap();
         fs::write(root.0.join(STATE_FILE), &bytes).unwrap();
         assert_eq!(
@@ -1371,6 +1424,11 @@ mod tests {
             ("café", "https://www.google.com/search?q=caf%C3%A9"),
         ] {
             assert_eq!(normalize_address(input), expected, "input: {input}");
+            assert_eq!(
+                is_search_query(input),
+                expected.starts_with("https://www.google.com/search?q="),
+                "input: {input}"
+            );
         }
     }
 

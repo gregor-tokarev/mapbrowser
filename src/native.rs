@@ -20,8 +20,8 @@ use objc2::{
     sel,
 };
 use objc2_app_kit::{
-    NSColor, NSNormalWindowLevel, NSView, NSWindowButton, NSWindowCollectionBehavior,
-    NSWindowOrderingMode, NSWindowStyleMask,
+    NSApplication, NSColor, NSEventType, NSNormalWindowLevel, NSView, NSWindowButton,
+    NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask,
 };
 use objc2_core_graphics::CGMutablePath;
 use objc2_foundation::{NSNotification, NSPoint, NSRect, NSSize};
@@ -354,6 +354,39 @@ pub fn reduce_motion() -> bool {
     unsafe {
         let reduced: Bool = msg_send![&workspace, accessibilityDisplayShouldReduceMotion];
         reduced.as_bool()
+    }
+}
+
+/// The AppKit view in a GPUI window's raw handle.
+pub fn ns_view(window: &gpui::Window) -> Option<*mut std::ffi::c_void> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match HasWindowHandle::window_handle(window).ok()?.as_raw() {
+        RawWindowHandle::AppKit(handle) => Some(handle.ns_view.as_ptr()),
+        _ => None,
+    }
+}
+
+/// Hands a window move to the window server, starting from the left
+/// mouse-down AppKit is dispatching (a press on empty sidebar space). Returns
+/// at once; AppKit may not deliver the matching mouse-up.
+pub fn begin_window_drag() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let Some(event) = NSApplication::sharedApplication(mtm).currentEvent() else {
+        return;
+    };
+    if event.r#type() == NSEventType::LeftMouseDown
+        && let Some(window) = event.window(mtm)
+    {
+        window.performWindowDragWithEvent(&event);
+    }
+}
+
+/// The standard About panel, with the bundle's name, version and icon.
+pub fn show_about_panel() {
+    if let Some(mtm) = MainThreadMarker::new() {
+        NSApplication::sharedApplication(mtm).orderFrontStandardAboutPanel(None);
     }
 }
 

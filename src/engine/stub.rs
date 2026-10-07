@@ -81,7 +81,6 @@ impl Engine {
     }
 
     pub fn set_blocker(&mut self, _blocker: ContentBlocker) {}
-    #[allow(dead_code)]
     pub fn set_blocking_exceptions(&self, _hosts: HashSet<String>) {}
     pub fn register_pending(&mut self) {}
     pub fn activate_tab(&mut self, _tab_id: u64) {}
@@ -190,14 +189,16 @@ impl Engine {
 }
 
 /// Window and card chrome. Linux previews draw these parts in GPUI.
-#[allow(dead_code)]
 impl Engine {
     pub fn set_corner_caps(&mut self, _radius: f64, _colors: [u32; 4]) {}
     pub fn set_fullscreen_layout(&mut self, _fullscreen: bool) {}
     pub fn exit_fullscreen(&self, _tab_id: u64) {}
-    pub fn attach_child_window(&self, _child_view: *mut c_void) {}
-    pub fn detach_child_window(&self, _child_view: *mut c_void) {}
     pub fn set_traffic_lights_hidden(&self, _hidden: bool) {}
+    /// The command bar is a child window only on macOS.
+    #[allow(dead_code)]
+    pub fn attach_child_window(&self, _child_view: *mut c_void) {}
+    #[allow(dead_code)]
+    pub fn detach_child_window(&self, _child_view: *mut c_void) {}
 }
 
 #[cfg(test)]

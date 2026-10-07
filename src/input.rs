@@ -173,10 +173,6 @@ impl TextInput {
         cx.notify();
     }
 
-    pub fn focus(&self, window: &mut Window, _cx: &mut App) {
-        window.focus(&self.focus_handle);
-    }
-
     pub fn select_all_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
         self.selected_range = 0..self.content.len();
@@ -226,7 +222,7 @@ impl TextInput {
     fn previous_word(&self) -> usize {
         self.content[..self.cursor_offset()]
             .unicode_word_indices()
-            .last()
+            .next_back()
             .map_or(0, |(offset, _)| offset)
     }
 
@@ -821,17 +817,17 @@ impl Element for TextElement {
         );
         let line = prepaint.line.take().unwrap();
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            if focus_handle.is_focused(window) {
-                if let Some(selection) = prepaint.selection.take() {
-                    window.paint_quad(selection);
-                }
+            if focus_handle.is_focused(window)
+                && let Some(selection) = prepaint.selection.take()
+            {
+                window.paint_quad(selection);
             }
             let origin = point(bounds.left() - prepaint.scroll_x, bounds.top());
             let _ = line.paint(origin, window.line_height(), window, cx);
-            if focus_handle.is_focused(window) {
-                if let Some(cursor) = prepaint.cursor.take() {
-                    window.paint_quad(cursor);
-                }
+            if focus_handle.is_focused(window)
+                && let Some(cursor) = prepaint.cursor.take()
+            {
+                window.paint_quad(cursor);
             }
         });
 
