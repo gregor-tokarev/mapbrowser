@@ -34,9 +34,11 @@ actions!(mapbrowser, [Quit, About, NewSpace, Dismiss]);
 #[action(namespace = mapbrowser, no_json)]
 pub struct Browse(pub Shortcut);
 
-/// Puts the traffic lights' centres at x 20/40/60, y 24, like Arc. GPUI
-/// moves the close button's 14 × 16 pt frame to this top-left point.
-const TRAFFIC_LIGHTS: Point<Pixels> = point(px(13.), px(16.));
+/// Puts the traffic lights' centres at x 20/40/60, y 20. GPUI moves the
+/// close button's 14 × 16 pt frame to this top-left point inside the 28 pt
+/// titlebar, which clips buttons hanging below it, so they can't sit as low
+/// as Arc's (y 24). The sidebar's navigation row is level with them.
+const TRAFFIC_LIGHTS: Point<Pixels> = point(px(13.), px(12.));
 
 fn key_bindings() -> Vec<KeyBinding> {
     use Shortcut::*;

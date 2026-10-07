@@ -6,6 +6,7 @@
 use super::{
     SlideFrame, Tooltip,
     command_bar::CommandMode,
+    drag::{DraggedEdge, DraggedTab, EDGE_HANDLE, TabDrag, TabPreview},
     icons::{Icon, icon},
     menu::MenuKind,
     placeholder_favicon, press_only, shadow,
@@ -15,21 +16,27 @@ use super::{
 use crate::{
     app::BrowserApp,
     favicons::host_of,
-    model::{Pin, Space, Tab},
+    model::{Pin, Space, Tab, TabId},
 };
 use gpui::{
-    AnyElement, BoxShadow, ClickEvent, Context, Div, FontWeight, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, Stateful, StatefulInteractiveElement, Styled, div,
-    img, point, prelude::FluentBuilder, px,
+    AnyElement, AppContext, BoxShadow, ClickEvent, Context, Div, DragMoveEvent, EmptyView,
+    FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
+    Pixels, ScrollWheelEvent, Size, Stateful, StatefulInteractiveElement, Styled, div, img, point,
+    prelude::FluentBuilder, px, size,
 };
 
-/// The URL pill's top; the sliding pages start just above it.
-const PAGES_TOP: f32 = 44.;
+/// The navigation row's centre, level with the traffic lights.
+const TOP_ROW_CENTER: f32 = 20.;
+const URL_PILL_TOP: f32 = 42.;
+/// The sliding pages start just above the URL pill.
+const PAGES_TOP: f32 = 40.;
 const BOTTOM_BAR: f32 = 48.;
 const ROW_HEIGHT: f32 = 36.;
-const ROW_GAP: f32 = 5.;
+pub(super) const ROW_GAP: f32 = 5.;
 const FAVORITE_HEIGHT: f32 = 47.;
-const FAVORITE_GAP: f32 = 9.;
+pub(super) const FAVORITE_GAP: f32 = 9.;
+/// A dragged tab's row or tile stays in place, faded.
+const DRAGGED_OPACITY: f32 = 0.4;
 const SPACE_ICONS: [&str; 12] = [
     "🏠", "💼", "🔬", "🎨", "🎵", "📚", "✈️", "🛒", "🎮", "⭐", "🌱", "☕",
 ];
@@ -106,6 +113,18 @@ impl BrowserApp {
             }
             _ => vec![self.render_page(active, 0., width, true, theme, cx)],
         };
+        // Only while a tab is dragged over the list: where it would land.
+        let indicator = self.tab_drag.and_then(|drag| drag.target).map(|target| {
+            let bounds = self.drop_zones.borrow().indicator(target);
+            div()
+                .absolute()
+                .left(bounds.left())
+                .top(bounds.top() - px(PAGES_TOP))
+                .w(bounds.size.width)
+                .h(bounds.size.height)
+                .rounded_full()
+                .bg(theme.focus())
+        });
         div()
             .id("sidebar")
             .absolute()
@@ -125,6 +144,17 @@ impl BrowserApp {
                     this.sidebar_mouse_down(event, window, cx)
                 }),
             )
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+                this.swipe_spaces(event, window, cx)
+            }))
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedTab>, _, cx| {
+                    this.drag_tab_over(event, cx)
+                }),
+            )
+            .on_drop(cx.listener(|this, dragged: &DraggedTab, window, cx| {
+                this.drop_tab(dragged.0, window, cx)
+            }))
             .child(
                 div()
                     .absolute()
@@ -133,32 +163,53 @@ impl BrowserApp {
                     .top(px(PAGES_TOP))
                     .bottom(px(BOTTOM_BAR))
                     .overflow_hidden()
-                    .children(pages),
+                    .children(pages)
+                    .children(indicator),
             )
-            .child(self.render_top_row(theme, cx))
+            .child(self.render_top_row(width, theme, cx))
             .children(self.render_notice(theme, cx))
             .child(self.render_bottom_bar(width, theme, cx))
+            .child(render_edge(width, cx))
     }
 
-    fn render_top_row(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+    /// Follows a tab dragged over the sidebar. Between the navigation row
+    /// and the bottom bar it finds the tab's drop position.
+    fn drag_tab_over(&mut self, event: &DragMoveEvent<DraggedTab>, cx: &mut Context<Self>) {
+        let (pointer, sidebar) = (event.event.position, event.bounds);
+        let over_list = sidebar.contains(&pointer)
+            && pointer.y >= sidebar.top() + px(PAGES_TOP)
+            && pointer.y < sidebar.bottom() - px(BOTTOM_BAR);
+        let drag = TabDrag {
+            tab: event.drag(cx).0,
+            target: over_list.then(|| self.drop_zones.borrow().target(pointer)),
+        };
+        if self.tab_drag != Some(drag) {
+            self.tab_drag = Some(drag);
+            cx.notify();
+        }
+    }
+
+    fn render_top_row(&self, width: f32, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let page = self
             .active_tab_id()
             .map(|id| self.page(id))
             .unwrap_or_default();
         let has_tab = self.active_tab_id().is_some();
+        let tooltip = |text, shortcut| Tooltip::build(text, shortcut, theme, width);
+        let button_top = px(TOP_ROW_CENTER - 14.);
         div()
             .absolute()
             .top_0()
             .left_0()
             .right_0()
-            .h(px(48.))
+            .h(px(PAGES_TOP))
             // macOS draws the real traffic lights here; previews draw stand-ins.
             .when(cfg!(not(target_os = "macos")), |row| {
                 row.children([14., 34., 54.].map(|left| {
                     div()
                         .absolute()
                         .left(px(left))
-                        .top(px(18.))
+                        .top(px(TOP_ROW_CENTER - 6.))
                         .size(px(12.))
                         .rounded_full()
                         .bg(theme.ink(if theme.dark { 0.16 } else { 0.12 }))
@@ -168,32 +219,35 @@ impl BrowserApp {
                 tool_button("toggle-sidebar", Icon::Sidebar, 19., true, theme)
                     .absolute()
                     .left(px(72.))
-                    .top(px(10.))
+                    .top(button_top)
+                    .tooltip(tooltip("Hide Sidebar", "⌘S"))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
             )
             .child(
                 div()
                     .absolute()
                     .right(px(8.5))
-                    .top(px(10.))
+                    .top(button_top)
                     .flex()
                     .gap(px(6.))
                     .child(
                         tool_button("back", Icon::ArrowLeft, 22., page.can_go_back, theme)
+                            .tooltip(tooltip("Back", "⌘["))
                             .on_click(cx.listener(|this, _, _, _| this.back())),
                     )
                     .child(
                         tool_button("forward", Icon::ArrowRight, 22., page.can_go_forward, theme)
+                            .tooltip(tooltip("Forward", "⌘]"))
                             .on_click(cx.listener(|this, _, _, _| this.forward())),
                     )
                     .child(
-                        tool_button("reload", Icon::Reload, 18., has_tab, theme).on_click(
-                            cx.listener(|this, _, _, cx| {
+                        tool_button("reload", Icon::Reload, 18., has_tab, theme)
+                            .tooltip(tooltip("Reload", "⌘R"))
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(id) = this.active_tab_id() {
                                     this.reload(id, cx);
                                 }
-                            }),
-                        ),
+                            })),
                     ),
             )
     }
@@ -217,15 +271,21 @@ impl BrowserApp {
                 .as_ref()
                 .is_some_and(|bar| bar.mode == CommandMode::NewTab);
         let show_clear = interactive && self.sidebar_hovered && !today.is_empty();
-        let rows = |tabs: &[&Tab], cx: &mut Context<Self>| {
-            div().flex().flex_col().gap(px(ROW_GAP)).children(
-                tabs.iter().map(|tab| {
-                    self.render_row(tab, Some(tab.id) == selected, interactive, theme, cx)
-                }),
-            )
+        let rows = |tabs: &[&Tab], first_gap: f32, cx: &mut Context<Self>| {
+            tabs.iter()
+                .enumerate()
+                .map(|(index, tab)| {
+                    self.render_row(tab, Some(tab.id) == selected, interactive, width, theme, cx)
+                        .mt(px(if index == 0 { first_gap } else { ROW_GAP }))
+                })
+                .collect::<Vec<_>>()
         };
-        let pinned_rows = (!pinned.is_empty()).then(|| rows(&pinned, cx).mt(px(2.)));
-        let today_rows = (!today.is_empty()).then(|| rows(&today, cx).mt(px(ROW_GAP)));
+        let pinned_rows = rows(&pinned, 2., cx);
+        let today_rows = rows(&today, ROW_GAP, cx);
+        // The active page notes where its parts are, for dropping tabs.
+        let zones = interactive.then(|| self.drop_zones.clone());
+        let has_favorites = !favorites.is_empty();
+        let pinned_count = pinned.len();
         div()
             .absolute()
             .top_0()
@@ -234,16 +294,25 @@ impl BrowserApp {
             .w(px(width))
             .flex()
             .flex_col()
-            .child(self.render_url_pill(space, interactive, theme, cx))
-            .when(!favorites.is_empty(), |page| {
-                page.child(self.render_favorites(
-                    &favorites,
-                    selected,
-                    width,
-                    interactive,
-                    theme,
-                    cx,
-                ))
+            .when_some(zones.clone(), |page, zones| {
+                page.on_children_prepainted(move |parts, _, _| {
+                    let mut zones = zones.borrow_mut();
+                    zones.list_top = parts.last().map_or(px(0.), |list| list.top());
+                    if !has_favorites {
+                        zones.favorites.clear();
+                    }
+                })
+            })
+            .child(self.render_url_pill(space, interactive, width, theme, cx))
+            .when(has_favorites, |page| {
+                page.child(
+                    self.render_favorites(&favorites, selected, width, interactive, theme, cx)
+                        .when_some(zones.clone(), |grid, zones| {
+                            grid.on_children_prepainted(move |tiles, _, _| {
+                                zones.borrow_mut().favorites = tiles;
+                            })
+                        }),
+                )
             })
             .child(
                 div()
@@ -251,18 +320,33 @@ impl BrowserApp {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    // Sideways swipes switch spaces instead of scrolling the list.
+                    .map(|mut list| {
+                        list.style().restrict_scroll_to_axis = Some(true);
+                        list
+                    })
                     .pb(px(8.))
-                    .child(self.render_space_title(
-                        space,
-                        !favorites.is_empty(),
-                        interactive,
-                        theme,
-                        cx,
-                    ))
-                    .children(pinned_rows)
-                    .child(self.render_divider(pinned.is_empty(), show_clear, theme, cx))
-                    .child(self.render_new_tab(new_tab_selected, interactive, theme, cx))
-                    .children(today_rows),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .when_some(zones, |list, zones| {
+                                list.on_children_prepainted(move |parts, _, _| {
+                                    zones.borrow_mut().measure_list(&parts, pinned_count)
+                                })
+                            })
+                            .child(self.render_space_title(
+                                space,
+                                has_favorites,
+                                interactive,
+                                theme,
+                                cx,
+                            ))
+                            .children(pinned_rows)
+                            .child(self.render_divider(pinned_count == 0, show_clear, theme, cx))
+                            .child(self.render_new_tab(new_tab_selected, interactive, theme, cx))
+                            .children(today_rows),
+                    ),
             )
     }
 
@@ -270,6 +354,7 @@ impl BrowserApp {
         &self,
         space: &Space,
         interactive: bool,
+        width: f32,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
@@ -279,9 +364,15 @@ impl BrowserApp {
         let blocking_off = host
             .as_deref()
             .is_some_and(|host| self.state.is_blocking_disabled(host));
+        // Buttons show on hover only (Arc), so at rest the host has the
+        // whole pill; the shield stays while blocking is off for the site.
+        let hovered = interactive && self.url_pill_hovered;
+        let copy = tab.filter(|_| hovered).map(|tab| tab.id);
+        let shield = host.filter(|_| interactive && (hovered || blocking_off));
+        let buttons = copy.is_some() || shield.is_some();
         let (control, control_hover) = (theme.control(), theme.control_hover());
         let hover = theme.hover();
-        let pill_button = |id: &'static str, glyph: Icon, always: bool| {
+        let pill_button = |id: &'static str, glyph: Icon, tooltip, shortcut| {
             press_only(
                 div()
                     .id(id)
@@ -291,25 +382,20 @@ impl BrowserApp {
                     .size(px(26.))
                     .rounded(px(6.))
                     .hover(move |style| style.bg(hover))
-                    .when(!always, |button| {
-                        button
-                            .invisible()
-                            .group_hover("url-pill", |style| style.visible())
-                    })
                     .child(icon(glyph, 17., theme.icon())),
             )
+            .tooltip(Tooltip::build(tooltip, shortcut, theme, width))
         };
         div()
             .id(("url-pill", space.id))
-            .group("url-pill")
             .flex()
             .flex_none()
             .items_center()
             .h(px(36.))
             .mx(px(8.))
-            .mt(px(46. - PAGES_TOP))
+            .mt(px(URL_PILL_TOP - PAGES_TOP))
             .pl(px(13.))
-            .pr(px(5.))
+            .pr(px(if buttons { 5. } else { 13. }))
             .gap(px(2.))
             .rounded(px(10.))
             .bg(control)
@@ -317,6 +403,12 @@ impl BrowserApp {
                 press_only(pill)
                     .cursor_pointer()
                     .hover(move |style| style.bg(control_hover))
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if this.url_pill_hovered != *hovered {
+                            this.url_pill_hovered = *hovered;
+                            cx.notify();
+                        }
+                    }))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_command_bar(CommandMode::EditAddress, window, cx)
                     }))
@@ -340,9 +432,9 @@ impl BrowserApp {
                             .child("Search or Enter URL…"),
                     ),
             })
-            .when_some(tab.filter(|_| interactive).map(|tab| tab.id), |pill, id| {
+            .when_some(copy, |pill, id| {
                 pill.child(
-                    pill_button("copy-url", Icon::Link, false).on_click(cx.listener(
+                    pill_button("copy-url", Icon::Link, "Copy URL", "⇧⌘C").on_click(cx.listener(
                         move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.copy_url(id, cx);
@@ -350,7 +442,7 @@ impl BrowserApp {
                     )),
                 )
             })
-            .when_some(host.filter(|_| interactive), |pill, host| {
+            .when_some(shield, |pill, host| {
                 pill.child(
                     pill_button(
                         "blocking",
@@ -359,7 +451,12 @@ impl BrowserApp {
                         } else {
                             Icon::Shield
                         },
-                        blocking_off,
+                        if blocking_off {
+                            "Content Blocking Off"
+                        } else {
+                            "Content Blocking On"
+                        },
+                        "",
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -379,7 +476,10 @@ impl BrowserApp {
         cx: &mut Context<Self>,
     ) -> Div {
         let columns = favorites.len().min(4) as f32;
-        let tile_width = ((width - 16.) - (columns - 1.) * FAVORITE_GAP) / columns;
+        let tile_size = size(
+            px(((width - 16.) - (columns - 1.) * FAVORITE_GAP) / columns),
+            px(FAVORITE_HEIGHT),
+        );
         let (control, control_hover) = (theme.control(), theme.control_hover());
         div()
             .flex()
@@ -396,8 +496,8 @@ impl BrowserApp {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .w(px(tile_width))
-                    .h(px(FAVORITE_HEIGHT))
+                    .w(tile_size.width)
+                    .h(tile_size.height)
                     .rounded(px(10.))
                     .map(|tile| {
                         if is_selected {
@@ -409,9 +509,11 @@ impl BrowserApp {
                             tile.bg(control).hover(move |style| style.bg(control_hover))
                         }
                     })
+                    .when(self.is_dragged(id), |tile| tile.opacity(DRAGGED_OPACITY))
                     .child(self.favicon(tab, 20., theme))
                     .when(interactive, |tile| {
-                        press_only(tile)
+                        self.draggable(press_only(tile), tab, tile_size, true, theme)
+                            .tooltip(Tooltip::build(tab.title.clone(), "", theme, width))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.select_tab(id, window, cx)
                             }))
@@ -610,17 +712,47 @@ impl BrowserApp {
         }
     }
 
+    fn is_dragged(&self, tab_id: TabId) -> bool {
+        self.tab_drag.is_some_and(|drag| drag.tab == tab_id)
+    }
+
+    /// Lets `element`, a row or tile of `tab`, be dragged to another place
+    /// in the sidebar. A copy of it follows the pointer.
+    fn draggable(
+        &self,
+        element: Stateful<Div>,
+        tab: &Tab,
+        size: Size<Pixels>,
+        tile: bool,
+        theme: &Theme,
+    ) -> Stateful<Div> {
+        let host = host_of(&tab.url);
+        let preview = TabPreview {
+            title: tab.title.clone().into(),
+            favicon: host.as_deref().and_then(|host| self.favicons.get(host)),
+            host,
+            theme: *theme,
+            size,
+            tile,
+        };
+        element.on_drag(DraggedTab(tab.id), move |_, _, _, cx| {
+            cx.new(|_| preview.clone())
+        })
+    }
+
     fn render_row(
         &self,
         tab: &Tab,
         selected: bool,
         interactive: bool,
+        width: f32,
         theme: &Theme,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+    ) -> Stateful<Div> {
         let id = tab.id;
         let hover = theme.hover();
         let button_hover = theme.ink(if theme.dark { 0.10 } else { 0.07 });
+        let show_close = self.hovered_tab == Some(id) && self.tab_drag.is_none();
         // Pinned tabs and favorites unload ("–") instead of closing.
         let glyph = if tab.pin == Pin::Today {
             Icon::Close
@@ -644,6 +776,7 @@ impl BrowserApp {
                     row.hover(move |style| style.bg(hover))
                 }
             })
+            .when(self.is_dragged(id), |row| row.opacity(DRAGGED_OPACITY))
             .child(self.favicon(tab, 16., theme))
             .child(
                 truncated(tab.title.clone())
@@ -654,7 +787,8 @@ impl BrowserApp {
                     .text_color(theme.title()),
             )
             .when(interactive, |row| {
-                press_only(row)
+                let row_size = size(px(width - 16.), px(ROW_HEIGHT));
+                self.draggable(press_only(row), tab, row_size, false, theme)
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.select_tab(id, window, cx)),
                     )
@@ -676,7 +810,7 @@ impl BrowserApp {
                             cx.notify();
                         }
                     }))
-                    .when(self.hovered_tab == Some(id), |row| {
+                    .when(show_close, |row| {
                         row.child(
                             press_only(
                                 div()
@@ -791,7 +925,6 @@ impl BrowserApp {
                 .children(self.state.spaces.iter().map(|space| {
                     let id = space.id;
                     let active = id == self.state.selected_space_id;
-                    let (name, tooltip_theme) = (space.name.clone(), *theme);
                     press_only(
                         div()
                             .id(("space", id))
@@ -815,7 +948,7 @@ impl BrowserApp {
                                 }
                             }),
                     )
-                    .tooltip(move |_, cx| Tooltip::view(name.clone(), &tooltip_theme, cx))
+                    .tooltip(Tooltip::build(space.name.clone(), "", theme, width))
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.switch_space(id, window, cx)),
                     )
@@ -838,6 +971,7 @@ impl BrowserApp {
                     .absolute()
                     .left(px(9.5))
                     .top(px(10.))
+                    .tooltip(Tooltip::build("Recently Closed", "", theme, width))
                     .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                         let anchor = event.position() - point(px(14.), px(18.));
                         this.open_menu(MenuKind::Library, anchor, window, cx)
@@ -849,10 +983,34 @@ impl BrowserApp {
                     .absolute()
                     .left(px(width - 24.5 - 14.))
                     .top(px(10.))
+                    .tooltip(Tooltip::build("New Tab or Space", "", theme, width))
                     .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                         let anchor = event.position() - point(px(14.), px(18.));
                         this.open_menu(MenuKind::Plus, anchor, window, cx)
                     })),
             )
     }
+}
+
+/// The invisible handle on the sidebar's right edge: drag it to resize the
+/// sidebar, double-click it for the standard width.
+fn render_edge(width: f32, cx: &mut Context<BrowserApp>) -> impl IntoElement + use<> {
+    press_only(
+        div()
+            .id("sidebar-edge")
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .w(px(EDGE_HANDLE))
+            .cursor_ew_resize(),
+    )
+    .on_drag(DraggedEdge { start_width: width }, |_, _, _, cx| {
+        cx.new(|_| EmptyView)
+    })
+    .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+        if event.click_count() >= 2 {
+            this.reset_sidebar_width(cx);
+        }
+    }))
 }

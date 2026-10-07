@@ -12,14 +12,16 @@ use crate::{
             self, ActiveTab, Command, CommandBar, CommandBarEvent, CommandContext, CommandMode,
             TabEntry,
         },
+        drag::{self, DropZones, TabDrag},
         menu::{MenuKind, OpenMenu},
+        swipe::SwipeTracker,
         theme::Theme,
     },
 };
 use gpui::{
     App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, MouseDownEvent,
-    Pixels, Point, SharedString, Subscription, Task, Window, WindowAppearance, WindowHandle,
-    http_client::Url, px,
+    Pixels, Point, ScrollWheelEvent, SharedString, Subscription, Task, Window, WindowAppearance,
+    WindowHandle, http_client::Url, px,
 };
 use std::{
     cell::RefCell,
@@ -91,6 +93,12 @@ pub struct BrowserApp {
     pub sidebar_hovered: bool,
     /// The row under the pointer, which shows its close button.
     pub hovered_tab: Option<TabId>,
+    /// The URL pill shows its buttons only under the pointer.
+    pub url_pill_hovered: bool,
+    pub tab_drag: Option<TabDrag>,
+    /// Measured while drawing the sidebar, for dropping dragged tabs.
+    pub drop_zones: Rc<RefCell<DropZones>>,
+    swipe: SwipeTracker,
     pub renaming: Option<SpaceId>,
     pub rename_input: Entity<TextInput>,
     pub command_bar: Option<CommandBarWindow>,
@@ -174,6 +182,10 @@ impl BrowserApp {
             toast: None,
             sidebar_hovered: false,
             hovered_tab: None,
+            url_pill_hovered: false,
+            tab_drag: None,
+            drop_zones: Rc::default(),
+            swipe: SwipeTracker::default(),
             renaming: None,
             rename_input: rename_input.clone(),
             command_bar: None,
@@ -753,13 +765,99 @@ impl BrowserApp {
     }
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.state.sidebar_hidden = !self.state.sidebar_hidden;
+        self.set_sidebar_hidden(!self.state.sidebar_hidden, cx);
+    }
+
+    fn set_sidebar_hidden(&mut self, hidden: bool, cx: &mut Context<Self>) {
+        if self.state.sidebar_hidden == hidden {
+            return;
+        }
+        self.state.sidebar_hidden = hidden;
         self.menu = None;
-        self.engine
-            .borrow()
-            .set_traffic_lights_hidden(self.state.sidebar_hidden);
+        self.engine.borrow().set_traffic_lights_hidden(hidden);
         self.persist_later(cx);
         cx.notify();
+    }
+
+    /// Follows the sidebar's edge, dragged with the pointer at `x`. Far
+    /// enough left the sidebar hides, keeping its width from before the
+    /// drag for when it shows again; coming back shows it at once.
+    pub fn drag_sidebar_edge(&mut self, x: f32, start_width: f32, cx: &mut Context<Self>) {
+        let width = drag::edge_width(x);
+        self.set_sidebar_hidden(width.is_none(), cx);
+        let width = width.unwrap_or(start_width);
+        if width != self.state.sidebar_width() {
+            self.set_sidebar_width(width, cx);
+        }
+    }
+
+    /// A double click on the sidebar's edge: back to Arc's standard width.
+    pub fn reset_sidebar_width(&mut self, cx: &mut Context<Self>) {
+        self.set_sidebar_width(model::DEFAULT_SIDEBAR_WIDTH, cx);
+    }
+
+    fn set_sidebar_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        self.state.set_sidebar_width(width);
+        self.persist_later(cx);
+        cx.notify();
+    }
+
+    /// Two-finger swipes on the sidebar go to the next or previous space.
+    pub fn swipe_spaces(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(next) = self.swipe.update(event.touch_phase, event.delta) else {
+            return;
+        };
+        let spaces = &self.state.spaces;
+        let index = spaces
+            .iter()
+            .position(|space| space.id == self.state.selected_space_id)
+            .unwrap_or(0);
+        let index = if next {
+            Some(index + 1)
+        } else {
+            index.checked_sub(1)
+        };
+        if let Some(id) = index
+            .and_then(|index| spaces.get(index))
+            .map(|space| space.id)
+        {
+            self.switch_space(id, window, cx);
+        }
+    }
+
+    /// Drops a dragged tab where the sidebar showed it would go. Dropping it
+    /// back in its place counts as a click, so a press that wobbled past
+    /// the drag threshold still selects the tab.
+    pub fn drop_tab(&mut self, tab_id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.tab_drag.take().and_then(|drag| drag.target) else {
+            return;
+        };
+        let place = |state: &BrowserState| {
+            let tabs = &state.active_space().tabs;
+            let index = tabs.iter().position(|tab| tab.id == tab_id)?;
+            Some((index, tabs[index].pin))
+        };
+        let Some(start) = place(&self.state) else {
+            return;
+        };
+        let before = self
+            .state
+            .active_space()
+            .section(target.pin)
+            .nth(target.index)
+            .map(|tab| tab.id);
+        self.state.move_tab(tab_id, before, target.pin);
+        if place(&self.state) == Some(start) {
+            self.select_tab(tab_id, window, cx);
+        } else {
+            self.persist_later(cx);
+            cx.notify();
+        }
     }
 
     /// Turns content blocking off (or back on) for `host` and reloads the
