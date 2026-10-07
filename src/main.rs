@@ -1,4 +1,5 @@
 mod engine;
+mod favicons;
 mod input;
 mod model;
 #[cfg(target_os = "macos")]
@@ -117,6 +118,7 @@ impl BrowserApp {
                     this.sync_address(cx);
                     window.focus(&this.focus_handle);
                 }
+                InputEvent::Changed(_) => {}
             },
         ));
         result._subscriptions.push(cx.subscribe_in(
@@ -150,6 +152,7 @@ impl BrowserApp {
                     window.focus(&this.focus_handle);
                     cx.notify();
                 }
+                InputEvent::Changed(_) => {}
             },
         ));
         result._subscriptions.push(cx.on_app_quit(|this, _| {
@@ -202,6 +205,11 @@ impl BrowserApp {
         }));
     }
 
+    /// The engine hides every page for an unknown id; 0 is never a tab id.
+    fn active_tab_id(&self) -> u64 {
+        self.state.active_tab().map_or(0, |tab| tab.id)
+    }
+
     fn create_browser(&mut self, tab_id: u64, space_id: u64, url: &str) {
         match self.engine.borrow_mut().create_tab(tab_id, space_id, url) {
             Ok(()) => {
@@ -222,13 +230,11 @@ impl BrowserApp {
                 }
             }
         }
-        self.engine
-            .borrow_mut()
-            .activate_tab(self.state.active_tab().id);
+        self.engine.borrow_mut().activate_tab(self.active_tab_id());
     }
 
     fn sync_address(&mut self, cx: &mut Context<Self>) {
-        let url = &self.state.active_tab().url;
+        let url = self.state.active_tab().map_or("", |tab| tab.url.as_str());
         self.address.update(cx, |input, cx| {
             input.set_text(if url == "about:blank" { "" } else { url }, cx)
         });
@@ -257,8 +263,15 @@ impl BrowserApp {
         }
         self.finish_slide();
         let url = model::normalize_address(value);
-        let tab_id = self.state.active_tab().id;
         let space_id = self.state.active_space().id;
+        let Some(tab_id) = self
+            .state
+            .active_tab()
+            .map(|tab| tab.id)
+            .or_else(|| self.state.new_tab(space_id, &url))
+        else {
+            return;
+        };
         self.error = None;
         self.state.update_tab(tab_id, &url, "");
         if !self.opened.contains(&tab_id) {
@@ -279,9 +292,7 @@ impl BrowserApp {
         self.finish_slide();
         self.state
             .new_tab(self.state.selected_space_id, "about:blank");
-        self.engine
-            .borrow_mut()
-            .activate_tab(self.state.active_tab().id);
+        self.engine.borrow_mut().activate_tab(self.active_tab_id());
         self.error = None;
         self.sync_address(cx);
         self.persist();
@@ -326,9 +337,7 @@ impl BrowserApp {
         }
         self.state.close_tab(self.state.selected_space_id, id);
         self.loading.remove(&id);
-        self.engine
-            .borrow_mut()
-            .activate_tab(self.state.active_tab().id);
+        self.engine.borrow_mut().activate_tab(self.active_tab_id());
         self.sync_address(cx);
         self.persist();
         cx.notify();
@@ -336,9 +345,7 @@ impl BrowserApp {
 
     fn finish_slide(&mut self) {
         if self.slide.take().is_some() {
-            self.engine
-                .borrow_mut()
-                .activate_tab(self.state.active_tab().id);
+            self.engine.borrow_mut().activate_tab(self.active_tab_id());
         }
     }
 
@@ -376,9 +383,7 @@ impl BrowserApp {
     ) {
         if native::reduce_motion() {
             self.slide = None;
-            self.engine
-                .borrow_mut()
-                .activate_tab(self.state.active_tab().id);
+            self.engine.borrow_mut().activate_tab(self.active_tab_id());
         } else {
             self.engine.borrow().focus_shell();
             self.slide = Some(Slide {
@@ -409,6 +414,7 @@ impl BrowserApp {
     }
 
     pub fn shortcut(&mut self, shortcut: Shortcut, window: &mut Window, cx: &mut Context<Self>) {
+        let active = self.state.active_tab().map(|tab| tab.id);
         match shortcut {
             Shortcut::Address => {
                 self.engine.borrow().focus_shell();
@@ -416,10 +422,26 @@ impl BrowserApp {
                     .update(cx, |input, cx| input.select_all_focus(window, cx));
             }
             Shortcut::NewTab => self.new_tab(window, cx),
-            Shortcut::CloseTab => self.close_tab(self.state.active_tab().id, cx),
-            Shortcut::Reload => self.engine.borrow().reload(self.state.active_tab().id),
-            Shortcut::Back => self.engine.borrow().back(self.state.active_tab().id),
-            Shortcut::Forward => self.engine.borrow().forward(self.state.active_tab().id),
+            Shortcut::CloseTab => {
+                if let Some(id) = active {
+                    self.close_tab(id, cx)
+                }
+            }
+            Shortcut::Reload => {
+                if let Some(id) = active {
+                    self.engine.borrow().reload(id)
+                }
+            }
+            Shortcut::Back => {
+                if let Some(id) = active {
+                    self.engine.borrow().back(id)
+                }
+            }
+            Shortcut::Forward => {
+                if let Some(id) = active {
+                    self.engine.borrow().forward(id)
+                }
+            }
             Shortcut::PreviousSpace | Shortcut::NextSpace => {
                 let index = self
                     .state
@@ -436,13 +458,11 @@ impl BrowserApp {
                 self.switch_space(self.state.spaces[next].id, window, cx);
             }
             Shortcut::NextTab => {
-                let space = self.state.active_space();
-                let index = space
-                    .tabs
-                    .iter()
-                    .position(|t| t.id == space.selected_tab_id)
-                    .unwrap_or(0);
-                self.select_tab(space.tabs[(index + 1) % space.tabs.len()].id, window, cx);
+                let tabs = &self.state.active_space().tabs;
+                let index = tabs.iter().position(|t| Some(t.id) == active).unwrap_or(0);
+                if let Some(next) = tabs.get((index + 1) % tabs.len().max(1)).map(|t| t.id) {
+                    self.select_tab(next, window, cx);
+                }
             }
         }
     }
@@ -465,7 +485,7 @@ impl BrowserApp {
                     self.state.update_tab(tab_id, url, title);
                     self.persist_later(cx);
                 }
-                if tab_id == self.state.active_tab().id
+                if tab_id == self.active_tab_id()
                     && !self.address.read(cx).focus_handle(cx).is_focused(window)
                 {
                     self.sync_address(cx);
@@ -498,7 +518,7 @@ impl BrowserApp {
                 self.persist();
             }
             EngineEvent::LoadError { tab_id, message } => {
-                if tab_id == self.state.active_tab().id {
+                if tab_id == self.active_tab_id() {
                     self.error = Some(message);
                 }
                 self.loading.remove(&tab_id);
