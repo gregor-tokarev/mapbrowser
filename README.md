@@ -14,15 +14,16 @@ Your tabs live in a sidebar instead of across the top. Group them into spaces, o
 
 ## Using Map Browser
 
-**Opening pages.** Press `⌘T` to open the command bar. Type an address or a search, pick an open tab from any space, or run an action such as Pin Tab, Clear Today Tabs or Switch to Space. A tab appears once you pick a result. `⌘L`, or a click on the address at the top of the sidebar, edits the current page's address.
+**Opening pages.** Press `⌘T` to open the command bar. Type an address or a search, pick an open tab from any space, or run an action such as Pin Tab, Clear Today Tabs or Switch to Space. A tab appears once you pick a result. Type the name of an open tab or of a space, or the address of an open tab, and Return goes there instead of searching. `⌘L`, or a click on the address at the top of the sidebar, edits the current page's address.
 
 **Today, pinned and favorites.**
 - New tabs appear in **Today**, at the top of the list.
 - `⌘D` pins a tab above the line. Right-click a tab to make it a **Favorite**, shown as a tile at the top.
 - Drag tabs to reorder them or move them between sections.
 - Closing a pinned tab or favorite (`⌘W` or its –) only puts it to sleep; it stays in the sidebar.
-- `⌘W` closes a Today tab and `⇧⌘T` brings it back. The library button at the bottom left lists recently closed tabs.
+- `⌘W` closes a Today tab and `⇧⌘T` brings it back. The library button at the bottom left lists recently closed tabs, also after you restart.
 - **Clear** (`⇧⌘K`) closes all Today tabs at once.
+- Right-click a tab and choose **Move to Space** to send it to another space. It opens there with that space's logins.
 
 **Spaces.**
 - Spaces appear as dots at the bottom of the sidebar.
@@ -46,15 +47,15 @@ Your tabs live in a sidebar instead of across the top. Group them into spaces, o
 
 Web apps keep their own shortcuts: in an editor such as VS Code for the web or Google Docs, keys like `⇧⌘K`, `⌘[` or `⌘F` do what the app says. Opening, closing and switching tabs and spaces always works.
 
-Drag the sidebar's edge to resize it; double-click the edge to reset it. The shield beside the address turns ad and tracker blocking off for that site.
+Drag the sidebar's edge to resize it; double-click the edge to reset it. With the sidebar hidden, short messages such as "Copied URL" or the zoom level appear briefly at the bottom left of the page. The shield beside the address turns ad and tracker blocking off for that site.
 
-**Downloads.** Files go straight to your Downloads folder, numbered if a file with that name is already there. While they download, the library button at the bottom left shows their progress; the library lists them, and a click shows one in Finder. Quitting stops downloads that haven't finished.
+**Downloads.** Files go straight to your Downloads folder, numbered if a file with that name is already there. While they download, the library button at the bottom left shows their progress; the library lists them, and a click shows one in Finder. If files are still downloading when you quit, Map Browser asks first, as quitting cancels them.
 
 **Camera, microphone and location.** Sites ask before using your camera, microphone, screen, location or notifications. The question appears in the sidebar. Your answer holds for that site in that space, for camera and microphone until you quit; screen sharing asks every time.
 
 Sign-in and payment windows, such as "Continue with Google" or PayPal, open as small windows and finish signing you in on the page that asked. Email and phone links open Mail and FaceTime.
 
-Spaces, tabs and selections come back when you reopen Map Browser, and the window opens where you left it, at the same size. Your browsing data stays on your Mac.
+Spaces, tabs and selections come back when you reopen Map Browser, and the window opens where you left it, at the same size. If your saved session can't be opened, for example after going back to an older version, Map Browser tells you why and leaves it untouched. Your browsing data stays on your Mac.
 
 ## Status
 
