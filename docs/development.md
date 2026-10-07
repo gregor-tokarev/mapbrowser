@@ -53,7 +53,7 @@ MAPBROWSER_DATA_DIR="$PWD/.test-data/manual" MAPBROWSER_TRACE_ANIMATION=1 make d
 | `src/blocker.rs` | Ad and tracker blocking with adblock-rust |
 | `src/engine/` | Chromium embedding (`mac.rs`), the Linux stand-in (`stub.rs`) and shared events |
 | `src/native.rs` | AppKit bridge: CEF's message loop inside GPUI's application, window helpers, corner caps |
-| `vendor/gpui/` | GPUI 0.2.2 with Metal memory and frame-scheduling changes; see `MAPBROWSER_PATCH.md` |
+| `vendor/gpui/` | GPUI 0.2.2 with Metal memory, frame-scheduling and native-view input changes; see `MAPBROWSER_PATCH.md` |
 | `assets/icons/` | Sidebar icons (Lucide, ISC licence) |
 
 ## Implementation notes
