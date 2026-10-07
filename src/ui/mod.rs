@@ -131,6 +131,7 @@ impl Render for BrowserApp {
             )
             // The whole window background is one gradient quad.
             .bg(theme.background())
+            .children(self.render_card_shadow(card))
             .child(self.render_card(card, &theme, frame, slide_finished, viewport))
             .children(self.render_progress(card, &theme))
             .children(sidebar)
@@ -184,18 +185,25 @@ pub fn placeholder_favicon(host: Option<&str>, theme: &Theme) -> Div {
         .child(initial)
 }
 
-/// Gap between the pointer and a tooltip, and a tooltip's height.
+/// Gap between the pointer and a tooltip, a tooltip's height, and the room
+/// it keeps from the sidebar's edges.
 const TOOLTIP_GAP: f32 = 6.;
 const TOOLTIP_HEIGHT: f32 = 26.;
+const TOOLTIP_EDGE: f32 = 6.;
+const TOOLTIP_MAX_WIDTH: f32 = 180.;
 
 /// Small text tooltips with the control's shortcut, like Arc's. Anything
 /// drawn over the card is hidden behind the page on macOS, so they stay
-/// narrow and, in the sidebar's right half, open leftwards.
+/// inside the sidebar: in its right half they open leftwards, and either
+/// way they move along as far as they must to fit.
 pub struct Tooltip {
     text: SharedString,
     shortcut: &'static str,
     theme: Theme,
-    leftward: bool,
+    /// The sidebar's width.
+    width: f32,
+    /// The pointer's x when the tooltip opened.
+    pointer: f32,
 }
 
 impl Tooltip {
@@ -208,13 +216,14 @@ impl Tooltip {
     ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
         let (text, theme) = (text.into(), *theme);
         move |window, cx| {
-            let leftward = window.mouse_position().x > px(width / 2.);
+            let pointer = f32::from(window.mouse_position().x);
             let text = text.clone();
             cx.new(|_| Self {
                 text,
                 shortcut,
                 theme,
-                leftward,
+                width,
+                pointer,
             })
             .into()
         }
@@ -224,6 +233,7 @@ impl Tooltip {
 impl Render for Tooltip {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &self.theme;
+        let span = (self.width - 2. * TOOLTIP_EDGE).max(0.);
         let bubble = div()
             .font_family(UI_FONT)
             .flex()
@@ -236,7 +246,8 @@ impl Render for Tooltip {
             .border_1()
             .border_color(gpui::black().opacity(0.1))
             .shadow(vec![shadow(2., 8., 0.12)])
-            .max_w(px(180.))
+            .flex_none()
+            .max_w(px(TOOLTIP_MAX_WIDTH.min(span)))
             .text_size(px(12.))
             .text_color(theme.title())
             .child(truncated(self.text.clone()).min_w_0())
@@ -248,15 +259,25 @@ impl Render for Tooltip {
                         .child(self.shortcut),
                 )
             });
-        // GPUI puts a tooltip's top-left at the pointer; with no width of
-        // its own the tooltip can end at the pointer instead.
-        let tooltip = div().h(px(TOOLTIP_GAP + TOOLTIP_HEIGHT));
-        if self.leftward {
-            tooltip
-                .w_0()
-                .child(bubble.absolute().top(px(TOOLTIP_GAP)).right_0())
+        // GPUI puts a tooltip's top-left 1 pt right of the pointer. With no
+        // width of its own GPUI never flips it; the bubble sits in a row
+        // across the sidebar instead, beside the pointer, where a spacer
+        // that shrinks first keeps it from running past either edge.
+        let origin = self.pointer + 1.;
+        let spacer = |width: f32| div().min_w_0().w(px(width.max(0.)));
+        let row = div()
+            .absolute()
+            .top(px(TOOLTIP_GAP))
+            .left(px(TOOLTIP_EDGE - origin))
+            .w(px(span))
+            .flex();
+        let row = if self.pointer > self.width / 2. {
+            row.justify_end()
+                .child(bubble)
+                .child(spacer(self.width - TOOLTIP_EDGE - self.pointer))
         } else {
-            tooltip.pt(px(TOOLTIP_GAP)).child(bubble)
-        }
+            row.child(spacer(origin - TOOLTIP_EDGE)).child(bubble)
+        };
+        div().w_0().h(px(TOOLTIP_GAP + TOOLTIP_HEIGHT)).child(row)
     }
 }

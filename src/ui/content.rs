@@ -4,7 +4,7 @@
 use super::{CARD_RADIUS, SlideFrame, shadow, theme::Theme, theme::darkened_argb, truncated};
 use crate::app::BrowserApp;
 use gpui::{
-    Bounds, Div, ParentElement, Pixels, SharedString, Size, Styled, canvas, div, point,
+    Bounds, BoxShadow, Div, ParentElement, Pixels, SharedString, Size, Styled, canvas, div, point,
     prelude::FluentBuilder, px,
 };
 
@@ -12,6 +12,13 @@ use gpui::{
 /// bottom corners. The native corner caps match it there.
 const CAP_SHADOW_TOP: f32 = 0.04;
 const CAP_SHADOW_BOTTOM: f32 = 0.07;
+/// How far the card's shadow reaches past it: three blur sigmas (5 pt)
+/// plus the offset (2 pt), and some room.
+const SHADOW_REACH: f32 = 20.;
+
+fn card_shadow() -> Vec<BoxShadow> {
+    vec![shadow(2., 10., 0.14), shadow(0., 1., 0.10)]
+}
 
 /// Chromium's network error codes in plain words.
 fn error_message(error: &str) -> String {
@@ -103,9 +110,6 @@ impl BrowserApp {
             } else {
                 theme.empty_card()
             })
-            .when(!self.fullscreen, |card| {
-                card.shadow(vec![shadow(2., 10., 0.14), shadow(0., 1., 0.10)])
-            })
             .child(native_frame)
             .child(match active {
                 None => hint(theme, "Press ⌘T to open a tab", None),
@@ -136,6 +140,58 @@ impl BrowserApp {
                         .child(error),
                 )
             })
+    }
+
+    /// The card's shadow, drawn under it in four strips along its edges.
+    /// GPUI shades a shadow over its whole area, and the opaque card hides
+    /// nearly all of it; clipped to the strips, that part is never shaded.
+    /// The strips don't overlap, so no part of the shadow is drawn twice.
+    pub(super) fn render_card_shadow(&self, card: Bounds<Pixels>) -> Vec<Div> {
+        if self.fullscreen {
+            return Vec::new();
+        }
+        let (reach, radius) = (px(SHADOW_REACH), px(CARD_RADIUS));
+        let (left, top, right, bottom) = (card.left(), card.top(), card.right(), card.bottom());
+        [
+            (
+                point(left - reach, top - reach),
+                point(right + reach, top + radius),
+            ),
+            (
+                point(left - reach, bottom - radius),
+                point(right + reach, bottom + reach),
+            ),
+            (
+                point(left - reach, top + radius),
+                point(left + radius, bottom - radius),
+            ),
+            (
+                point(right - radius, top + radius),
+                point(right + reach, bottom - radius),
+            ),
+        ]
+        .into_iter()
+        .map(|(start, end)| {
+            let strip = Bounds::from_corners(start, end);
+            div()
+                .absolute()
+                .left(strip.left())
+                .top(strip.top())
+                .w(strip.size.width)
+                .h(strip.size.height)
+                .overflow_hidden()
+                .child(
+                    div()
+                        .absolute()
+                        .left(card.left() - strip.left())
+                        .top(card.top() - strip.top())
+                        .w(card.size.width)
+                        .h(card.size.height)
+                        .rounded(radius)
+                        .shadow(card_shadow()),
+                )
+        })
+        .collect()
     }
 
     /// A thin bar in the margin above the card while the active page loads.
