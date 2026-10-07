@@ -3,16 +3,19 @@
 
 pub mod command_bar;
 mod content;
+pub mod drag;
 pub mod icons;
 pub mod menu;
 mod sidebar;
+pub mod swipe;
 pub mod theme;
 
 use crate::{Dismiss, app::BrowserApp};
+use drag::DraggedEdge;
 use gpui::{
-    AnyView, App, AppContext, Bounds, BoxShadow, Context, Div, FontWeight, Hsla,
+    AnyView, App, AppContext, Bounds, BoxShadow, Context, Div, DragMoveEvent, FontWeight,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Render, SharedString,
-    Styled, Window, div, point, px, size,
+    Styled, Window, div, point, prelude::FluentBuilder, px, size,
 };
 use theme::Theme;
 
@@ -92,6 +95,10 @@ impl BrowserApp {
 
 impl Render for BrowserApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A tab drag that ended outside the sidebar leaves nothing behind.
+        if !cx.has_active_drag() {
+            self.tab_drag = None;
+        }
         let viewport = window.viewport_size();
         let (frame, slide_finished) = self.slide_frame(window);
         let theme = match (frame, &self.slide) {
@@ -115,6 +122,13 @@ impl Render for BrowserApp {
             .key_context("Browser")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &Dismiss, _, cx| this.close_menu(cx)))
+            // The sidebar's edge may be dragged anywhere, even with the sidebar hidden.
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedEdge>, _, cx| {
+                    let start_width = event.drag(cx).start_width;
+                    this.drag_sidebar_edge(f32::from(event.event.position.x), start_width, cx)
+                }),
+            )
             // The whole window background is one gradient quad.
             .bg(theme.background())
             .child(self.render_card(card, &theme, frame, slide_finished, viewport))
@@ -170,41 +184,79 @@ pub fn placeholder_favicon(host: Option<&str>, theme: &Theme) -> Div {
         .child(initial)
 }
 
-/// Small text tooltips. They are kept narrow, as anything drawn over the
-/// card is hidden behind the page on macOS.
+/// Gap between the pointer and a tooltip, and a tooltip's height.
+const TOOLTIP_GAP: f32 = 6.;
+const TOOLTIP_HEIGHT: f32 = 26.;
+
+/// Small text tooltips with the control's shortcut, like Arc's. Anything
+/// drawn over the card is hidden behind the page on macOS, so they stay
+/// narrow and, in the sidebar's right half, open leftwards.
 pub struct Tooltip {
     text: SharedString,
-    background: Hsla,
-    color: Hsla,
+    shortcut: &'static str,
+    theme: Theme,
+    leftward: bool,
 }
 
 impl Tooltip {
-    pub fn view(text: impl Into<SharedString>, theme: &Theme, cx: &mut App) -> AnyView {
-        let (text, background, color) = (text.into(), theme.surface(), theme.title());
-        cx.new(|_| Self {
-            text,
-            background,
-            color,
-        })
-        .into()
+    /// A tooltip for a control in the sidebar, which is `width` wide.
+    pub fn build(
+        text: impl Into<SharedString>,
+        shortcut: &'static str,
+        theme: &Theme,
+        width: f32,
+    ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+        let (text, theme) = (text.into(), *theme);
+        move |window, cx| {
+            let leftward = window.mouse_position().x > px(width / 2.);
+            let text = text.clone();
+            cx.new(|_| Self {
+                text,
+                shortcut,
+                theme,
+                leftward,
+            })
+            .into()
+        }
     }
 }
 
 impl Render for Tooltip {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let theme = &self.theme;
+        let bubble = div()
             .font_family(UI_FONT)
-            .mt(px(6.))
+            .flex()
+            .gap(px(6.))
+            .h(px(TOOLTIP_HEIGHT))
+            .items_center()
             .px(px(8.))
-            .py(px(4.))
             .rounded(px(6.))
-            .bg(self.background)
+            .bg(theme.surface())
             .border_1()
             .border_color(gpui::black().opacity(0.1))
             .shadow(vec![shadow(2., 8., 0.12)])
             .max_w(px(180.))
             .text_size(px(12.))
-            .text_color(self.color)
-            .child(truncated(self.text.clone()))
+            .text_color(theme.title())
+            .child(truncated(self.text.clone()).min_w_0())
+            .when(!self.shortcut.is_empty(), |bubble| {
+                bubble.child(
+                    div()
+                        .flex_none()
+                        .text_color(theme.tertiary())
+                        .child(self.shortcut),
+                )
+            });
+        // GPUI puts a tooltip's top-left at the pointer; with no width of
+        // its own the tooltip can end at the pointer instead.
+        let tooltip = div().h(px(TOOLTIP_GAP + TOOLTIP_HEIGHT));
+        if self.leftward {
+            tooltip
+                .w_0()
+                .child(bubble.absolute().top(px(TOOLTIP_GAP)).right_0())
+        } else {
+            tooltip.pt(px(TOOLTIP_GAP)).child(bubble)
+        }
     }
 }
