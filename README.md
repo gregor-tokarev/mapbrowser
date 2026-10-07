@@ -28,7 +28,7 @@ Your tabs live in a sidebar instead of across the top. Group them into spaces, o
 - Spaces appear as dots at the bottom of the sidebar.
 - To switch, click a dot, swipe sideways with two fingers on the sidebar, or use `⌃1`–`⌃9` or `⌥⌘←` / `⌥⌘→`.
 - The … beside a space's name renames it and sets its colour and icon. **Unload Space** puts all of its pages to sleep when you're done with them.
-- The + at the bottom right creates a space.
+- The + at the bottom right creates a space. **Delete Space**, in the same … menu or on a right-click on a space's dot, removes a space with its tabs, logins and other site data, after asking. Your last space can't be deleted.
 
 **Getting around.**
 
@@ -36,14 +36,15 @@ Your tabs live in a sidebar instead of across the top. Group them into spaces, o
 |---|---|
 | `⌘S` | Hide or show the sidebar |
 | `⌘1`–`⌘9` | Go to a tab |
-| `⌃Tab`, `⌥⌘↑` / `⌥⌘↓` | Next or previous tab |
+| `⌃Tab` | Back to the tab you were on. Hold `⌃` and press `Tab` again to go further back; the sidebar outlines the tab you'll get |
+| `⌥⌘↑` / `⌥⌘↓` | Previous or next tab in the sidebar |
 | `⌘R` | Reload |
 | `⌘[` / `⌘]` | Back and forward |
 | `⇧⌘C` | Copy the address |
 
 Drag the sidebar's edge to resize it; double-click the edge to reset it. The shield beside the address turns ad and tracker blocking off for that site.
 
-Spaces, tabs and selections come back when you reopen Map Browser. Your browsing data stays on your Mac.
+Spaces, tabs and selections come back when you reopen Map Browser, and the window opens where you left it, at the same size. Your browsing data stays on your Mac.
 
 ## Status
 
