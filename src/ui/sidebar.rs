@@ -768,7 +768,9 @@ impl BrowserApp {
         let id = tab.id;
         let hover = theme.hover();
         let button_hover = theme.ink(if theme.dark { 0.10 } else { 0.07 });
-        let show_close = self.hovered_tab == Some(id) && self.tab_drag.is_none();
+        let show_close = interactive && self.tab_drag.is_none();
+        // Titles use the whole row until the pointer is over it.
+        let title_room = show_close && self.hovered_tab == Some(id);
         // Pinned tabs and favorites unload ("–") instead of closing.
         let glyph = if tab.pin == Pin::Today {
             Icon::Close
@@ -777,6 +779,8 @@ impl BrowserApp {
         };
         div()
             .id(("tab", id))
+            .group("tab-row")
+            .relative()
             .flex()
             .items_center()
             .h(px(ROW_HEIGHT))
@@ -799,6 +803,7 @@ impl BrowserApp {
                     .flex_1()
                     .min_w_0()
                     .ml(px(11.5))
+                    .when(title_room, |title| title.mr(px(24.)))
                     .text_size(px(14.))
                     .text_color(theme.title()),
             )
@@ -814,7 +819,6 @@ impl BrowserApp {
                             this.open_menu(MenuKind::Tab(id), event.position, window, cx)
                         }),
                     )
-                    // Titles use the whole row until the close button shows.
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         let hovered_tab = if *hovered {
                             Some(id)
@@ -826,18 +830,24 @@ impl BrowserApp {
                             cx.notify();
                         }
                     }))
+                    // Shown by the row's hover in each frame, not by
+                    // `hovered_tab`: after a close the next row moves under a
+                    // still pointer, and a second click must close it too.
                     .when(show_close, |row| {
                         row.child(
                             press_only(
                                 div()
                                     .id("close")
+                                    .absolute()
+                                    .right(px(4.))
+                                    .top(px((ROW_HEIGHT - 20.) / 2.))
                                     .flex()
-                                    .flex_none()
                                     .items_center()
                                     .justify_center()
                                     .size(px(20.))
-                                    .ml(px(4.))
                                     .rounded(px(5.))
+                                    .invisible()
+                                    .group_hover("tab-row", |style| style.visible())
                                     .hover(move |style| style.bg(button_hover))
                                     .child(icon(glyph, 18., theme.icon())),
                             )
