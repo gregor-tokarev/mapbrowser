@@ -2,10 +2,11 @@ use super::{BoolExt, MacDisplay, NSRange, NSStringExt, ns_string, renderer};
 use crate::{
     AnyWindowHandle, Bounds, Capslock, DisplayLink, ExternalPaths, FileDropEvent,
     ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformInput, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    SharedString, Size, SystemWindowTab, Timer, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowKind, WindowParams, dispatch_get_main_queue,
+    MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformWindow, Point, PromptButton, PromptLevel,
+    RequestFrameOptions, SharedString, Size, SystemWindowTab, Timer, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind, WindowParams,
+    dispatch_get_main_queue,
     dispatch_sys::{DISPATCH_TIME_NOW, dispatch_after_f, dispatch_async_f, dispatch_time},
     platform::{
         PlatformInputHandler,
@@ -75,6 +76,8 @@ const NSPopUpWindowLevel: NSInteger = 101;
 const NSTrackingMouseEnteredAndExited: NSUInteger = 0x01;
 #[allow(non_upper_case_globals)]
 const NSTrackingMouseMoved: NSUInteger = 0x02;
+#[allow(non_upper_case_globals)]
+const NSTrackingActiveInKeyWindow: NSUInteger = 0x20;
 #[allow(non_upper_case_globals)]
 const NSTrackingActiveAlways: NSUInteger = 0x80;
 #[allow(non_upper_case_globals)]
@@ -409,6 +412,9 @@ struct MacWindowState {
     input_handler: Option<PlatformInputHandler>,
     last_key_equivalent: Option<KeyDownEvent>,
     synthetic_drag_counter: usize,
+    /// Timestamp and position of the last mouse move passed on, to drop the
+    /// second delivery of the same move.
+    last_mouse_move: Option<(f64, Point<Pixels>)>,
     traffic_light_position: Option<Point<Pixels>>,
     transparent_titlebar: bool,
     previous_modifiers_changed_event: Option<PlatformInput>,
@@ -947,6 +953,7 @@ impl MacWindow {
                 input_handler: None,
                 last_key_equivalent: None,
                 synthetic_drag_counter: 0,
+                last_mouse_move: None,
                 traffic_light_position: titlebar
                     .as_ref()
                     .and_then(|titlebar| titlebar.traffic_light_position),
@@ -1019,6 +1026,22 @@ impl MacWindow {
                 WindowKind::Normal | WindowKind::Floating => {
                     native_window.setLevel_(NSNormalWindowLevel);
                     native_window.setAcceptsMouseMovedEvents_(YES);
+                    // AppKit sends mouse moves to the first responder only, and a
+                    // native subview (an embedded web view) can be that. A tracking
+                    // area sends them here too, wherever keyboard focus is, so
+                    // hover states follow the pointer. When this view is first
+                    // responder a move arrives twice; handle_view_event drops the
+                    // copy.
+                    let tracking_area: id = msg_send![class!(NSTrackingArea), alloc];
+                    let _: () = msg_send![
+                        tracking_area,
+                        initWithRect: NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.))
+                        options: NSTrackingMouseEnteredAndExited | NSTrackingMouseMoved | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect
+                        owner: native_view
+                        userInfo: nil
+                    ];
+                    let _: () =
+                        msg_send![native_view, addTrackingArea: tracking_area.autorelease()];
 
                     if let Some(tabbing_identifier) = tabbing_identifier {
                         let tabbing_id = NSString::alloc(nil).init_str(tabbing_identifier.as_str());
@@ -1172,6 +1195,8 @@ impl MacWindow {
 impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
+        // Pending synthetic drags stop at their next tick.
+        this.synthetic_drag_counter += 1;
         this.renderer.destroy();
         let window = this.native_window;
         this.frame_pacer.close();
@@ -1465,9 +1490,19 @@ impl PlatformWindow for MacWindow {
         unsafe { self.0.lock().native_window.isKeyWindow() == YES }
     }
 
-    // is_hovered is unused on macOS. See Window::is_window_hovered.
+    /// Whether the pointer is over this view itself rather than a native
+    /// subview (an embedded web view), which sets its own cursor. See
+    /// Window::is_window_hovered.
     fn is_hovered(&self) -> bool {
-        false
+        let lock = self.0.lock();
+        unsafe {
+            let view = lock.native_view.as_ptr() as id;
+            let superview: id = msg_send![view, superview];
+            let location = lock.native_window.mouseLocationOutsideOfEventStream();
+            let location: NSPoint = msg_send![superview, convertPoint: location fromView: nil];
+            let hit: id = msg_send![view, hitTest: location];
+            hit == view
+        }
     }
 
     fn set_title(&mut self, title: &str) {
@@ -2129,6 +2164,19 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
                 }
             }
 
+            PlatformInput::MouseMove(MouseMoveEvent {
+                pressed_button: None,
+                position,
+                ..
+            }) => {
+                // The same move through the tracking area and as first responder.
+                let timestamp: f64 = unsafe { msg_send![native_event, timestamp] };
+                if lock.last_mouse_move == Some((timestamp, *position)) {
+                    return;
+                }
+                lock.last_mouse_move = Some((timestamp, *position));
+            }
+
             PlatformInput::MouseUp(MouseUpEvent { .. }) => {
                 lock.synthetic_drag_counter += 1;
             }
@@ -2156,6 +2204,20 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
 
         if let Some(mut callback) = lock.event_callback.take() {
             drop(lock);
+            // Hover states and tooltips follow mouse moves only: a move to
+            // where the pointer left the view clears them.
+            if let PlatformInput::MouseExited(MouseExitEvent {
+                position,
+                pressed_button: None,
+                modifiers,
+            }) = event
+            {
+                callback(PlatformInput::MouseMove(MouseMoveEvent {
+                    position,
+                    pressed_button: None,
+                    modifiers,
+                }));
+            }
             callback(event);
             window_state.lock().event_callback = Some(callback);
         }
@@ -2717,17 +2779,21 @@ async fn synthetic_drag(
 ) {
     loop {
         Timer::after(Duration::from_millis(16)).await;
-        if let Some(window_state) = window_state.upgrade() {
-            let mut lock = window_state.lock();
-            if lock.synthetic_drag_counter == drag_id {
-                if let Some(mut callback) = lock.event_callback.take() {
-                    drop(lock);
-                    callback(PlatformInput::MouseMove(event.clone()));
-                    window_state.lock().event_callback = Some(callback);
-                }
-            } else {
-                break;
-            }
+        // Stop once the window is gone or every button is up: the mouse-up
+        // can go to another window, or never come for a window that closed.
+        let Some(window_state) = window_state.upgrade() else {
+            break;
+        };
+        let pressed_buttons: NSUInteger =
+            unsafe { msg_send![class!(NSEvent), pressedMouseButtons] };
+        let mut lock = window_state.lock();
+        if lock.synthetic_drag_counter != drag_id || pressed_buttons == 0 {
+            break;
+        }
+        if let Some(mut callback) = lock.event_callback.take() {
+            drop(lock);
+            callback(PlatformInput::MouseMove(event.clone()));
+            window_state.lock().event_callback = Some(callback);
         }
     }
 }

@@ -52,3 +52,30 @@ dependencies. Run its tests on any host with
 `rustc --edition 2024 --test vendor/gpui/src/platform/frame_pacing.rs -o /tmp/frame_pacing && /tmp/frame_pacing`.
 Measure idle and interaction wakeups and keystroke latency on a Mac before
 claiming energy savings.
+
+Input fixes for a window that embeds native views (`src/platform/mac/window.rs`,
+`src/window.rs`, `src/elements/div.rs`), kept apart from the frame patch:
+
+- Normal windows get a tracking area for mouse moves, entering and exiting
+  while key, like pop-up windows already had. AppKit sends mouse moves only to
+  the first responder, so while an embedded web view had keyboard focus GPUI
+  saw none and every hover state, `on_hover` and tooltip went dead. While
+  GPUI's view is first responder AppKit delivers each move twice; the second
+  delivery (same timestamp and position) is dropped. Leaving the view sends a
+  mouse move to the exit point before the exit event, so hover states and
+  tooltips clear.
+- `Window::is_window_hovered` (which gates every cursor change) is false on
+  macOS while the pointer is over a native subview, so redraws and hit-test
+  changes no longer replace the web page's cursor with GPUI's arrow.
+- The 16 ms synthetic drag loop stops when its window state is gone, when the
+  window closes, and when no mouse button is pressed. Upstream looped forever
+  once the window was gone (a mouse-up landing in another window or a window
+  closed mid-drag), waking the main thread about 60 times a second.
+- Scroll events clamp the offset before deciding to notify, so a scroll that
+  can't move the content (it fits, or is at its end) no longer redraws the
+  whole view for every wheel and momentum event.
+
+Check on a Mac: with a web page focused, hovering sidebar rows shows their
+close buttons and tooltips appear; the page's cursor (I-beam, hand) is not
+reset to an arrow while the shell redraws; idle wakeups stay at zero after
+pressing a command-bar row, moving slightly and releasing.
