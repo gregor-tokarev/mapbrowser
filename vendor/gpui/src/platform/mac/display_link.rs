@@ -1,7 +1,7 @@
 use crate::{
     dispatch_get_main_queue,
     dispatch_sys::{
-        _dispatch_source_type_data_add, dispatch_resume, dispatch_set_context,
+        _dispatch_source_type_data_add, dispatch_object_t, dispatch_resume, dispatch_set_context,
         dispatch_source_cancel, dispatch_source_create, dispatch_source_merge_data,
         dispatch_source_set_event_handler_f, dispatch_source_t,
     },
@@ -11,6 +11,12 @@ use core_graphics::display::CGDirectDisplayID;
 use std::ffi::c_void;
 use util::ResultExt;
 
+unsafe extern "C" {
+    // libdispatch (libSystem). Not in the generated bindings; same signature as the
+    // generated `dispatch_resume`.
+    fn dispatch_release(object: dispatch_object_t);
+}
+
 /// A CVDisplayLink that forwards each refresh to `callback` on the main queue.
 ///
 /// The link can be started and stopped any number of times. The dispatch source that
@@ -18,6 +24,9 @@ use util::ResultExt;
 /// cancelled when it is dropped. It is never suspended, so suspend and resume calls cannot
 /// become unbalanced (over-resuming a dispatch object crashes). A refresh merged just before
 /// `stop` may still be delivered once afterwards; callers must tolerate that.
+///
+/// Dropping a link that was started leaks the CVDisplayLink and the cancelled source (see
+/// `Drop`), so callers should replace links only when needed.
 pub struct DisplayLink {
     display_link: Option<sys::DisplayLink>,
     frame_requests: dispatch_source_t,
@@ -46,30 +55,39 @@ impl DisplayLink {
         }
 
         unsafe {
+            // The CVDisplayLink comes first, so that its failures leave no dispatch source
+            // behind. Until it is started no CoreVideo thread uses it, and dropping it here
+            // releases it.
+            let mut display_link = sys::DisplayLink::new(display_id)?;
+
             let frame_requests = dispatch_source_create(
                 &_dispatch_source_type_data_add,
                 0,
                 0,
                 dispatch_get_main_queue(),
             );
-            dispatch_set_context(
-                crate::dispatch_sys::dispatch_object_t {
-                    _ds: frame_requests,
-                },
-                data,
+            anyhow::ensure!(
+                !frame_requests.is_null(),
+                "could not create dispatch source"
             );
-            dispatch_source_set_event_handler_f(frame_requests, Some(callback));
-
-            let display_link = sys::DisplayLink::new(
-                display_id,
-                display_link_callback,
-                frame_requests as *mut c_void,
-            )?;
-
-            // Dispatch sources are created inactive. This is the only resume.
-            dispatch_resume(crate::dispatch_sys::dispatch_object_t {
+            let source = dispatch_object_t {
                 _ds: frame_requests,
-            });
+            };
+            if let Err(error) = display_link
+                .set_output_callback(display_link_callback, frame_requests as *mut c_void)
+            {
+                // SAFETY: releasing an inactive source crashes, so activate it, cancel it, then
+                // release it. It has no handler yet, and the link never ran, so nothing else
+                // refers to the source.
+                dispatch_resume(source);
+                dispatch_source_cancel(frame_requests);
+                dispatch_release(source);
+                return Err(error);
+            }
+            dispatch_set_context(source, data);
+            dispatch_source_set_event_handler_f(frame_requests, Some(callback));
+            // Dispatch sources are created inactive. This is the only resume.
+            dispatch_resume(source);
 
             Ok(Self {
                 display_link: Some(display_link),
@@ -120,6 +138,13 @@ impl Drop for DisplayLink {
         // is still accessing it.
         //
         // We might also want to upgrade to CADisplayLink, but that requires dropping old macOS support.
+        //
+        // Upstream later found (zed#32116) that `CVDisplayLinkStop` only asks that thread to
+        // exit and returns at once. Releasing the link after a delay would not be safe either,
+        // because nothing bounds when the thread exits: it may be waiting for a refresh, for
+        // example until a sleeping display wakes. The cancelled source is not released for the
+        // same reason, since that thread may still pass it to `dispatch_source_merge_data`.
+        // Cancelled, it no longer wakes the main queue.
         std::mem::forget(self.display_link.take());
         unsafe {
             dispatch_source_cancel(self.frame_requests);
@@ -258,11 +283,7 @@ mod sys {
 
     impl DisplayLink {
         /// Apple docs: [CVDisplayLinkCreateWithCGDisplay](https://developer.apple.com/documentation/corevideo/1456981-cvdisplaylinkcreatewithcgdisplay?language=objc)
-        pub unsafe fn new(
-            display_id: CGDirectDisplayID,
-            callback: CVDisplayLinkOutputCallback,
-            user_info: *mut c_void,
-        ) -> Result<Self> {
+        pub unsafe fn new(display_id: CGDirectDisplayID) -> Result<Self> {
             unsafe {
                 let mut display_link: *mut CVDisplayLink = 0 as _;
 
@@ -270,9 +291,6 @@ mod sys {
                 anyhow::ensure!(code == 0, "could not create display link, code: {}", code);
 
                 let mut display_link = DisplayLink::from_ptr(display_link);
-
-                let code = CVDisplayLinkSetOutputCallback(&mut display_link, callback, user_info);
-                anyhow::ensure!(code == 0, "could not set output callback, code: {}", code);
 
                 let code = CVDisplayLinkSetCurrentCGDisplay(&mut display_link, display_id);
                 anyhow::ensure!(
@@ -287,6 +305,19 @@ mod sys {
     }
 
     impl DisplayLinkRef {
+        /// Apple docs: [CVDisplayLinkSetOutputCallback](https://developer.apple.com/documentation/corevideo/1457096-cvdisplaylinksetoutputcallback?language=objc)
+        pub unsafe fn set_output_callback(
+            &mut self,
+            callback: CVDisplayLinkOutputCallback,
+            user_info: *mut c_void,
+        ) -> Result<()> {
+            unsafe {
+                let code = CVDisplayLinkSetOutputCallback(self, callback, user_info);
+                anyhow::ensure!(code == 0, "could not set output callback, code: {}", code);
+                Ok(())
+            }
+        }
+
         /// Apple docs: [CVDisplayLinkStart](https://developer.apple.com/documentation/corevideo/1457193-cvdisplaylinkstart?language=objc)
         pub unsafe fn start(&mut self) -> Result<()> {
             unsafe {

@@ -10,7 +10,7 @@ use crate::{
     dispatch_sys::{DISPATCH_TIME_NOW, dispatch_after_f, dispatch_async_f, dispatch_time},
     platform::{
         PlatformInputHandler,
-        frame_pacing::{FramePacing, LinkAction, Watchdog},
+        frame_pacing::{FramePacing, LinkAction, MAX_SOURCE_FAILURES, Watchdog},
     },
     point, px, size,
 };
@@ -566,10 +566,9 @@ const IDLE_REFRESHES_BEFORE_PAUSE: u32 = 8;
 
 /// How long a display link that should be running may go without a refresh before it is
 /// replaced, and how soon a failed start is retried while a frame is wanted. Doubles after
-/// each consecutive failure, up to 2^`MAX_WATCHDOG_BACKOFF` times, so a link that never
-/// works does not leak a replacement every period.
+/// each consecutive failure; after [`MAX_SOURCE_FAILURES`] of them the watchdog gives up
+/// (about 4 s in all) until something that may have repaired the link happens.
 const DISPLAY_LINK_WATCHDOG_PERIOD: Duration = Duration::from_millis(250);
-const MAX_WATCHDOG_BACKOFF: u32 = 5;
 
 /// How many times in a row a scene that found no drawable is presented again.
 const MAX_PRESENT_RETRIES: u32 = 3;
@@ -583,6 +582,8 @@ const MAX_PRESENT_RETRIES: u32 = 3;
 /// watchdog finds that it should run but delivers no refreshes: upstream recreated the link
 /// on every occlusion change, activation and `displayLayer:`, which incidentally repaired
 /// such links, and a link that is believed to run but never fires would freeze the window.
+/// The window counts as hidden while the displays sleep, because a link on a sleeping
+/// display delivers no refreshes while AppKit may still report the window as visible.
 ///
 /// Main thread only. The CoreVideo thread touches only the link's dispatch source. This
 /// lives outside the `MacWindowState` mutex so that frame requests never take that lock.
@@ -590,8 +591,6 @@ struct MacFramePacer {
     this: std::rc::Weak<MacFramePacer>,
     pacing: Cell<FramePacing>,
     display_link: RefCell<Option<DisplayLink>>,
-    /// Consecutive watchdog checks that found a stalled link or retried a failed start.
-    watchdog_failures: Cell<u32>,
     /// The next frame must present even if GPUI draws nothing: the window just became
     /// visible (its layer contents may be stale), or the last present found no drawable.
     force_present: Cell<bool>,
@@ -602,16 +601,20 @@ struct MacFramePacer {
 
 impl MacFramePacer {
     fn new(native_window: id, native_view: id) -> Rc<Self> {
-        Rc::new_cyclic(|this| Self {
+        let frame_pacer = Rc::new_cyclic(|this| Self {
             this: this.clone(),
             pacing: Cell::new(FramePacing::new(IDLE_REFRESHES_BEFORE_PAUSE)),
             display_link: RefCell::new(None),
-            watchdog_failures: Cell::new(0),
             force_present: Cell::new(false),
             present_retries: Cell::new(0),
             native_window,
             native_view: native_view as *mut c_void,
-        })
+        });
+        FRAME_PACERS.with_borrow_mut(|frame_pacers| {
+            frame_pacers.retain(|frame_pacer| frame_pacer.strong_count() > 0);
+            frame_pacers.push(frame_pacer.this.clone());
+        });
+        frame_pacer
     }
 
     fn read<R>(&self, f: impl FnOnce(&mut FramePacing) -> R) -> R {
@@ -687,8 +690,7 @@ impl MacFramePacer {
         if !self.read(|pacing| pacing.arm_watchdog()) {
             return;
         }
-        let backoff = self.watchdog_failures.get().min(MAX_WATCHDOG_BACKOFF);
-        let period = DISPLAY_LINK_WATCHDOG_PERIOD * (1 << backoff);
+        let period = DISPLAY_LINK_WATCHDOG_PERIOD * (1 << self.pacing.get().failures());
         // A `dispatch_after` timer cannot be cancelled, so it holds a weak reference that
         // `fire_display_link_watchdog` frees.
         let context = Box::into_raw(Box::new(self.this.clone()));
@@ -705,33 +707,35 @@ impl MacFramePacer {
 
     fn watchdog(&self) {
         match self.read(|pacing| pacing.watchdog()) {
-            Watchdog::Disarm => self.watchdog_failures.set(0),
-            Watchdog::Rearm(LinkAction::None) => {
-                self.watchdog_failures.set(0);
-                self.arm_watchdog();
-            }
+            Watchdog::Disarm => {}
             Watchdog::Rearm(action) => {
-                self.watchdog_failures
-                    .set(self.watchdog_failures.get().saturating_add(1));
                 self.apply(action);
                 self.arm_watchdog();
             }
             Watchdog::Recreate => {
-                let failures = self.watchdog_failures.get();
-                log::warn!(
-                    "display link delivered no refresh for {:?}; recreating it",
-                    DISPLAY_LINK_WATCHDOG_PERIOD * (1 << failures.min(MAX_WATCHDOG_BACKOFF))
-                );
-                self.watchdog_failures.set(failures.saturating_add(1));
+                log::warn!("display link delivered no refresh; recreating it");
                 self.drop_link();
                 self.apply(LinkAction::Start);
                 self.arm_watchdog();
+            }
+            Watchdog::GiveUp => {
+                log::warn!(
+                    "display link still not working after {MAX_SOURCE_FAILURES} retries; \
+                     waiting for the displays or the window to change"
+                );
+                self.drop_link();
             }
         }
     }
 
     fn request(&self) {
         self.update(|pacing| pacing.request());
+    }
+
+    /// Something happened that may have repaired a display link the watchdog gave up on. See
+    /// [`FramePacing::retry`]. Giving up dropped the link, so this starts a new one.
+    fn retry(&self) {
+        self.update(|pacing| pacing.retry());
     }
 
     fn set_visible(&self, visible: bool) {
@@ -747,16 +751,18 @@ impl MacFramePacer {
         self.update(|pacing| pacing.set_visible(visible));
     }
 
-    /// Applies the window's current occlusion state.
+    /// Applies the window's current occlusion state. The window counts as hidden while the
+    /// displays sleep.
     fn update_visibility(&self) {
         if self.pacing.get().is_closed() {
             return;
         }
-        let visible = unsafe {
-            self.native_window
-                .occlusionState()
-                .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
-        };
+        let visible = !DISPLAYS_ASLEEP.get()
+            && unsafe {
+                self.native_window
+                    .occlusionState()
+                    .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
+            };
         self.set_visible(visible);
     }
 
@@ -766,6 +772,7 @@ impl MacFramePacer {
         if self.pacing.get().is_running() {
             self.apply(LinkAction::Start);
         }
+        self.retry();
         self.request();
     }
 
@@ -808,6 +815,47 @@ extern "C" fn fire_display_link_watchdog(context: *mut c_void) {
     let frame_pacer = unsafe { Box::from_raw(context as *mut std::rc::Weak<MacFramePacer>) };
     if let Some(frame_pacer) = frame_pacer.upgrade() {
         frame_pacer.watchdog();
+    }
+}
+
+thread_local! {
+    /// The frame pacer of every window, for events that concern all windows.
+    static FRAME_PACERS: RefCell<Vec<std::rc::Weak<MacFramePacer>>> =
+        const { RefCell::new(Vec::new()) };
+    /// Whether the displays sleep: between `NSWorkspaceScreensDidSleepNotification` and
+    /// `NSWorkspaceScreensDidWakeNotification`.
+    static DISPLAYS_ASLEEP: Cell<bool> = const { Cell::new(false) };
+}
+
+fn frame_pacers() -> Vec<Rc<MacFramePacer>> {
+    FRAME_PACERS.with_borrow_mut(|frame_pacers| {
+        frame_pacers.retain(|frame_pacer| frame_pacer.strong_count() > 0);
+        frame_pacers
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .collect()
+    })
+}
+
+/// The displays went to sleep or woke up. Windows count as hidden while the displays sleep,
+/// as in Chromium and the JDK: a display link on a sleeping display delivers no refreshes,
+/// and AppKit can keep reporting the window as visible, so the link watchdog would otherwise
+/// replace links that cannot work. Waking shows the windows again with new links, presents
+/// them, and retries links the watchdog gave up on.
+pub(crate) fn set_displays_asleep(asleep: bool) {
+    DISPLAYS_ASLEEP.set(asleep);
+    for frame_pacer in frame_pacers() {
+        frame_pacer.update_visibility();
+        if !asleep {
+            frame_pacer.retry();
+        }
+    }
+}
+
+/// The display configuration changed. Retries display links the watchdog gave up on.
+pub(crate) fn screen_parameters_changed() {
+    for frame_pacer in frame_pacers() {
+        frame_pacer.retry();
     }
 }
 
@@ -1984,7 +2032,9 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
                 return NO;
             }
 
+            let frame_pacer = lock.frame_pacer.clone();
             drop(lock);
+            frame_pacer.retry();
 
             let is_composing =
                 with_input_handler(this, |input_handler| input_handler.marked_text_range())
@@ -2135,7 +2185,9 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
 
         match &event {
             PlatformInput::MouseDown(_) => {
+                let frame_pacer = lock.frame_pacer.clone();
                 drop(lock);
+                frame_pacer.retry();
                 unsafe {
                     let input_context: id = msg_send![this, inputContext];
                     msg_send![input_context, handleEvent: native_event]
@@ -2227,13 +2279,12 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
 extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let lock = window_state.lock();
-    let visible = lock.is_visible();
-    if visible {
+    if lock.is_visible() {
         lock.move_traffic_light();
     }
     let frame_pacer = lock.frame_pacer.clone();
     drop(lock);
-    frame_pacer.set_visible(visible);
+    frame_pacer.update_visibility();
 }
 
 extern "C" fn window_did_resize(this: &Object, _: Sel, _: id) {
@@ -2321,9 +2372,9 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
     if selector == sel!(windowDidBecomeKey:) && is_active {
         let window_state = unsafe { get_window_state(this) };
         let mut lock = window_state.lock();
+        let frame_pacer = lock.frame_pacer.clone();
 
         if lock.activated_least_once {
-            let frame_pacer = lock.frame_pacer.clone();
             if let Some(mut callback) = lock.request_frame_callback.take() {
                 #[cfg(not(feature = "macos-blade"))]
                 lock.renderer.set_presents_with_transaction(true);
@@ -2346,7 +2397,9 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
             frame_pacer.update_visibility();
         } else {
             lock.activated_least_once = true;
+            drop(lock);
         }
+        frame_pacer.retry();
     }
 
     executor

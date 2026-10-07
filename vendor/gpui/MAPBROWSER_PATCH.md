@@ -40,8 +40,30 @@ Here the link is replaced when the window becomes visible, when it is bound to
 another display than the window's, and when a start fails. While the link
 should run, a watchdog timer checks every 250 ms that refreshes arrive and
 replaces the link if none did. It also retries a failed start while a frame is
-wanted. The timer backs off to 8 s while failures repeat and stops when the
-link stops, so an idle window has no timers. Becoming visible presents the
+wanted; until then frame requests only record demand, so a link that cannot
+start is not rebuilt on every invalidation. The period doubles with each
+failure, and after three replacements or retries in a row without a refresh
+(about 4 s) the watchdog gives up: it drops the link and stops. Only the window
+becoming visible, the displays waking, a display configuration change, the
+window moving to another display or becoming key, or a click or key press in
+it then starts a new link. The timer also stops when the link stops, so an idle
+window has no timers.
+
+Windows count as hidden while the displays sleep (from
+`NSWorkspaceScreensDidSleepNotification` to
+`NSWorkspaceScreensDidWakeNotification`), as in Chromium and the JDK: a link on
+a sleeping display delivers no refreshes, and AppKit can keep reporting the
+window as visible, so the watchdog would otherwise keep replacing links that
+cannot work. Waking shows the windows again with a new link and one forced
+present.
+
+A replaced link is stopped and its dispatch source cancelled, but neither is
+released, as upstream: `CVDisplayLinkStop` returns without waiting for the
+link's thread, which may still use both (zed#32116). Each replacement therefore
+leaks one small CVDisplayLink and one cancelled source; the cases above bound
+how often that happens. A failed `DisplayLink::new` leaks nothing: the
+CVDisplayLink is set up first, and a source whose link could not take it is
+activated, cancelled and released. Becoming visible presents the
 current scene once, and a present that found no drawable is retried up to
 three times. Effects queued by platform callbacks that run outside
 `App::update` (launch, reopen, keyboard layout change) are flushed right away,

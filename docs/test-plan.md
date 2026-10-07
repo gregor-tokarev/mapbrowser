@@ -103,3 +103,5 @@ The redesign was built on a machine without macOS: it type-checks for macOS and 
 ### Energy
 
 Follow the measuring section of [energy design](energy.md). The first check is the idle one: with one quiet page visible, the main process should show no periodic wakeups, also after pressing a command-bar result, moving slightly and releasing.
+
+Display sleep: on power, with audio playing in one tab and another tab whose title keeps changing, run `pmset displaysleepnow` and leave the display off for ten minutes (once with "Require password" set to a delay or off, so the window is not hidden by the lock screen). While it is off, the main process shows no periodic wakeups and the log no "display link" warnings. On waking, the sidebar and an open command bar redraw at once, without a freeze of several seconds, and show the latest titles.

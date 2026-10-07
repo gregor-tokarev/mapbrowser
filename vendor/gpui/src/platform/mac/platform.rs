@@ -149,6 +149,19 @@ unsafe fn build_classes() {
                 on_keyboard_layout_change as extern "C" fn(&mut Object, Sel, id),
             );
 
+            decl.add_method(
+                sel!(onScreensDidSleep:),
+                on_screens_did_sleep as extern "C" fn(&mut Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(onScreensDidWake:),
+                on_screens_did_wake as extern "C" fn(&mut Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(onScreenParametersChange:),
+                on_screen_parameters_change as extern "C" fn(&mut Object, Sel, id),
+            );
+
             decl.register()
         }
     }
@@ -1397,6 +1410,25 @@ extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
             name: name
             object: nil
         ];
+        let _: () = msg_send![notification_center, addObserver: this as id
+            selector: sel!(onScreenParametersChange:)
+            name: NSApplicationDidChangeScreenParametersNotification
+            object: nil
+        ];
+
+        // Display sleep is posted on the workspace's own notification center.
+        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let workspace_center: id = msg_send![workspace, notificationCenter];
+        let _: () = msg_send![workspace_center, addObserver: this as id
+            selector: sel!(onScreensDidSleep:)
+            name: NSWorkspaceScreensDidSleepNotification
+            object: nil
+        ];
+        let _: () = msg_send![workspace_center, addObserver: this as id
+            selector: sel!(onScreensDidWake:)
+            name: NSWorkspaceScreensDidWakeNotification
+            object: nil
+        ];
 
         let platform = get_mac_platform(this);
         let callback = platform.0.lock().finish_launching.take();
@@ -1442,6 +1474,18 @@ extern "C" fn on_keyboard_layout_change(this: &mut Object, _: Sel, _: id) {
             .on_keyboard_layout_change
             .get_or_insert(callback);
     }
+}
+
+extern "C" fn on_screens_did_sleep(_: &mut Object, _: Sel, _: id) {
+    super::window::set_displays_asleep(true);
+}
+
+extern "C" fn on_screens_did_wake(_: &mut Object, _: Sel, _: id) {
+    super::window::set_displays_asleep(false);
+}
+
+extern "C" fn on_screen_parameters_change(_: &mut Object, _: Sel, _: id) {
+    super::window::screen_parameters_changed();
 }
 
 extern "C" fn open_urls(this: &mut Object, _: Sel, _: id, urls: id) {
@@ -1570,6 +1614,14 @@ unsafe extern "C" {
     pub(super) static kTISPropertyUnicodeKeyLayoutData: CFStringRef;
     pub(super) static kTISPropertyInputSourceID: CFStringRef;
     pub(super) static kTISPropertyLocalizedName: CFStringRef;
+}
+
+#[link(name = "AppKit", kind = "framework")]
+#[allow(non_upper_case_globals)]
+unsafe extern "C" {
+    static NSApplicationDidChangeScreenParametersNotification: id;
+    static NSWorkspaceScreensDidSleepNotification: id;
+    static NSWorkspaceScreensDidWakeNotification: id;
 }
 
 mod security {

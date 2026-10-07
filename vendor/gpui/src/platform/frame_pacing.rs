@@ -8,7 +8,9 @@
 //!
 //! A vsync source that the platform believes is running but that delivers no ticks would
 //! freeze the window, so the platform also runs a stall watchdog while the source should run:
-//! see [`FramePacing::watchdog`].
+//! see [`FramePacing::watchdog`]. The watchdog gives up after [`MAX_SOURCE_FAILURES`] attempts
+//! in a row, so a source that cannot work (for example on a sleeping display) is not replaced
+//! forever; [`FramePacing::retry`] and becoming visible start over.
 //!
 //! This file has no dependencies so that its tests run on any host:
 //! `rustc --edition 2024 --test src/platform/frame_pacing.rs`.
@@ -39,7 +41,16 @@ pub(crate) enum Watchdog {
     /// The vsync source should run but delivered no tick during a whole watchdog period.
     /// Replace it with a new one and start that, then fire again after another period.
     Recreate,
+    /// The vsync source still delivers no ticks after [`MAX_SOURCE_FAILURES`] replacements or
+    /// retried starts in a row. Drop it (stopping it if it runs) and stop watching. Demand is
+    /// kept, but only [`FramePacing::retry`] or becoming visible start a source again.
+    GiveUp,
 }
+
+/// Watchdog checks in a row that may replace a stalled vsync source or retry a failed start
+/// before the watchdog gives up. A tick, becoming visible, or [`FramePacing::retry`] after
+/// giving up starts a new count.
+pub(crate) const MAX_SOURCE_FAILURES: u32 = 3;
 
 /// Frame pacing state for one window.
 #[derive(Clone, Copy, Debug)]
@@ -60,6 +71,15 @@ pub(crate) struct FramePacing {
     watchdog_armed: bool,
     /// Whether a tick began since the last watchdog check.
     ticked: bool,
+    /// Watchdog checks since the last tick that found the source stalled or retried a failed
+    /// start.
+    failures: u32,
+    /// A start failed and the next watchdog check retries it. Until then requests only record
+    /// demand, so a source that cannot start is not retried on every request.
+    retry_pending: bool,
+    /// The watchdog gave up on the source. Requests only record demand until [`Self::retry`]
+    /// or the window becomes visible.
+    gave_up: bool,
 }
 
 impl FramePacing {
@@ -77,6 +97,9 @@ impl FramePacing {
             serving: false,
             watchdog_armed: false,
             ticked: false,
+            failures: 0,
+            retry_pending: false,
+            gave_up: false,
         }
     }
 
@@ -104,10 +127,24 @@ impl FramePacing {
         self.closed
     }
 
+    /// Watchdog checks in a row that found the source stalled or retried a failed start
+    /// (at most [`MAX_SOURCE_FAILURES`]). The platform backs off the watchdog period by it.
+    #[allow(dead_code)]
+    pub(crate) fn failures(&self) -> u32 {
+        self.failures
+    }
+
+    /// Whether the watchdog gave up on the vsync source. See [`Watchdog::GiveUp`].
+    #[allow(dead_code)]
+    pub(crate) fn has_given_up(&self) -> bool {
+        self.gave_up
+    }
+
     /// GPUI needs a frame: the window became dirty, queued a next-frame callback, or has a
     /// scene that was drawn but not presented. Safe to call at any time on the main thread,
-    /// including from inside a frame callback. Demand received while the window is hidden is
-    /// kept and served once it becomes visible.
+    /// including from inside a frame callback. Demand received while the window is hidden,
+    /// while a failed start waits for the watchdog, or after the watchdog gave up is kept and
+    /// served once a source runs.
     pub(crate) fn request(&mut self) -> LinkAction {
         if self.closed {
             return LinkAction::None;
@@ -126,6 +163,7 @@ impl FramePacing {
             return false;
         }
         self.ticked = true;
+        self.failures = 0;
         self.begin_frame();
         true
     }
@@ -177,10 +215,11 @@ impl FramePacing {
         self.serving = false;
     }
 
-    /// Reports the window's visibility (for macOS, its occlusion state). Hiding stops the
-    /// vsync source. Showing counts as demand and starts the source until the window is
-    /// idle: demand recorded while hidden is served, the platform can present the current
-    /// scene again, and a failed start is retried by the watchdog.
+    /// Reports the window's visibility (for macOS, its occlusion state, and hidden while the
+    /// displays sleep). Hiding stops the vsync source. Showing counts as demand and starts the
+    /// source until the window is idle: demand recorded while hidden is served, the platform
+    /// can present the current scene again, and a failed start is retried by the watchdog.
+    /// Showing also forgets earlier failures; the platform starts a new source for it.
     pub(crate) fn set_visible(&mut self, visible: bool) -> LinkAction {
         if self.closed || visible == self.visible {
             return LinkAction::None;
@@ -189,16 +228,37 @@ impl FramePacing {
         if visible {
             self.pending = true;
             self.idle_ticks = 0;
+            self.failures = 0;
+            self.retry_pending = false;
+            self.gave_up = false;
             self.start_if_visible()
         } else {
             self.stop()
         }
     }
 
-    /// The platform could not start its vsync source. The next request or watchdog check
-    /// retries.
+    /// The platform could not start its vsync source. The next watchdog check retries;
+    /// requests until then only record demand.
     pub(crate) fn start_failed(&mut self) {
         self.running = false;
+        self.retry_pending = true;
+    }
+
+    /// Something happened that may have repaired a vsync source the watchdog gave up on: the
+    /// displays woke, the display configuration changed, or the window moved to another
+    /// display, became key or received input. Forgets the failures and starts a new source if
+    /// demand waits. Does nothing unless the watchdog gave up.
+    pub(crate) fn retry(&mut self) -> LinkAction {
+        if !self.gave_up {
+            return LinkAction::None;
+        }
+        self.gave_up = false;
+        self.failures = 0;
+        if self.pending {
+            self.start_if_visible()
+        } else {
+            LinkAction::None
+        }
     }
 
     /// The platform started (or replaced and started) its vsync source.
@@ -219,21 +279,30 @@ impl FramePacing {
     /// The watchdog period elapsed. While the vsync source should run, the platform keeps a
     /// watchdog armed. If no tick began during a whole period (and no frame is in progress,
     /// which would hold back ticks from a nested run loop), the source is stalled and must be
-    /// replaced. If a start failed while demand is waiting, this retries it. Otherwise the
+    /// replaced. If a start failed while demand is waiting, this retries it. After
+    /// [`MAX_SOURCE_FAILURES`] such checks without a tick it gives up instead. Otherwise the
     /// watchdog stops, so an idle window has no timer.
     pub(crate) fn watchdog(&mut self) -> Watchdog {
         self.watchdog_armed = false;
+        self.retry_pending = false;
         let ticked = std::mem::take(&mut self.ticked);
         if self.closed || !self.visible {
             Watchdog::Disarm
         } else if self.running {
             if ticked || self.in_frame {
                 Watchdog::Rearm(LinkAction::None)
-            } else {
+            } else if self.count_failure() {
                 Watchdog::Recreate
+            } else {
+                self.running = false;
+                Watchdog::GiveUp
             }
         } else if self.pending {
-            Watchdog::Rearm(self.start_if_visible())
+            if self.count_failure() {
+                Watchdog::Rearm(self.start_if_visible())
+            } else {
+                Watchdog::GiveUp
+            }
         } else {
             Watchdog::Disarm
         }
@@ -270,8 +339,22 @@ impl FramePacing {
         }
     }
 
+    /// Counts a watchdog check that found the source broken. Returns `false`, and gives up,
+    /// if the source already failed [`MAX_SOURCE_FAILURES`] checks in a row.
+    fn count_failure(&mut self) -> bool {
+        if self.failures < MAX_SOURCE_FAILURES {
+            self.failures += 1;
+            true
+        } else {
+            self.gave_up = true;
+            false
+        }
+    }
+
+    /// Starts the source if it should run and nothing holds back a start: a failed start
+    /// waits for the watchdog, and after giving up for [`Self::retry`].
     fn start_if_visible(&mut self) -> LinkAction {
-        if self.visible && !self.running && !self.closed {
+        if self.visible && !self.running && !self.closed && !self.retry_pending && !self.gave_up {
             self.running = true;
             LinkAction::Start
         } else {
@@ -282,7 +365,7 @@ impl FramePacing {
 
 #[cfg(test)]
 mod tests {
-    use super::{FramePacing, LinkAction, Watchdog};
+    use super::{FramePacing, LinkAction, MAX_SOURCE_FAILURES, Watchdog};
 
     const LIMIT: u32 = 4;
 
@@ -440,11 +523,197 @@ mod tests {
     }
 
     #[test]
-    fn failed_start_is_retried() {
+    fn failed_start_is_retried_by_the_watchdog_only() {
         let mut pacing = FramePacing::new(LIMIT);
         assert_eq!(pacing.set_visible(true), LinkAction::Start);
         pacing.start_failed();
+        assert!(pacing.arm_watchdog());
+        // Every invalidation requests a frame; none of them may build another link.
+        for _ in 0..10 {
+            assert_eq!(pacing.request(), LinkAction::None);
+        }
+        assert!(pacing.begin_sync_frame());
+        assert_eq!(pacing.request(), LinkAction::None);
+        assert_eq!(pacing.end_sync_frame(), LinkAction::None);
+        assert_eq!(pacing.watchdog(), Watchdog::Rearm(LinkAction::Start));
+        pacing.source_started();
+        assert!(pacing.arm_watchdog());
+        assert!(pacing.begin_tick());
+        assert_eq!(pacing.end_tick(), LinkAction::None);
+        assert_eq!(pacing.failures(), 0);
+    }
+
+    #[test]
+    fn failed_start_without_demand_lets_the_next_request_start() {
+        let mut pacing = FramePacing::new(LIMIT);
+        assert_eq!(pacing.set_visible(true), LinkAction::Start);
+        pacing.start_failed();
+        assert!(pacing.arm_watchdog());
+        // A synchronous frame (displayLayer:) serves the demand before the check.
+        assert!(pacing.begin_sync_frame());
+        assert_eq!(pacing.end_sync_frame(), LinkAction::None);
+        assert_eq!(pacing.watchdog(), Watchdog::Disarm);
         assert_eq!(pacing.request(), LinkAction::Start);
+    }
+
+    #[test]
+    fn watchdog_gives_up_on_a_source_that_never_ticks() {
+        let mut pacing = FramePacing::new(LIMIT);
+        assert_eq!(pacing.set_visible(true), LinkAction::Start);
+        pacing.source_started();
+        assert!(pacing.arm_watchdog());
+        for failures in 1..=MAX_SOURCE_FAILURES {
+            assert_eq!(pacing.request(), LinkAction::None);
+            assert_eq!(pacing.watchdog(), Watchdog::Recreate);
+            assert_eq!(pacing.failures(), failures);
+            pacing.source_started();
+            assert!(pacing.arm_watchdog());
+        }
+        assert_eq!(pacing.watchdog(), Watchdog::GiveUp);
+        assert!(pacing.has_given_up());
+        assert!(!pacing.is_running());
+        assert!(pacing.has_pending_request());
+        // Pages keep notifying while the display sleeps: no new link, no timer.
+        for _ in 0..10 {
+            assert_eq!(pacing.request(), LinkAction::None);
+            assert!(pacing.begin_sync_frame());
+            assert_eq!(pacing.end_sync_frame(), LinkAction::None);
+        }
+        assert_eq!(pacing.request(), LinkAction::None);
+        // An event that may have repaired it starts over with a full budget.
+        assert_eq!(pacing.retry(), LinkAction::Start);
+        assert!(!pacing.has_given_up());
+        assert_eq!(pacing.failures(), 0);
+        pacing.source_started();
+        assert!(pacing.arm_watchdog());
+        assert_eq!(pacing.watchdog(), Watchdog::Recreate);
+    }
+
+    #[test]
+    fn watchdog_gives_up_on_starts_that_keep_failing() {
+        let mut pacing = FramePacing::new(LIMIT);
+        assert_eq!(pacing.set_visible(true), LinkAction::Start);
+        pacing.start_failed();
+        assert!(pacing.arm_watchdog());
+        for _ in 0..MAX_SOURCE_FAILURES {
+            assert_eq!(pacing.watchdog(), Watchdog::Rearm(LinkAction::Start));
+            pacing.start_failed();
+            assert!(pacing.arm_watchdog());
+            assert_eq!(pacing.request(), LinkAction::None);
+        }
+        assert_eq!(pacing.watchdog(), Watchdog::GiveUp);
+        assert_eq!(pacing.request(), LinkAction::None);
+        assert_eq!(pacing.retry(), LinkAction::Start);
+    }
+
+    #[test]
+    fn showing_again_forgets_failures() {
+        let mut pacing = FramePacing::new(LIMIT);
+        assert_eq!(pacing.set_visible(true), LinkAction::Start);
+        pacing.start_failed();
+        assert!(pacing.arm_watchdog());
+        // Hidden and shown before the watchdog fires: the start is retried right away.
+        assert_eq!(pacing.set_visible(false), LinkAction::None);
+        assert_eq!(pacing.set_visible(true), LinkAction::Start);
+        pacing.source_started();
+        // The new link never ticks either.
+        let mut checks = 0;
+        while pacing.watchdog() != Watchdog::GiveUp {
+            pacing.source_started();
+            assert!(pacing.arm_watchdog());
+            checks += 1;
+            assert!(
+                checks <= MAX_SOURCE_FAILURES + 1,
+                "the watchdog never gave up"
+            );
+        }
+        assert!(pacing.has_given_up());
+        assert_eq!(pacing.set_visible(false), LinkAction::None);
+        assert_eq!(pacing.request(), LinkAction::None);
+        assert_eq!(pacing.set_visible(true), LinkAction::Start);
+        assert!(!pacing.has_given_up());
+        assert_eq!(pacing.failures(), 0);
+    }
+
+    #[test]
+    fn a_tick_resets_the_failure_count() {
+        let mut pacing = FramePacing::new(LIMIT);
+        assert_eq!(pacing.set_visible(true), LinkAction::Start);
+        pacing.source_started();
+        assert!(pacing.arm_watchdog());
+        for _ in 0..MAX_SOURCE_FAILURES {
+            assert_eq!(pacing.watchdog(), Watchdog::Recreate);
+            pacing.source_started();
+            assert!(pacing.arm_watchdog());
+        }
+        // The last replacement works.
+        assert!(pacing.begin_tick());
+        assert_eq!(pacing.failures(), 0);
+        assert_eq!(pacing.end_tick(), LinkAction::None);
+        assert_eq!(pacing.watchdog(), Watchdog::Rearm(LinkAction::None));
+        assert!(pacing.arm_watchdog());
+        // A later stall gets the full budget again.
+        assert_eq!(pacing.watchdog(), Watchdog::Recreate);
+        assert_eq!(pacing.failures(), 1);
+    }
+
+    #[test]
+    fn retry_does_nothing_unless_the_watchdog_gave_up() {
+        let mut pacing = visible();
+        assert_eq!(pacing.retry(), LinkAction::None);
+        while pacing.is_running() {
+            let _ = idle_tick(&mut pacing);
+        }
+        assert_eq!(pacing.retry(), LinkAction::None);
+        assert!(!pacing.is_running());
+
+        // A failed start waits for the watchdog, not for the next input.
+        let mut pacing = FramePacing::new(LIMIT);
+        assert_eq!(pacing.set_visible(true), LinkAction::Start);
+        pacing.start_failed();
+        assert_eq!(pacing.retry(), LinkAction::None);
+    }
+
+    #[test]
+    fn retry_without_demand_lets_the_next_request_start() {
+        let mut pacing = FramePacing::new(LIMIT);
+        assert_eq!(pacing.set_visible(true), LinkAction::Start);
+        pacing.source_started();
+        assert!(pacing.arm_watchdog());
+        // The demand is served by synchronous frames while the link is stalled.
+        assert!(pacing.begin_sync_frame());
+        assert_eq!(pacing.end_sync_frame(), LinkAction::None);
+        for _ in 0..MAX_SOURCE_FAILURES {
+            assert_eq!(pacing.watchdog(), Watchdog::Recreate);
+            pacing.source_started();
+            assert!(pacing.arm_watchdog());
+        }
+        assert_eq!(pacing.watchdog(), Watchdog::GiveUp);
+        assert!(!pacing.has_pending_request());
+        assert_eq!(pacing.retry(), LinkAction::None);
+        assert_eq!(pacing.request(), LinkAction::Start);
+    }
+
+    #[test]
+    fn display_sleep_hides_and_wake_starts_a_new_link() {
+        let mut pacing = visible();
+        assert!(pacing.arm_watchdog());
+        // The displays sleep while the link runs: the platform reports the window hidden.
+        assert_eq!(pacing.set_visible(false), LinkAction::Stop);
+        // Pages keep notifying: demand is recorded, nothing starts, the watchdog disarms.
+        for _ in 0..10 {
+            assert_eq!(pacing.request(), LinkAction::None);
+        }
+        assert_eq!(pacing.watchdog(), Watchdog::Disarm);
+        assert_eq!(pacing.request(), LinkAction::None);
+        assert!(!pacing.is_running());
+        // Waking shows the window again and serves the demand.
+        assert_eq!(pacing.set_visible(true), LinkAction::Start);
+        pacing.source_started();
+        assert!(pacing.arm_watchdog());
+        assert!(pacing.begin_tick());
+        assert_eq!(pacing.end_tick(), LinkAction::None);
+        assert!(!pacing.has_pending_request());
     }
 
     #[test]
@@ -561,22 +830,41 @@ mod tests {
 
     /// Simulates GPUI (dirty flag, next-frame callbacks, needs_present, animations) driving
     /// the pacing state through a fake display link and the platform's watchdog, with random
-    /// events. The fake link can fail to start and can stall (keep "running" without ticks)
-    /// until it is replaced, as the macOS glue replaces it: after a failed start, on becoming
-    /// visible, and when the watchdog reports a stall. Checks that the link never runs while
-    /// hidden, that a visible window with work always has a ticking link or a pending
-    /// watchdog that will repair it, that the link stops and the watchdog disarms once GPUI
-    /// is idle, and that no state is left undrawn while the link is stopped.
+    /// events. The fake link can fail to start, can stall (keep "running" without ticks) until
+    /// it is replaced, and can be broken (every new link stalls, like a link on a display that
+    /// sleeps unnoticed). It is replaced as the macOS glue replaces it: after a failed start,
+    /// on becoming visible, when the window changes display, when the watchdog reports a
+    /// stall, and on a retry after the watchdog gave up.
+    ///
+    /// Checks that the link never runs while hidden; that a visible window with work always
+    /// has a ticking link, a pending watchdog that will repair it, or a watchdog that gave up
+    /// and waits for a retry; that requests never rebuild a link while a failed start waits for
+    /// the watchdog or after it gave up; that the watchdog builds at most
+    /// [`MAX_SOURCE_FAILURES`] links in a row and then stops while pages keep notifying; that
+    /// the link stops and the watchdog disarms once GPUI is idle; and that no state is left
+    /// undrawn while the link is stopped.
     #[test]
     fn randomized_simulation_has_no_missed_wakeups() {
         struct Sim {
             pacing: FramePacing,
             visible: bool,
+            /// The glue holds a link object (`MacFramePacer::display_link`).
+            link_exists: bool,
             link_running: bool,
             /// The link object stopped delivering ticks; only a new link object recovers.
             link_stalled: bool,
+            /// Every new link object stalls.
+            broken: bool,
             fail_starts: bool,
             watchdog_pending: bool,
+            /// A start failed and the watchdog has not fired since.
+            start_failed: bool,
+            /// Links the watchdog built since the last tick or the last reset of its budget.
+            watchdog_links: u32,
+            recreates: u64,
+            retried_starts: u64,
+            give_ups: u64,
+            held_back_requests: u64,
             dirty: bool,
             callbacks: Vec<u32>,
             needs_present: bool,
@@ -598,17 +886,29 @@ mod tests {
                 assert_eq!(self.link_running, self.pacing.is_running());
             }
 
+            // MacFramePacer::start_link and the failure branch of apply.
             fn start_link(&mut self) {
+                if !self.link_exists {
+                    self.link_exists = true;
+                    self.link_stalled = self.broken;
+                }
                 if self.fail_starts {
                     // The glue drops the link object, so the retry creates a new one.
-                    self.link_stalled = false;
-                    self.link_running = false;
+                    self.drop_link();
+                    self.start_failed = true;
                     self.pacing.start_failed();
                 } else {
                     self.link_running = true;
                     self.pacing.source_started();
                 }
                 self.arm_watchdog();
+            }
+
+            // MacFramePacer::drop_link.
+            fn drop_link(&mut self) {
+                self.link_exists = false;
+                self.link_running = false;
+                self.link_stalled = false;
             }
 
             fn arm_watchdog(&mut self) {
@@ -618,29 +918,74 @@ mod tests {
                 }
             }
 
+            // MacFramePacer::watchdog.
             fn fire_watchdog(&mut self) {
                 if !self.watchdog_pending {
                     return;
                 }
                 self.watchdog_pending = false;
+                self.start_failed = false;
                 match self.pacing.watchdog() {
                     Watchdog::Disarm => {}
                     Watchdog::Rearm(action) => {
+                        if action == LinkAction::Start {
+                            self.watchdog_links += 1;
+                            self.retried_starts += 1;
+                        }
                         self.apply(action);
                         self.arm_watchdog();
                     }
                     Watchdog::Recreate => {
                         assert!(self.link_running);
-                        self.link_stalled = false;
-                        self.start_link();
-                        assert_eq!(self.link_running, self.pacing.is_running());
+                        self.watchdog_links += 1;
+                        self.recreates += 1;
+                        self.drop_link();
+                        self.apply(LinkAction::Start);
                         self.arm_watchdog();
                     }
+                    Watchdog::GiveUp => {
+                        self.drop_link();
+                        assert!(!self.pacing.is_running());
+                        self.give_ups += 1;
+                    }
                 }
+                assert!(
+                    self.watchdog_links <= MAX_SOURCE_FAILURES,
+                    "the watchdog keeps replacing a link that does not work"
+                );
+            }
+
+            // MacFramePacer::retry: the displays woke, the display configuration changed, or
+            // the window became key or received input.
+            fn retry(&mut self) {
+                if self.pacing.has_given_up() {
+                    self.watchdog_links = 0;
+                }
+                let action = self.pacing.retry();
+                self.apply(action);
+            }
+
+            // MacFramePacer::display_changed.
+            fn display_changed(&mut self) {
+                self.drop_link();
+                if self.pacing.is_running() {
+                    self.apply(LinkAction::Start);
+                }
+                self.retry();
+                self.wake();
+            }
+
+            fn held_back(&self) -> bool {
+                self.start_failed || self.pacing.has_given_up()
             }
 
             fn wake(&mut self) {
+                let held_back = self.held_back();
                 let action = self.pacing.request();
+                if held_back {
+                    assert_eq!(action, LinkAction::None, "a request rebuilt a broken link");
+                    self.held_back_requests += 1;
+                }
                 self.apply(action);
             }
 
@@ -704,6 +1049,7 @@ mod tests {
                     return;
                 }
                 if self.pacing.begin_tick() {
+                    self.watchdog_links = 0;
                     self.frame_callback();
                     let action = self.pacing.end_tick();
                     self.apply(action);
@@ -713,7 +1059,11 @@ mod tests {
             fn sync_frame(&mut self) {
                 if self.pacing.begin_sync_frame() {
                     self.frame_callback();
+                    let held_back = self.held_back();
                     let action = self.pacing.end_sync_frame();
+                    if held_back {
+                        assert_eq!(action, LinkAction::None, "a frame rebuilt a broken link");
+                    }
                     self.apply(action);
                 }
             }
@@ -722,7 +1072,10 @@ mod tests {
             fn set_visible(&mut self, visible: bool) {
                 if visible && !self.pacing.is_visible() {
                     // The glue replaces the link object on every hidden-to-visible change.
-                    self.link_stalled = false;
+                    assert!(!self.link_running);
+                    self.drop_link();
+                    self.start_failed = false;
+                    self.watchdog_links = 0;
                 }
                 self.visible = visible;
                 let action = self.pacing.set_visible(visible);
@@ -736,17 +1089,20 @@ mod tests {
                 if self.link_running {
                     assert!(self.watchdog_pending, "link runs without a watchdog");
                 }
+                if self.pacing.has_given_up() {
+                    assert!(
+                        !self.link_running && !self.watchdog_pending,
+                        "gave up but still runs or watches the link"
+                    );
+                }
                 if self.visible && self.has_work() {
                     let ticking = self.link_running && !self.link_stalled;
                     assert!(
-                        ticking || self.watchdog_pending,
+                        ticking || self.watchdog_pending || self.pacing.has_given_up(),
                         "visible window has work but nothing will run a frame"
                     );
                     if !self.link_running {
-                        assert!(
-                            self.pacing.has_pending_request(),
-                            "a failed start would not be retried"
-                        );
+                        assert!(self.pacing.has_pending_request(), "demand was lost");
                     }
                 }
             }
@@ -760,14 +1116,23 @@ mod tests {
             seed
         };
 
+        let (mut recreates, mut retried_starts, mut random_give_ups, mut held_back) = (0, 0, 0, 0);
         for _run in 0..2_000 {
             let mut sim = Sim {
                 pacing: FramePacing::new(LIMIT),
                 visible: false,
+                link_exists: false,
                 link_running: false,
                 link_stalled: false,
+                broken: false,
                 fail_starts: false,
                 watchdog_pending: false,
+                start_failed: false,
+                watchdog_links: 0,
+                recreates: 0,
+                retried_starts: 0,
+                give_ups: 0,
+                held_back_requests: 0,
                 dirty: true,
                 callbacks: Vec::new(),
                 needs_present: false,
@@ -775,7 +1140,7 @@ mod tests {
                 presents: 0,
             };
             for _step in 0..300 {
-                match next() % 16 {
+                match next() % 20 {
                     0..=4 => sim.tick(),
                     5 | 6 => sim.notify(),
                     7 => sim.on_next_frame((next() % 5) as u32),
@@ -791,14 +1156,53 @@ mod tests {
                         }
                     }
                     12 => sim.fail_starts = next() % 3 == 0,
-                    13 => sim.fire_watchdog(),
+                    13 | 14 => sim.fire_watchdog(),
+                    15 => sim.broken = next() % 4 == 0,
+                    16 => sim.retry(),
+                    17 => sim.display_changed(),
                     _ => sim.tick(),
                 }
                 sim.check_invariants();
             }
+            random_give_ups += sim.give_ups;
+
+            // The displays sleep without the window noticing: the link stops ticking and every
+            // new one stalls or fails to start, while pages keep notifying. The watchdog must
+            // stop building links and stop firing.
+            sim.broken = true;
+            sim.link_stalled = sim.link_exists;
+            sim.fail_starts = next() % 2 == 0;
+            sim.set_visible(true);
+            let mut steps = 0;
+            loop {
+                sim.notify();
+                sim.tick();
+                sim.fire_watchdog();
+                sim.check_invariants();
+                if !sim.link_running && !sim.watchdog_pending {
+                    break;
+                }
+                steps += 1;
+                assert!(steps < 100, "the watchdog never gave up");
+            }
+            assert!(sim.pacing.has_given_up());
+            for _ in 0..10 {
+                sim.notify();
+                sim.sync_frame();
+                sim.notify();
+                sim.tick();
+                sim.check_invariants();
+                assert!(!sim.link_running && !sim.watchdog_pending);
+            }
+
+            // The displays wake: the platform retries with a new link that works.
+            sim.broken = false;
+            sim.fail_starts = false;
+            sim.retry();
+            assert!(sim.link_running);
+
             // Quiesce: no more GPUI events, only ticks and watchdog timers. GPUI must become
             // idle, the link stop and the watchdog disarm.
-            sim.fail_starts = false;
             sim.set_visible(true);
             sim.check_invariants();
             let mut steps = 0;
@@ -815,6 +1219,11 @@ mod tests {
             assert!(!sim.has_work(), "link stopped with work left");
             assert!(!sim.pacing.has_pending_request());
             assert!(sim.presents <= sim.draws + 1);
+            recreates += sim.recreates;
+            retried_starts += sim.retried_starts;
+            held_back += sim.held_back_requests;
         }
+        // The random phase exercised every repair path.
+        assert!(recreates > 0 && retried_starts > 0 && random_give_ups > 0 && held_back > 0);
     }
 }
