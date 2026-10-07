@@ -88,6 +88,9 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-r", Browse(Reload), None),
         KeyBinding::new("cmd-[", Browse(Back), None),
         KeyBinding::new("cmd-]", Browse(Forward), None),
+        // Text fields bind these too, later, so theirs move the caret there.
+        KeyBinding::new("cmd-left", Browse(Back), None),
+        KeyBinding::new("cmd-right", Browse(Forward), None),
         KeyBinding::new("cmd-s", Browse(ToggleSidebar), None),
         KeyBinding::new("cmd-d", Browse(TogglePin), None),
         KeyBinding::new("cmd-shift-c", Browse(CopyUrl), None),
@@ -102,6 +105,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-f", Browse(Find), None),
         KeyBinding::new("cmd-g", Browse(FindNext), None),
         KeyBinding::new("cmd-shift-g", Browse(FindPrevious), None),
+        KeyBinding::new("cmd-p", Browse(Print), None),
     ];
     for digit in 1..=9u8 {
         bindings.push(KeyBinding::new(
@@ -145,6 +149,8 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Reopen Closed Tab", Browse(ReopenClosedTab)),
                 MenuItem::separator(),
                 MenuItem::action("Close Tab", Browse(CloseTab)),
+                MenuItem::separator(),
+                MenuItem::action("Print…", Browse(Print)),
             ],
         ),
         // Routed to whichever view has focus, the web page included. Undo
@@ -237,10 +243,12 @@ fn main() -> anyhow::Result<()> {
         }
     });
     application.run(move |cx: &mut App| {
+        // First: of bindings for the same keys, GPUI picks the one added
+        // last, so the text fields' and pop-ups' own bindings win.
+        cx.bind_keys(key_bindings());
         input::init(cx);
         ui::command_bar::init(cx);
         ui::find_bar::init(cx);
-        cx.bind_keys(key_bindings());
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(|_: &About, _| native::show_about_panel());
         cx.on_action(|_: &Hide, cx| cx.hide());

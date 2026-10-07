@@ -88,7 +88,10 @@ Input fixes for a window that embeds native views (`src/platform/mac/window.rs`,
   tooltips clear.
 - `Window::is_window_hovered` (which gates every cursor change) is false on
   macOS while the pointer is over a native subview, so redraws and hit-test
-  changes no longer replace the web page's cursor with GPUI's arrow.
+  changes no longer replace the web page's cursor with GPUI's arrow. Outside
+  the window it stays true, as upstream: the move to the exit point resets a
+  hand or I-beam to the arrow (Chromium sets the arrow on exit for the same
+  reason), and GPUI uses no cursor rects that would.
 - The 16 ms synthetic drag loop stops when its window state is gone, when the
   window closes, and when no mouse button is pressed. Upstream looped forever
   once the window was gone (a mouse-up landing in another window or a window
@@ -99,5 +102,7 @@ Input fixes for a window that embeds native views (`src/platform/mac/window.rs`,
 
 Check on a Mac: with a web page focused, hovering sidebar rows shows their
 close buttons and tooltips appear; the page's cursor (I-beam, hand) is not
-reset to an arrow while the shell redraws; idle wakeups stay at zero after
+reset to an arrow while the shell redraws; flicking the pointer out of the
+window from the URL pill (hand) or a rename field (I-beam), or out of the
+command bar from a row, leaves the arrow; idle wakeups stay at zero after
 pressing a command-bar row, moving slightly and releasing.

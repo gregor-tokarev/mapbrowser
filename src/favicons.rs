@@ -2,26 +2,41 @@
 //! icon without loading the page; the engine downloads icons, the shell only
 //! stores them. Disk access never happens on the main thread.
 
-use gpui::{BackgroundExecutor, Image, ImageFormat, Task, http_client::Url};
+use gpui::{App, BackgroundExecutor, Image, ImageFormat, Task, http_client::Url};
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     fmt::Write as _,
     fs, io,
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
     thread,
+    time::{Duration, Instant},
 };
 
 /// Engine icons are 32 pt at 2x; anything larger is not a favicon.
 const MAX_BYTES: usize = 64 * 1024;
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 const MAX_FILE_NAME: usize = 200;
+/// GPUI keeps every image it has decoded until it is told to drop it. A
+/// host's previous icons stay decoded, so pages that cycle through a few (a
+/// blinking badge, spinner frames) draw them again for free; older ones go.
+/// (GPUI 0.2.2's atlas can't free a single image's tile: what bounds that
+/// is how rarely the engine fetches a changing icon.)
+const RECENT_ICONS: usize = 8;
+/// A host's icon file is written at most this often: pages that animate
+/// their icon would otherwise rewrite it every few seconds. A host's first
+/// icon is written at once, the newest one once its time comes.
+const WRITE_INTERVAL: Duration = Duration::from_secs(10);
 
 pub type LoadedIcons = Vec<(String, Arc<Image>)>;
 
 pub struct FaviconStore {
     dir: PathBuf,
     icons: HashMap<String, Arc<Image>>,
+    /// Each host's previous icons, oldest first (`RECENT_ICONS`).
+    recent: HashMap<String, VecDeque<Arc<Image>>>,
+    /// Icons no host shows any more, for `release_replaced`.
+    replaced: Vec<Arc<Image>>,
     /// Hosts already looked up on disk, found or not, so each is read once.
     looked_up: HashSet<String>,
     writer: Option<mpsc::Sender<(PathBuf, Vec<u8>)>>,
@@ -32,6 +47,8 @@ impl FaviconStore {
         Self {
             dir: data_dir.join("favicons"),
             icons: HashMap::new(),
+            recent: HashMap::new(),
+            replaced: Vec::new(),
             looked_up: HashSet::new(),
             writer: None,
         }
@@ -82,7 +99,8 @@ impl FaviconStore {
     }
 
     /// Keeps an icon downloaded by the engine and caches it on disk in the
-    /// background. Returns whether the host's icon changed.
+    /// background. Returns whether the host's icon changed. Call
+    /// `release_replaced` afterwards.
     pub fn store(&mut self, host: &str, png: Vec<u8>) -> bool {
         if !is_png(&png) || self.icons.get(host).is_some_and(|icon| icon.bytes == png) {
             return false;
@@ -91,11 +109,30 @@ impl FaviconStore {
         if let Some(name) = file_name(host) {
             self.write_in_background(self.dir.join(name), png.clone());
         }
-        self.icons.insert(
-            host.to_owned(),
-            Arc::new(Image::from_bytes(ImageFormat::Png, png)),
-        );
+        let icon = Arc::new(Image::from_bytes(ImageFormat::Png, png));
+        let recent = self.recent.entry(host.to_owned()).or_default();
+        // An icon shown again is the current one, not a previous one.
+        recent.retain(|previous| previous.id() != icon.id());
+        recent.extend(self.icons.insert(host.to_owned(), icon));
+        let evicted = recent
+            .len()
+            .checked_sub(RECENT_ICONS)
+            .map(|excess| recent.drain(..excess).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for image in evicted {
+            let shown = |other: &Arc<Image>| other.id() == image.id();
+            if !self.icons.values().any(shown) && !self.recent.values().flatten().any(shown) {
+                self.replaced.push(image);
+            }
+        }
         true
+    }
+
+    /// Lets GPUI drop the decoded copies of icons no host shows any more.
+    pub fn release_replaced(&mut self, cx: &mut App) {
+        for image in self.replaced.drain(..) {
+            image.remove_asset(cx);
+        }
     }
 
     fn write_in_background(&mut self, path: PathBuf, png: Vec<u8>) {
@@ -105,17 +142,81 @@ impl FaviconStore {
     }
 }
 
+/// Icon files to write, each at most once per `WRITE_INTERVAL`.
+#[derive(Default)]
+struct WriteQueue {
+    /// When files were written, within the last interval.
+    written: HashMap<PathBuf, Instant>,
+    /// The newest icon of each file still to write.
+    waiting: HashMap<PathBuf, Vec<u8>>,
+}
+
+impl WriteQueue {
+    fn offer(&mut self, path: PathBuf, png: Vec<u8>) {
+        self.waiting.insert(path, png);
+    }
+
+    /// The icons whose turn has come at `now`.
+    fn due(&mut self, now: Instant) -> Vec<(PathBuf, Vec<u8>)> {
+        self.written
+            .retain(|_, at| now.saturating_duration_since(*at) < WRITE_INTERVAL);
+        let due: Vec<PathBuf> = self
+            .waiting
+            .keys()
+            .filter(|path| !self.written.contains_key(*path))
+            .cloned()
+            .collect();
+        due.into_iter()
+            .filter_map(|path| {
+                let png = self.waiting.remove(&path)?;
+                self.written.insert(path.clone(), now);
+                Some((path, png))
+            })
+            .collect()
+    }
+
+    /// When the next waiting icon's turn comes.
+    fn next_due(&self) -> Option<Instant> {
+        self.waiting
+            .keys()
+            .filter_map(|path| self.written.get(path))
+            .map(|at| *at + WRITE_INTERVAL)
+            .min()
+    }
+}
+
 /// One thread writes icons in order, so a host's newest icon always lands last.
-/// It exits once the store is dropped and the queue is drained.
+/// It sleeps until a write is due, and exits once the store is dropped and the
+/// waiting icons are written.
 fn spawn_writer() -> mpsc::Sender<(PathBuf, Vec<u8>)> {
     let (sender, receiver) = mpsc::channel::<(PathBuf, Vec<u8>)>();
     let spawned = thread::Builder::new()
         .name("favicon-cache".into())
         .spawn(move || {
-            for (path, png) in receiver {
+            let write = |(path, png): (PathBuf, Vec<u8>)| {
                 if let Err(error) = write_icon(&path, &png) {
                     eprintln!("Couldn't cache favicon {}: {error}", path.display());
                 }
+            };
+            let mut queue = WriteQueue::default();
+            loop {
+                let received = match queue.next_due() {
+                    Some(due) => {
+                        receiver.recv_timeout(due.saturating_duration_since(Instant::now()))
+                    }
+                    None => receiver
+                        .recv()
+                        .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                };
+                match received {
+                    Ok((path, png)) => queue.offer(path, png),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        queue.waiting.into_iter().for_each(write);
+                        return;
+                    }
+                }
+                queue.due(Instant::now()).into_iter().for_each(write);
             }
         });
     if let Err(error) = spawned {
@@ -321,11 +422,57 @@ mod tests {
         assert_eq!(store.get("example.com").unwrap().bytes, png(2));
         assert_eq!(store.get("other.com").unwrap().bytes, png(3));
 
+        // The newest icon is written by the time the store is gone.
+        drop(store);
         let deadline = Instant::now() + Duration::from_secs(5);
         let cached = dir.0.join("favicons");
         while read_icon(&cached, "example.com") != Some(png(2)) {
             assert!(Instant::now() < deadline, "favicon was not written");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn hosts_keep_their_last_icons_decoded() {
+        let dir = TestDir::new("recent");
+        let mut store = FaviconStore::new(&dir.0);
+        // A badge that blinks between two icons releases nothing.
+        for _ in 0..20 {
+            assert!(store.store("mail.test", png(1)));
+            assert!(store.store("mail.test", png(2)));
+        }
+        assert!(store.replaced.is_empty());
+        // A clock drawn into its icon lets the oldest go, unless another
+        // host shows it.
+        assert!(store.store("other.test", png(10)));
+        for marker in 10..=10 + RECENT_ICONS as u8 + 2 {
+            assert!(store.store("clock.test", png(marker)));
+        }
+        let released: Vec<_> = store
+            .replaced
+            .iter()
+            .map(|image| image.bytes.clone())
+            .collect();
+        assert_eq!(released, [png(11)]);
+    }
+
+    #[test]
+    fn icon_files_are_written_at_most_every_interval() {
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let (a, b) = (PathBuf::from("a.png"), PathBuf::from("b.png"));
+        let mut queue = WriteQueue::default();
+        queue.offer(a.clone(), png(1));
+        assert_eq!(queue.due(start), [(a.clone(), png(1))]);
+        assert_eq!(queue.next_due(), None);
+        // A changing icon waits; only the newest is written.
+        queue.offer(a.clone(), png(2));
+        queue.offer(a.clone(), png(3));
+        queue.offer(b.clone(), png(4));
+        assert_eq!(queue.due(at(1)), [(b, png(4))]);
+        assert_eq!(queue.next_due(), Some(start + WRITE_INTERVAL));
+        assert_eq!(queue.due(at(9)), []);
+        assert_eq!(queue.due(at(10)), [(a, png(3))]);
+        assert_eq!(queue.next_due(), None);
     }
 }

@@ -1,7 +1,8 @@
 //! Keys for a focused page. As in Chrome, the page gets browser shortcuts
-//! first, all but the reserved ones (`Shortcut::reserved`): the key monitor
-//! hands them to the page's view, and `PageKeys` runs the shortcut only if
-//! the page leaves the key unhandled (no `preventDefault`).
+//! first, all but the reserved ones (`Shortcut::reserved`), and the editing
+//! keys (⌘A, ⌘C, ⌘X, ⌘V, ⌘Z, ⇧⌘Z): the key monitor hands them to the page's
+//! view, and `PageKeys` acts only if the page leaves the key unhandled (no
+//! `preventDefault`), so web apps with their own undo or clipboard keep them.
 
 use super::{BrowserLink, edit_frame};
 use crate::engine::{
@@ -9,14 +10,16 @@ use crate::engine::{
 };
 use cef::*;
 use objc2::{msg_send, rc::Retained, runtime::Bool};
-use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSWindow};
+use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType, NSWindow};
 use objc2_foundation::NSString;
 
-/// kVK_Escape.
-pub(super) const KEY_ESCAPE: u16 = 53;
+/// kVK_Escape, kVK_LeftArrow and kVK_RightArrow.
+const KEY_ESCAPE: u16 = 53;
+const KEY_LEFT: u16 = 123;
+const KEY_RIGHT: u16 = 124;
 
 /// A key press, read the way shortcuts are matched.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct KeyPress {
     pub key: u16,
     pub character: Option<char>,
@@ -24,10 +27,21 @@ pub(super) struct KeyPress {
 }
 
 impl KeyPress {
-    pub fn from_ns_event(event: &NSEvent) -> Self {
+    /// The press a key down stands for; any other event is none.
+    ///
+    /// AppKit raises NSInternalInconsistencyException when `characters` or
+    /// `charactersIgnoringModifiers` is read from an event other than a key
+    /// down or up, such as the FlagsChanged every modifier key (⇧, ⌘, ⌥, ⌃,
+    /// Caps Lock) sends, and `keyCode` from one that isn't a key event. An
+    /// exception unwinding out of a CEF callback aborts the app, so the type
+    /// is checked before anything else is read.
+    pub fn from_ns_event(event: &NSEvent) -> Option<Self> {
+        if event.r#type() != NSEventType::KeyDown {
+            return None;
+        }
         let flags = event.modifierFlags();
         let key = event.keyCode();
-        Self {
+        Some(Self {
             key,
             character: shortcut_character(
                 &text(event.characters()),
@@ -40,10 +54,12 @@ impl KeyPress {
                 option: flags.contains(NSEventModifierFlags::Option),
                 shift: flags.contains(NSEventModifierFlags::Shift),
             },
-        }
+        })
     }
 
     /// A key down as CEF reports it, read from the NSEvent it carries.
+    /// Modifier keys arrive as raw key downs too, carrying a FlagsChanged
+    /// event; `from_ns_event` turns those away.
     fn from_cef(event: Option<&KeyEvent>, os_event: *mut u8) -> Option<Self> {
         let kind = event?.type_;
         if kind != KeyEventType::RAWKEYDOWN && kind != KeyEventType::KEYDOWN {
@@ -52,15 +68,22 @@ impl KeyPress {
         // SAFETY: On macOS CEF passes the NSEvent it is handling, or null,
         // borrowed for the duration of the callback.
         let event = unsafe { os_event.cast::<NSEvent>().as_ref() }?;
-        Some(Self::from_ns_event(event))
+        Self::from_ns_event(event)
     }
 
     pub fn shortcut(self) -> Option<Shortcut> {
         shortcut_for_key(self.key, self.character, self.modifiers)
     }
 
-    fn is_escape(self) -> bool {
+    pub fn is_escape(self) -> bool {
         self.key == KEY_ESCAPE && self.modifiers == Modifiers::default()
+    }
+
+    /// ⌘← and ⌘→ go back and forward, but in text fields they move the
+    /// caret to the start or end of the line.
+    pub fn moves_caret(self) -> bool {
+        matches!(self.key, KEY_LEFT | KEY_RIGHT)
+            && matches!(self.shortcut(), Some(Shortcut::Back | Shortcut::Forward))
     }
 }
 
@@ -106,12 +129,15 @@ impl PageKeys {
     /// Runs what a key the page left alone means. False lets CEF offer it
     /// to the menu bar.
     fn unhandled(&self, browser: &Browser, press: KeyPress) -> bool {
+        // Editing keys act on the focused frame, as the Edit menu's would.
+        // Handled here, CEF doesn't also offer them to the menu bar, whose
+        // items would run them a second time.
+        if let Some(command) = edit_command(press.character, press.modifiers) {
+            return edit_frame(Some(browser.clone()), command);
+        }
         if self.popup {
             // Popup and DevTools windows have no tabs. No shortcut may reach
             // the browser window behind them through the menu bar.
-            if let Some(command) = edit_command(press.character, press.modifiers) {
-                return edit_frame(Some(browser.clone()), command);
-            }
             match press.shortcut() {
                 Some(Shortcut::CloseTab) => {
                     if let Some(host) = browser.host() {
@@ -132,5 +158,57 @@ impl PageKeys {
             return true;
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use objc2_foundation::NSPoint;
+
+    fn event(
+        kind: NSEventType,
+        flags: NSEventModifierFlags,
+        text: &str,
+        key: u16,
+    ) -> Retained<NSEvent> {
+        let text = NSString::from_str(text);
+        NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+            kind,
+            NSPoint::new(0., 0.),
+            flags,
+            0.,
+            0,
+            None,
+            &text,
+            &text,
+            false,
+            key,
+        )
+        .expect("key event")
+    }
+
+    #[test]
+    fn modifier_keys_are_no_presses() {
+        // ⇧ (56), ⌘ (55), ⌥ (58), ⌃ (59) and Caps Lock (57) going down.
+        for (key, flags) in [
+            (56, NSEventModifierFlags::Shift),
+            (55, NSEventModifierFlags::Command),
+            (58, NSEventModifierFlags::Option),
+            (59, NSEventModifierFlags::Control),
+            (57, NSEventModifierFlags::CapsLock),
+        ] {
+            let modifier = event(NSEventType::FlagsChanged, flags, "", key);
+            assert_eq!(KeyPress::from_ns_event(&modifier), None, "{key}");
+        }
+        let release = event(NSEventType::KeyUp, NSEventModifierFlags::Command, "t", 17);
+        assert_eq!(KeyPress::from_ns_event(&release), None);
+    }
+
+    #[test]
+    fn key_downs_are_read_for_shortcuts() {
+        let press = event(NSEventType::KeyDown, NSEventModifierFlags::Command, "t", 17);
+        let press = KeyPress::from_ns_event(&press).expect("a press");
+        assert_eq!(press.shortcut(), Some(Shortcut::CommandBar));
     }
 }

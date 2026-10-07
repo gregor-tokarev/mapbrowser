@@ -1082,7 +1082,8 @@ fn web_address(input: &str) -> Option<String> {
     None
 }
 
-fn search_url(input: &str) -> String {
+/// A Google search for `input`.
+pub fn search_url(input: &str) -> String {
     let mut query = String::new();
     for byte in input.bytes() {
         match byte {
