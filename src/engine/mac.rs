@@ -3,7 +3,10 @@
 
 mod blocking;
 
-use super::{EngineEvent, Modifiers, merge_features, progress_worth_reporting, shortcut_for_key};
+use super::{
+    EditCommand, EngineEvent, Modifiers, edit_command, merge_features, opens_in_tab,
+    progress_worth_reporting, shortcut_character, shortcut_for_key,
+};
 use crate::blocker::ContentBlocker;
 use crate::native::CornerCaps;
 use anyhow::{Context, Result, bail, ensure};
@@ -13,12 +16,14 @@ use cef::*;
 use objc2::{
     ClassType, MainThreadMarker, MainThreadOnly, msg_send,
     rc::Retained,
-    runtime::{AnyObject, Bool},
+    runtime::{AnyObject, Bool, NSObjectProtocol},
+    sel,
 };
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSEvent, NSEventMask, NSEventModifierFlags, NSView,
+    NSApplication, NSAutoresizingMaskOptions, NSEvent, NSEventMask, NSEventModifierFlags, NSView,
+    NSWindow,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
@@ -94,6 +99,7 @@ struct ReadyBrowser {
 /// What the key monitor needs to route keys into web content.
 #[derive(Default)]
 struct KeyRouting {
+    /// The web container; its window is the browser window.
     container: usize,
     /// The active tab's browser, which receives web editing commands.
     browser: Option<Browser>,
@@ -101,10 +107,18 @@ struct KeyRouting {
     fullscreen: Option<(u64, Browser)>,
 }
 
+/// A favicon is fetched for a page host and an icon URL: the shell files
+/// icons by host, and hosts can share one icon URL.
+type FaviconKey = (Option<String>, String);
+
 /// Display state of one browser. Only touched on the UI thread.
 #[derive(Default)]
 struct PageState {
-    favicon_url: Option<String>,
+    /// The latest icon asked for; downloads of any other are stale.
+    favicon_requested: Option<FaviconKey>,
+    /// The last icon sent, or known to be missing. Failed or cancelled
+    /// downloads are not recorded, so the next page asks again.
+    favicon_done: Option<FaviconKey>,
     progress: Option<f64>,
 }
 
@@ -198,6 +212,7 @@ wrap_client! {
         load: LoadHandler,
         life: LifeSpanHandler,
         menu: ContextMenuHandler,
+        requests: RequestHandler,
     }
     impl Client {
         fn display_handler(&self) -> Option<DisplayHandler> {
@@ -212,6 +227,9 @@ wrap_client! {
         fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
             Some(self.menu.clone())
         }
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(self.requests.clone())
+        }
     }
 }
 
@@ -222,7 +240,8 @@ fn tab_client(link: BrowserLink) -> Client {
         TabDisplay::new(link.clone(), Arc::default()),
         TabLoad::new(link.clone()),
         TabLife::new(link.clone()),
-        TabMenu::new(link),
+        TabMenu::new(link.clone()),
+        TabRequests::new(link),
     )
 }
 
@@ -242,14 +261,19 @@ wrap_display_handler! {
         fn on_favicon_urlchange(&self, browser: Option<&mut Browser>, icon_urls: Option<&mut CefStringList>) {
             // Take the borrowed list: iterating a clone of it yields nothing.
             let Some(url) = icon_urls.map(std::mem::take).and_then(|urls| urls.into_iter().next()) else { return; };
+            let Some(browser) = browser else { return; };
+            // The new document has committed, so the main frame has its URL.
+            let page_host = browser.main_frame().and_then(|frame| crate::favicons::host_of(&frame_url(Some(&frame))));
+            let key = (page_host, url);
             {
                 let mut page = self.page.lock().expect("page state");
-                if page.favicon_url.as_ref() == Some(&url) { return; }
-                page.favicon_url = Some(url.clone());
+                if page.favicon_done.as_ref() == Some(&key) { return; }
+                page.favicon_requested = Some(key.clone());
             }
-            if let Some(host) = browser.and_then(|browser| browser.host()) {
-                let mut callback = FaviconDownload::new(self.link.clone(), self.page.clone(), url.clone());
-                host.download_image(Some(&CefString::from(url.as_str())), 1, FAVICON_SIZE, 0, Some(&mut callback));
+            if let Some(host) = browser.host() {
+                let url = CefString::from(key.1.as_str());
+                let mut callback = FaviconDownload::new(self.link.clone(), self.page.clone(), key);
+                host.download_image(Some(&url), 1, FAVICON_SIZE, 0, Some(&mut callback));
             }
         }
         fn on_loading_progress_change(&self, _browser: Option<&mut Browser>, progress: f64) {
@@ -277,16 +301,23 @@ wrap_display_handler! {
 }
 
 wrap_download_image_callback! {
-    struct FaviconDownload { link: BrowserLink, page: Arc<Mutex<PageState>>, url: String }
+    struct FaviconDownload { link: BrowserLink, page: Arc<Mutex<PageState>>, key: FaviconKey }
     impl DownloadImageCallback {
-        fn on_download_image_finished(&self, _image_url: Option<&CefString>, _http_status_code: i32, image: Option<&mut Image>) {
-            // A newer icon URL supersedes this download.
-            if self.page.lock().expect("page state").favicon_url.as_ref() != Some(&self.url) { return; }
-            let Some(image) = image.filter(|image| image.is_empty() == 0) else { return; };
-            let (mut width, mut height) = (0, 0);
-            let Some(png) = image.as_png(FAVICON_SCALE, 1, Some(&mut width), Some(&mut height)) else { return; };
-            let png = binary_to_vec(&png);
-            if !png.is_empty() {
+        fn on_download_image_finished(&self, _image_url: Option<&CefString>, http_status_code: i32, image: Option<&mut Image>) {
+            let png = image.filter(|image| image.is_empty() == 0).and_then(|image| {
+                let (mut width, mut height) = (0, 0);
+                image.as_png(FAVICON_SCALE, 1, Some(&mut width), Some(&mut height))
+            }).map(|png| binary_to_vec(&png)).filter(|png| !png.is_empty());
+            {
+                let mut page = self.page.lock().expect("page state");
+                // A newer icon supersedes this download.
+                if page.favicon_requested.as_ref() != Some(&self.key) { return; }
+                // Offline, cancelled or server errors: the next page retries.
+                // A missing or undecodable icon is not fetched again.
+                if png.is_none() && !matches!(http_status_code, 200..=299 | 404 | 410) { return; }
+                page.favicon_done = Some(self.key.clone());
+            }
+            if let Some(png) = png {
                 self.link.send(EngineEvent::Favicon { tab_id: self.link.tab_id, png });
             }
         }
@@ -357,11 +388,14 @@ wrap_life_span_handler! {
                 link.send(EngineEvent::Created { tab_id: link.tab_id });
             }
         }
-        fn on_before_popup(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, _popup_id: i32, target_url: Option<&CefString>, _target_frame_name: Option<&CefString>, target_disposition: WindowOpenDisposition, user_gesture: i32, _popup_features: Option<&PopupFeatures>, _window_info: Option<&mut WindowInfo>, _client: Option<&mut Option<Client>>, _settings: Option<&mut BrowserSettings>, _extra_info: Option<&mut Option<DictionaryValue>>, _no_javascript_access: Option<&mut i32>) -> i32 {
-            if user_gesture != 0 && let Some(url) = target_url.map(ToString::to_string).filter(|url| !url.is_empty()) {
-                // ⌘-click and middle-click ask for a tab behind this one.
+        fn on_before_popup(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, _popup_id: i32, target_url: Option<&CefString>, _target_frame_name: Option<&CefString>, target_disposition: WindowOpenDisposition, user_gesture: i32, _popup_features: Option<&PopupFeatures>, _window_info: Option<&mut WindowInfo>, _client: Option<&mut Option<Client>>, _settings: Option<&mut BrowserSettings>, _extra_info: Option<&mut Option<DictionaryValue>>, _no_javascript_access: Option<&mut i32>) -> i32 {
+            // target=_blank links and window.open. ⌘- and middle-clicks on
+            // them ask for a tab behind this one; the same clicks on plain
+            // links arrive in TabRequests::on_open_urlfrom_tab instead.
+            if user_gesture != 0 {
                 let background = target_disposition == WindowOpenDisposition::NEW_BACKGROUND_TAB;
-                self.link.send(EngineEvent::OpenTab { opener_tab_id: self.link.tab_id, url, background });
+                let url = target_url.map(ToString::to_string).unwrap_or_default();
+                request_tab(&self.link, frame.as_deref(), url, background);
             }
             1
         }
@@ -409,10 +443,13 @@ wrap_life_span_handler! {
                 if was_fullscreen { keys.fullscreen = None; }
                 was_fullscreen
             };
+            if was_fullscreen {
+                // Also when a newer browser represents the tab: keys.fullscreen
+                // still named this one, so the shell last heard about
+                // fullscreen from it, and nothing else will end it.
+                link.send(EngineEvent::Fullscreen { tab_id: link.tab_id, fullscreen: false });
+            }
             if report {
-                if was_fullscreen {
-                    link.send(EngineEvent::Fullscreen { tab_id: link.tab_id, fullscreen: false });
-                }
                 link.send(EngineEvent::Closed { tab_id: link.tab_id });
             }
             if ready_to_quit { quit_message_loop(); }
@@ -423,21 +460,27 @@ wrap_life_span_handler! {
 wrap_context_menu_handler! {
     struct TabMenu { link: BrowserLink }
     impl ContextMenuHandler {
-        fn on_before_context_menu(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, params: Option<&mut ContextMenuParams>, model: Option<&mut MenuModel>) {
+        fn on_before_context_menu(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, params: Option<&mut ContextMenuParams>, model: Option<&mut MenuModel>) {
             let Some(model) = model else { return; };
             model.remove(sys::cef_menu_id_t::MENU_ID_VIEW_SOURCE as i32);
             model.remove(sys::cef_menu_id_t::MENU_ID_PRINT as i32);
-            if params.is_some_and(|params| !link_url(params).is_empty()) {
-                model.insert_item_at(0, MENU_OPEN_LINK, Some(&CefString::from("Open Link in New Tab")));
-                model.insert_item_at(1, MENU_COPY_LINK, Some(&CefString::from("Copy Link Address")));
-                model.insert_separator_at(2);
+            let url = params.map(|params| link_url(params)).unwrap_or_default();
+            if !url.is_empty() {
+                // mailto: and javascript: links can be copied, not opened.
+                let mut index = 0;
+                if opens_in_tab(&url, &frame_url(frame.as_deref())) {
+                    model.insert_item_at(index, MENU_OPEN_LINK, Some(&CefString::from("Open Link in New Tab")));
+                    index += 1;
+                }
+                model.insert_item_at(index, MENU_COPY_LINK, Some(&CefString::from("Copy Link Address")));
+                model.insert_separator_at(index + 1);
             }
             tidy_separators(model);
         }
-        fn on_context_menu_command(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, params: Option<&mut ContextMenuParams>, command_id: i32, _event_flags: EventFlags) -> i32 {
+        fn on_context_menu_command(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, params: Option<&mut ContextMenuParams>, command_id: i32, _event_flags: EventFlags) -> i32 {
             let url = params.map(|params| link_url(params)).unwrap_or_default();
             match command_id {
-                MENU_OPEN_LINK => self.link.send(EngineEvent::OpenTab { opener_tab_id: self.link.tab_id, url, background: false }),
+                MENU_OPEN_LINK => request_tab(&self.link, frame.as_deref(), url, false),
                 MENU_COPY_LINK => self.link.send(EngineEvent::CopyText(url)),
                 _ => return 0,
             }
@@ -448,6 +491,45 @@ wrap_context_menu_handler! {
 
 fn link_url(params: &ContextMenuParams) -> String {
     CefString::from(&params.link_url()).to_string()
+}
+
+fn frame_url(frame: Option<&Frame>) -> String {
+    frame
+        .map(|frame| CefString::from(&frame.url()).to_string())
+        .unwrap_or_default()
+}
+
+/// Asks the shell for a tab showing `url` if a tab can show it; `opener` is
+/// the frame that asked. See `opens_in_tab`.
+fn request_tab(link: &BrowserLink, opener: Option<&Frame>, url: String, background: bool) {
+    if opens_in_tab(&url, &frame_url(opener)) {
+        link.send(EngineEvent::OpenTab {
+            opener_tab_id: link.tab_id,
+            url,
+            background,
+        });
+    }
+}
+
+wrap_request_handler! {
+    struct TabRequests { link: BrowserLink }
+    impl RequestHandler {
+        fn on_open_urlfrom_tab(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, target_url: Option<&CefString>, target_disposition: WindowOpenDisposition, user_gesture: i32) -> i32 {
+            // ⌘-, ⇧- and middle-clicks on links without a target arrive here,
+            // not in on_before_popup. Alloy would load them in this tab.
+            let background = target_disposition == WindowOpenDisposition::NEW_BACKGROUND_TAB;
+            let new_tab = background
+                || [WindowOpenDisposition::NEW_FOREGROUND_TAB, WindowOpenDisposition::NEW_WINDOW, WindowOpenDisposition::NEW_POPUP].contains(&target_disposition);
+            if !new_tab { return 0; }
+            // Never navigate this tab instead. Like popups, requests without
+            // a user gesture (clicks dispatched by scripts) are dropped.
+            if user_gesture != 0 {
+                let url = target_url.map(ToString::to_string).unwrap_or_default();
+                request_tab(&self.link, frame.as_deref(), url, background);
+            }
+            1
+        }
+    }
 }
 
 /// Removing items can leave leading, trailing or doubled separators.
@@ -628,6 +710,14 @@ impl Engine {
         let container =
             NSView::initWithFrame(NSView::alloc(mtm), rect(0., 0., self.width, self.height));
         container.setWantsLayer(true);
+        // Pages slide out of the card while spaces switch; they must never
+        // draw over the sidebar. AppKit stopped clipping subviews by default
+        // for apps built with the macOS 14 SDK (older systems still clip and
+        // lack the property). A plain rectangle, unlike a rounded mask, needs
+        // no offscreen pass; the corner caps do the rounding.
+        if container.respondsToSelector(sel!(setClipsToBounds:)) {
+            container.setClipsToBounds(true);
+        }
         parent.addSubview(&container);
         container.setHidden(true);
         // Added after the container, so they draw above every web view.
@@ -648,13 +738,7 @@ impl Engine {
                 currently_on(ThreadId::UI)
             );
         }
-        if self
-            .pending
-            .lock()
-            .expect("pending browser state")
-            .current
-            .contains_key(&tab_id)
-        {
+        if self.has_tab(tab_id) {
             self.navigate(tab_id, url);
             return Ok(());
         }
@@ -777,8 +861,8 @@ impl Engine {
             }
             if let Some(view) = browser_view(&browser) {
                 view.setAutoresizingMask(NSAutoresizingMaskOptions::empty());
-                view.setHidden(!active);
                 view.setFrame(rect(0., 0., self.width, self.height));
+                view.setHidden(!active);
             }
             if !url.is_empty() {
                 // Suppress address/title callbacks from the internal empty
@@ -807,11 +891,15 @@ impl Engine {
         for (&id, browser) in &self.browsers {
             if let Some(view) = browser_view(browser) {
                 view.setFrameOrigin(NSPoint::new(0., 0.));
+                if id == tab_id {
+                    fit_view(view, self.width, self.height);
+                }
                 view.setHidden(id != tab_id);
             }
         }
-        self.set_container_hidden(!self.has_tab(tab_id));
-        if self.has_tab(tab_id) {
+        let live = self.live_browser(tab_id).is_some();
+        self.set_container_hidden(!live);
+        if live {
             self.focus_tab(tab_id);
         } else {
             self.focus_shell();
@@ -841,9 +929,11 @@ impl Engine {
         if self.width != width || self.height != height {
             self.width = width;
             self.height = height;
+            // Every resize makes a page lay out again, so hidden pages (in
+            // every space) are sized only when they are shown again.
             for browser in self.browsers.values() {
-                if let Some(view) = browser_view(browser) {
-                    view.setFrameSize(NSSize::new(width, height));
+                if let Some(view) = browser_view(browser).filter(|view| !view.isHidden()) {
+                    fit_view(view, width, height);
                 }
             }
         }
@@ -860,6 +950,9 @@ impl Engine {
         for (&id, browser) in &self.browsers {
             if let Some(view) = browser_view(browser) {
                 let visible = id == from_tab || id == to_tab;
+                if visible {
+                    fit_view(view, self.width, self.height);
+                }
                 view.setHidden(!visible);
                 if visible {
                     view.setFrameOrigin(NSPoint::new(
@@ -939,8 +1032,14 @@ impl Engine {
             .get(&tab_id)
             .filter(|browser| browser.is_valid() != 0)
     }
+    /// Whether a browser represents the tab: requested, being created or
+    /// live. A `Closed` for a tab that has one again is stale.
     pub fn has_tab(&self, tab_id: u64) -> bool {
-        self.live_browser(tab_id).is_some()
+        self.pending
+            .lock()
+            .expect("pending browser state")
+            .current
+            .contains_key(&tab_id)
     }
     /// Drops the handle of a browser reported `Closed`. A browser created for
     /// the tab since then stays.
@@ -966,13 +1065,19 @@ impl Engine {
                 pending.canceled.insert(instance);
             }
         }
-        if let Some(host) = self
+        if let Some(browser) = self
             .browsers
             .remove(&tab_id)
             .filter(|browser| browser.is_valid() != 0)
-            .and_then(|browser| browser.host())
         {
-            host.close_browser(1);
+            // Chromium removes the view only after the page's unload
+            // handlers ran; until then it would cover the next tab.
+            if let Some(view) = browser_view(&browser) {
+                view.setHidden(true);
+            }
+            if let Some(host) = browser.host() {
+                host.close_browser(1);
+            }
         }
         self.update_key_routing();
     }
@@ -1139,6 +1244,14 @@ fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
 }
 
+/// Sizes a page's view to the card, before it is shown.
+fn fit_view(view: &NSView, width: f64, height: f64) {
+    let size = NSSize::new(width, height);
+    if view.frame().size != size {
+        view.setFrameSize(size);
+    }
+}
+
 fn trace_native_layout(tab_id: u64, view: &NSView) {
     if let Some(window) = view.window() {
         eprintln!(
@@ -1191,6 +1304,24 @@ fn install_key_monitor(
     let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
         // SAFETY: AppKit passes a valid event that outlives this handler.
         let e = unsafe { event.as_ref() };
+        let mtm = MainThreadMarker::new().expect("native event on main thread");
+        // Only keys for the browser window itself. The command bar handles
+        // its own (GPUI binds the same shortcuts there), and file panels,
+        // dialogs and other sheets keep theirs.
+        let container = keys.lock().expect("key routing state").container;
+        let Some(window) = e
+            .window(mtm)
+            .filter(|window| is_browser_window(window, container))
+        else {
+            return event.as_ptr();
+        };
+        if window.attachedSheet().is_some()
+            || NSApplication::sharedApplication(mtm)
+                .modalWindow()
+                .is_some()
+        {
+            return event.as_ptr();
+        }
         let flags = e.modifierFlags();
         let modifiers = Modifiers {
             command: flags.contains(NSEventModifierFlags::Command),
@@ -1199,10 +1330,15 @@ fn install_key_monitor(
             shift: flags.contains(NSEventModifierFlags::Shift),
         };
         let key = e.keyCode();
-        if handle_in_page(e, key, modifiers, &keys) {
+        let character = shortcut_character(
+            &text(e.characters()),
+            &text(e.charactersIgnoringModifiers()),
+            key,
+        );
+        if handle_in_page(&window, key, character, modifiers, &keys) {
             return std::ptr::null_mut();
         }
-        if let Some(shortcut) = shortcut_for_key(key, modifiers) {
+        if let Some(shortcut) = shortcut_for_key(key, character, modifiers) {
             let _ = events.try_send(EngineEvent::Shortcut(shortcut));
             std::ptr::null_mut()
         } else {
@@ -1214,11 +1350,26 @@ fn install_key_monitor(
     unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &block) }
 }
 
+fn text(string: Option<Retained<NSString>>) -> String {
+    string.map(|string| string.to_string()).unwrap_or_default()
+}
+
+/// Whether `window` holds the web container, at address `container` (or 0
+/// before `attach`).
+fn is_browser_window(window: &NSWindow, container: usize) -> bool {
+    // SAFETY: A non-zero `container` is the engine's web container, alive
+    // until `shutdown`, which removes this monitor first. Main thread only.
+    unsafe { (container as *const NSView).as_ref() }
+        .and_then(|container| container.window())
+        .is_some_and(|browser| std::ptr::eq(&*browser, window))
+}
+
 /// Keys that act on the page itself: Esc leaves HTML fullscreen, and the
 /// standard editing commands go to the focused frame of the active page.
 fn handle_in_page(
-    event: &NSEvent,
+    window: &NSWindow,
     key: u16,
+    character: Option<char>,
     modifiers: Modifiers,
     keys: &Mutex<KeyRouting>,
 ) -> bool {
@@ -1240,35 +1391,26 @@ fn handle_in_page(
         host.exit_fullscreen(1);
         return true;
     }
-    let Modifiers {
-        command,
-        control,
-        option,
-        shift,
-    } = modifiers;
-    if !command || control || option || !matches!(key, 0 | 6 | 7 | 8 | 9) {
+    let Some(command) = edit_command(character, modifiers) else {
         return false;
-    }
+    };
     let (container, browser) = {
         let keys = keys.lock().expect("key routing state");
         (keys.container, keys.browser.clone())
     };
-    let web_has_focus = event
-        .window(MainThreadMarker::new().expect("native event on main thread"))
-        .and_then(|window| window.firstResponder())
-        .is_some_and(|responder| {
-            // SAFETY: Both messages are NSObject/NSView queries with object
-            // arguments; `container` is the live web container (checked
-            // non-zero) and `responder` is retained for this call.
-            unsafe {
-                let is_view: Bool = msg_send![&responder, isKindOfClass: NSView::class()];
-                if !is_view.as_bool() || container == 0 {
-                    return false;
-                }
-                let inside: Bool = msg_send![&responder, isDescendantOf: container as *mut NSView];
-                inside.as_bool()
+    let web_has_focus = window.firstResponder().is_some_and(|responder| {
+        // SAFETY: Both messages are NSObject/NSView queries with object
+        // arguments; `container` is the live web container (checked
+        // non-zero) and `responder` is retained for this call.
+        unsafe {
+            let is_view: Bool = msg_send![&responder, isKindOfClass: NSView::class()];
+            if !is_view.as_bool() || container == 0 {
+                return false;
             }
-        });
+            let inside: Bool = msg_send![&responder, isDescendantOf: container as *mut NSView];
+            inside.as_bool()
+        }
+    });
     if !web_has_focus {
         return false;
     }
@@ -1278,14 +1420,13 @@ fn handle_in_page(
     else {
         return false;
     };
-    match (key, shift) {
-        (0, false) => frame.select_all(),
-        (8, false) => frame.copy(),
-        (7, false) => frame.cut(),
-        (9, false) => frame.paste(),
-        (6, false) => frame.undo(),
-        (6, true) => frame.redo(),
-        _ => return false,
+    match command {
+        EditCommand::SelectAll => frame.select_all(),
+        EditCommand::Copy => frame.copy(),
+        EditCommand::Cut => frame.cut(),
+        EditCommand::Paste => frame.paste(),
+        EditCommand::Undo => frame.undo(),
+        EditCommand::Redo => frame.redo(),
     }
     true
 }

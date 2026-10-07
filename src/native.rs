@@ -14,17 +14,17 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use objc2::{
-    Encode, MainThreadMarker, MainThreadOnly, ffi, msg_send,
+    Encode, MainThreadMarker, MainThreadOnly, define_class, ffi, msg_send,
     rc::Retained,
     runtime::{AnyClass, AnyObject, AnyProtocol, Bool, Imp, ProtocolBuilder, Sel},
     sel,
 };
 use objc2_app_kit::{
-    NSApplication, NSColor, NSEventType, NSNormalWindowLevel, NSView, NSWindowButton,
+    NSApplication, NSColor, NSEventType, NSNormalWindowLevel, NSResponder, NSView, NSWindowButton,
     NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask,
 };
 use objc2_core_graphics::CGMutablePath;
-use objc2_foundation::{NSNotification, NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSNotification, NSObject, NSPoint, NSRect, NSSize};
 use objc2_quartz_core::{CAShapeLayer, CATransaction};
 
 type SendEvent = unsafe extern "C-unwind" fn(&AnyObject, Sel, &AnyObject);
@@ -469,12 +469,33 @@ pub struct CornerCaps {
     shaped: (f64, f64),
 }
 
+define_class!(
+    // SAFETY: NSView has no subclassing requirements, and this class adds
+    // no ivars and no Drop.
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "MapBrowserCornerCap"]
+    struct CornerCapView;
+
+    impl CornerCapView {
+        /// Caps only paint. A cap's square is mostly page, so AppKit must
+        /// pass its clicks, scrolls and drags to the web view beneath.
+        #[unsafe(method(hitTest:))]
+        fn hit_test(&self, _point: NSPoint) -> *mut NSView {
+            std::ptr::null_mut()
+        }
+    }
+);
+
 impl CornerCaps {
     /// Adds the caps above `parent`'s current subviews, so add the web
     /// container first. They stay hidden until `set_style`.
     pub fn new(parent: &NSView, mtm: MainThreadMarker) -> Self {
         let caps = std::array::from_fn(|_| {
-            let view = NSView::initWithFrame(NSView::alloc(mtm), NSRect::ZERO);
+            // SAFETY: NSView's designated initializer, on a fresh instance.
+            let view: Retained<CornerCapView> =
+                unsafe { msg_send![CornerCapView::alloc(mtm), initWithFrame: NSRect::ZERO] };
+            let view = Retained::into_super(view);
             view.setWantsLayer(true);
             view.setHidden(true);
             let shape = CAShapeLayer::new();
