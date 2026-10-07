@@ -353,7 +353,10 @@ impl MetalRenderer {
         // nothing to do
     }
 
-    pub fn draw(&mut self, scene: &Scene) {
+    /// Renders and presents `scene`. Returns `false` if the layer had no drawable to render
+    /// into (for example after `nextDrawable` timed out), in which case presenting again
+    /// later may succeed.
+    pub fn draw(&mut self, scene: &Scene) -> bool {
         let layer = self.layer.clone();
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
@@ -370,7 +373,7 @@ impl MetalRenderer {
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
             );
-            return;
+            return false;
         };
 
         loop {
@@ -399,7 +402,7 @@ impl MetalRenderer {
                         command_buffer.present_drawable(drawable);
                         command_buffer.commit();
                     }
-                    return;
+                    return true;
                 }
                 Err(err) => {
                     log::error!(
@@ -420,6 +423,8 @@ impl MetalRenderer {
                 }
             }
         }
+        // Presenting this scene again would fail the same way.
+        true
     }
 
     fn draw_primitives(

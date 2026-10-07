@@ -3,7 +3,7 @@ use crate::{
     dispatch_sys::{
         _dispatch_source_type_data_add, dispatch_resume, dispatch_set_context,
         dispatch_source_cancel, dispatch_source_create, dispatch_source_merge_data,
-        dispatch_source_set_event_handler_f, dispatch_source_t, dispatch_suspend,
+        dispatch_source_set_event_handler_f, dispatch_source_t,
     },
 };
 use anyhow::Result;
@@ -11,9 +11,17 @@ use core_graphics::display::CGDirectDisplayID;
 use std::ffi::c_void;
 use util::ResultExt;
 
+/// A CVDisplayLink that forwards each refresh to `callback` on the main queue.
+///
+/// The link can be started and stopped any number of times. The dispatch source that
+/// carries refreshes to the main queue is activated once when the link is created and
+/// cancelled when it is dropped. It is never suspended, so suspend and resume calls cannot
+/// become unbalanced (over-resuming a dispatch object crashes). A refresh merged just before
+/// `stop` may still be delivered once afterwards; callers must tolerate that.
 pub struct DisplayLink {
     display_link: Option<sys::DisplayLink>,
     frame_requests: dispatch_source_t,
+    display_id: CGDirectDisplayID,
 }
 
 impl DisplayLink {
@@ -58,29 +66,45 @@ impl DisplayLink {
                 frame_requests as *mut c_void,
             )?;
 
+            // Dispatch sources are created inactive. This is the only resume.
+            dispatch_resume(crate::dispatch_sys::dispatch_object_t {
+                _ds: frame_requests,
+            });
+
             Ok(Self {
                 display_link: Some(display_link),
                 frame_requests,
+                display_id,
             })
         }
     }
 
+    /// The display this link was created for.
+    pub fn display_id(&self) -> CGDirectDisplayID {
+        self.display_id
+    }
+
+    /// Starts the CVDisplayLink. Does nothing if it is already running.
+    ///
+    /// CoreVideo's own running state is the source of truth (as in Chromium), so a failed
+    /// `stop` cannot leave a running link that every later `start` rejects.
     pub fn start(&mut self) -> Result<()> {
         unsafe {
-            dispatch_resume(crate::dispatch_sys::dispatch_object_t {
-                _ds: self.frame_requests,
-            });
-            self.display_link.as_mut().unwrap().start()?;
+            let display_link = self.display_link.as_mut().unwrap();
+            if !display_link.is_running() {
+                display_link.start()?;
+            }
         }
         Ok(())
     }
 
+    /// Stops the CVDisplayLink. Does nothing if it is already stopped.
     pub fn stop(&mut self) -> Result<()> {
         unsafe {
-            dispatch_suspend(crate::dispatch_sys::dispatch_object_t {
-                _ds: self.frame_requests,
-            });
-            self.display_link.as_mut().unwrap().stop()?;
+            let display_link = self.display_link.as_mut().unwrap();
+            if display_link.is_running() {
+                display_link.stop()?;
+            }
         }
         Ok(())
     }
@@ -227,6 +251,7 @@ mod sys {
         ) -> i32;
         pub fn CVDisplayLinkStart(display_link: &mut DisplayLinkRef) -> i32;
         pub fn CVDisplayLinkStop(display_link: &mut DisplayLinkRef) -> i32;
+        pub fn CVDisplayLinkIsRunning(display_link: &DisplayLinkRef) -> u8;
         pub fn CVDisplayLinkRelease(display_link: *mut CVDisplayLink);
         pub fn CVDisplayLinkRetain(display_link: *mut CVDisplayLink) -> *mut CVDisplayLink;
     }
@@ -278,6 +303,11 @@ mod sys {
                 anyhow::ensure!(code == 0, "could not stop display link, code: {}", code);
                 Ok(())
             }
+        }
+
+        /// Whether CoreVideo reports the link as running (`CVDisplayLinkIsRunning`).
+        pub unsafe fn is_running(&self) -> bool {
+            unsafe { CVDisplayLinkIsRunning(self) != 0 }
         }
     }
 }

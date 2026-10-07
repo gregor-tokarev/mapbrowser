@@ -180,6 +180,7 @@ impl Application {
         platform.run(Box::new(move || {
             let cx = &mut *this.borrow_mut();
             on_finish_launching(cx);
+            cx.flush_effects_outside_update();
         }));
     }
 
@@ -202,7 +203,9 @@ impl Application {
         let this = Rc::downgrade(&self.0);
         self.0.borrow_mut().platform.on_reopen(Box::new(move || {
             if let Some(app) = this.upgrade() {
-                callback(&mut app.borrow_mut());
+                let cx = &mut *app.borrow_mut();
+                callback(cx);
+                cx.flush_effects_outside_update();
             }
         }));
         self
@@ -678,7 +681,8 @@ impl App {
                     cx.keyboard_mapper = cx.platform.keyboard_mapper();
                     cx.keyboard_layout_observers
                         .clone()
-                        .retain(&(), move |callback| (callback)(cx));
+                        .retain(&(), |callback| (callback)(cx));
+                    cx.flush_effects_outside_update();
                 }
             }
         }));
@@ -754,6 +758,14 @@ impl App {
     /// multiple times in an update cycle and still result in a single redraw.
     pub fn refresh_windows(&mut self) {
         self.pending_effects.push_back(Effect::RefreshWindows);
+    }
+
+    /// Applies effects queued by a platform callback that ran with a raw `&mut App` outside
+    /// [`App::update`] (`refresh_windows`, `bind_keys`, `emit`, ...). Upstream GPUI applied
+    /// them in the next frame's update, but frames now run only on demand, so they could
+    /// otherwise wait for an unrelated update.
+    fn flush_effects_outside_update(&mut self) {
+        self.update(|_| {});
     }
 
     pub(crate) fn update<R>(&mut self, update: impl FnOnce(&mut Self) -> R) -> R {

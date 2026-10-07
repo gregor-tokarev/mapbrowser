@@ -60,6 +60,9 @@ pub use prompts::*;
 
 pub(crate) const DEFAULT_WINDOW_SIZE: Size<Pixels> = size(px(1536.), px(864.));
 
+/// How long an active window keeps presenting every frame after a key press, click or scroll.
+const KEEP_PRESENTING_AFTER_INPUT: Duration = Duration::from_secs(1);
+
 /// Represents the two different phases when dispatching events.
 #[derive(Default, Copy, Clone, Debug, Eq, PartialEq)]
 pub enum DispatchPhase {
@@ -95,6 +98,8 @@ struct WindowInvalidatorInner {
     pub dirty: bool,
     pub draw_phase: DrawPhase,
     pub dirty_views: FxHashSet<EntityId>,
+    /// Asks the platform for a frame. See [`PlatformWindow::frame_waker`].
+    frame_waker: Option<Rc<dyn Fn()>>,
 }
 
 #[derive(Clone)]
@@ -109,6 +114,7 @@ impl WindowInvalidator {
                 dirty: true,
                 draw_phase: DrawPhase::None,
                 dirty_views: FxHashSet::default(),
+                frame_waker: None,
             })),
         }
     }
@@ -119,6 +125,11 @@ impl WindowInvalidator {
         if inner.draw_phase == DrawPhase::None {
             inner.dirty = true;
             cx.push_effect(Effect::Notify { emitter: entity });
+            drop(inner);
+            // Request on every invalidation, not only when the window becomes dirty: if the
+            // platform could not start its vsync source for the first request, a later
+            // notification retries instead of finding the window already dirty.
+            self.request_frame();
             true
         } else {
             false
@@ -130,7 +141,25 @@ impl WindowInvalidator {
     }
 
     pub fn set_dirty(&self, dirty: bool) {
-        self.inner.borrow_mut().dirty = dirty
+        self.inner.borrow_mut().dirty = dirty;
+        // Like `invalidate_view`, request even if the window was already dirty.
+        if dirty {
+            self.request_frame();
+        }
+    }
+
+    pub fn set_frame_waker(&self, frame_waker: Option<Rc<dyn Fn()>>) {
+        self.inner.borrow_mut().frame_waker = frame_waker;
+    }
+
+    /// Tells the platform that this window needs a frame. Platforms that request frames
+    /// continuously ignore this. Cheap when a frame is already requested. Never call it while
+    /// `inner` is borrowed.
+    pub fn request_frame(&self) {
+        let frame_waker = self.inner.borrow().frame_waker.clone();
+        if let Some(frame_waker) = frame_waker {
+            frame_waker();
+        }
     }
 
     pub fn set_phase(&self, phase: DrawPhase) {
@@ -862,6 +891,8 @@ pub struct Window {
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    /// When the last key press, click or scroll was dispatched. See
+    /// [`KEEP_PRESENTING_AFTER_INPUT`].
     pub(crate) last_input_timestamp: Rc<Cell<Instant>>,
     pub(crate) refreshing: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
@@ -987,6 +1018,7 @@ impl Window {
         let appearance = platform_window.appearance();
         let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
         let invalidator = WindowInvalidator::new();
+        invalidator.set_frame_waker(platform_window.frame_waker());
         let active = Rc::new(Cell::new(platform_window.is_active()));
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
@@ -1034,12 +1066,16 @@ impl Window {
                         .log_err();
                 }
 
-                // Keep presenting the current scene for 1 extra second since the
-                // last input to prevent the display from underclocking the refresh rate.
+                // Keep presenting the current scene for a while after a key press, click
+                // or scroll in the active window, so ProMotion displays do not lower their
+                // refresh rate between keystrokes (upstream GPUI did this after any input).
+                // Mouse moves do not count: they arrive continuously, also over web
+                // content, and every present re-renders the whole scene.
+                let keep_presenting = active.get()
+                    && last_input_timestamp.get().elapsed() < KEEP_PRESENTING_AFTER_INPUT;
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
-                    || (active.get()
-                        && last_input_timestamp.get().elapsed() < Duration::from_secs(1));
+                    || keep_presenting;
 
                 if invalidator.is_dirty() || request_frame_options.force_render {
                     measure("frame duration", || {
@@ -1061,6 +1097,17 @@ impl Window {
                 handle
                     .update(&mut cx, |_, window, _| {
                         window.complete_frame();
+                        // Work queued during this frame (an animation's next-frame callback,
+                        // a notification while painting) needs another frame. The calls that
+                        // queue it already request one; this check keeps pacing correct if
+                        // a new path forgets to.
+                        if keep_presenting
+                            || window.invalidator.is_dirty()
+                            || !window.next_frame_callbacks.borrow().is_empty()
+                            || window.needs_present.get()
+                        {
+                            window.invalidator.request_frame();
+                        }
                     })
                     .log_err();
             }
@@ -1643,6 +1690,7 @@ impl Window {
     /// Schedule the given closure to be run directly after the current frame is rendered.
     pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
+        self.invalidator.request_frame();
     }
 
     /// Schedule a frame to be drawn on the next animation frame.
@@ -1976,6 +2024,9 @@ impl Window {
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
         self.needs_present.set(true);
+        // Draws outside a frame callback (key dispatch, opening a window) still need a
+        // frame to present the new scene.
+        self.invalidator.request_frame();
 
         ArenaClearNeeded
     }
@@ -3579,7 +3630,12 @@ impl Window {
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
-        self.last_input_timestamp.set(Instant::now());
+        if matches!(
+            event,
+            PlatformInput::KeyDown(_) | PlatformInput::MouseDown(_) | PlatformInput::ScrollWheel(_)
+        ) {
+            self.last_input_timestamp.set(Instant::now());
+        }
         // Handlers may set this to false by calling `stop_propagation`.
         cx.propagate_event = true;
         // Handlers may set this to true by calling `prevent_default`.
@@ -5099,5 +5155,179 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+    }
+}
+
+#[cfg(test)]
+mod frame_waker_tests {
+    use crate::{
+        AnyWindowHandle, Context, IntoElement, ParentElement as _, Render, TestAppContext, Window,
+        div,
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    struct Counter(usize);
+
+    impl Render for Counter {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(format!("{}", self.0))
+        }
+    }
+
+    /// Installs a waker that counts frame requests. Returns the counter.
+    fn count_wakes(cx: &mut TestAppContext) -> (crate::WindowHandle<Counter>, Rc<Cell<usize>>) {
+        let window = cx.add_window(|_, _| Counter(0));
+        let wakes = Rc::new(Cell::new(0));
+        window
+            .update(cx, |_, window, _| {
+                let wakes = wakes.clone();
+                window
+                    .invalidator
+                    .set_frame_waker(Some(Rc::new(move || wakes.set(wakes.get() + 1))));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        (window, wakes)
+    }
+
+    #[crate::test]
+    fn notify_requests_a_frame(cx: &mut TestAppContext) {
+        let (window, wakes) = count_wakes(cx);
+        let before = wakes.get();
+        window
+            .update(cx, |counter, _, cx| {
+                counter.0 += 1;
+                cx.notify();
+            })
+            .unwrap();
+        assert!(wakes.get() > before);
+    }
+
+    #[crate::test]
+    fn refresh_requests_every_time(cx: &mut TestAppContext) {
+        let (window, wakes) = count_wakes(cx);
+        window
+            .update(cx, |_, window, _| {
+                let before = wakes.get();
+                window.refresh();
+                assert_eq!(wakes.get(), before + 1);
+                // Already dirty: request again, so a failed start of the vsync source is
+                // retried.
+                window.refresh();
+                assert_eq!(wakes.get(), before + 2);
+            })
+            .unwrap();
+    }
+
+    #[crate::test]
+    fn notify_on_dirty_window_requests_again(cx: &mut TestAppContext) {
+        let (window, wakes) = count_wakes(cx);
+        window
+            .update(cx, |counter, window, cx| {
+                window.refresh();
+                let before = wakes.get();
+                counter.0 += 1;
+                cx.notify();
+                assert!(wakes.get() > before);
+            })
+            .unwrap();
+    }
+
+    #[crate::test]
+    fn only_deliberate_input_keeps_presenting(cx: &mut TestAppContext) {
+        let (window, _wakes) = count_wakes(cx);
+        let window: AnyWindowHandle = window.into();
+        window
+            .update(cx, |_, window, cx| {
+                let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(60);
+                window.last_input_timestamp.set(long_ago);
+                window.dispatch_event(
+                    crate::PlatformInput::MouseMove(crate::MouseMoveEvent::default()),
+                    cx,
+                );
+                assert_eq!(window.last_input_timestamp.get(), long_ago);
+                window.dispatch_event(
+                    crate::PlatformInput::ScrollWheel(crate::ScrollWheelEvent::default()),
+                    cx,
+                );
+                assert!(window.last_input_timestamp.get() > long_ago);
+            })
+            .unwrap();
+    }
+
+    #[crate::test]
+    fn refresh_windows_requests_a_frame(cx: &mut TestAppContext) {
+        let (_window, wakes) = count_wakes(cx);
+        let before = wakes.get();
+        cx.update(|cx| cx.refresh_windows());
+        assert!(wakes.get() > before);
+    }
+
+    #[crate::test]
+    fn on_next_frame_requests_a_frame(cx: &mut TestAppContext) {
+        let (window, wakes) = count_wakes(cx);
+        window
+            .update(cx, |_, window, _| {
+                let before = wakes.get();
+                window.on_next_frame(|_, _| {});
+                assert_eq!(wakes.get(), before + 1);
+                assert!(!window.invalidator.is_dirty());
+            })
+            .unwrap();
+    }
+
+    #[crate::test]
+    fn async_on_next_frame_requests_a_frame(cx: &mut TestAppContext) {
+        let (window, wakes) = count_wakes(cx);
+        let before = wakes.get();
+        // The asset and image loaders queue a next-frame callback from a task.
+        window
+            .update(cx, |_, window, cx| {
+                window
+                    .spawn(cx, async move |cx| {
+                        cx.on_next_frame(|_, _| {});
+                    })
+                    .detach();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(wakes.get() > before);
+    }
+
+    #[crate::test]
+    fn draw_requests_a_present(cx: &mut TestAppContext) {
+        let (window, wakes) = count_wakes(cx);
+        // Update through the untyped handle so the root view is not leased while drawing.
+        let window: AnyWindowHandle = window.into();
+        window
+            .update(cx, |_, window, cx| {
+                window.refresh();
+                let before = wakes.get();
+                window.draw(cx).clear();
+                assert!(window.needs_present.get());
+                assert_eq!(wakes.get(), before + 1);
+            })
+            .unwrap();
+    }
+
+    #[crate::test]
+    fn entity_update_from_task_requests_a_frame(cx: &mut TestAppContext) {
+        let (window, wakes) = count_wakes(cx);
+        let counter = window.root(cx).unwrap();
+        let before = wakes.get();
+        // Timers and channels (tooltips, engine events) notify from tasks.
+        cx.update(|cx| {
+            cx.spawn(async move |cx| {
+                counter
+                    .update(cx, |counter, cx| {
+                        counter.0 += 1;
+                        cx.notify();
+                    })
+                    .ok();
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+        assert!(wakes.get() > before);
     }
 }

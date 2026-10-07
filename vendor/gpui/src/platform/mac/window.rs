@@ -6,7 +6,12 @@ use crate::{
     PlatformInput, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
     SharedString, Size, SystemWindowTab, Timer, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControlArea, WindowKind, WindowParams, dispatch_get_main_queue,
-    dispatch_sys::dispatch_async_f, platform::PlatformInputHandler, point, px, size,
+    dispatch_sys::{DISPATCH_TIME_NOW, dispatch_after_f, dispatch_async_f, dispatch_time},
+    platform::{
+        PlatformInputHandler,
+        frame_pacing::{FramePacing, LinkAction, Watchdog},
+    },
+    point, px, size,
 };
 use block::ConcreteBlock;
 use cocoa::{
@@ -40,7 +45,7 @@ use parking_lot::Mutex;
 use raw_window_handle as rwh;
 use smallvec::SmallVec;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     ffi::{CStr, c_void},
     mem,
     ops::Range,
@@ -391,7 +396,7 @@ struct MacWindowState {
     native_window: id,
     native_view: NonNull<Object>,
     blurred_view: Option<id>,
-    display_link: Option<DisplayLink>,
+    frame_pacer: Rc<MacFramePacer>,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> crate::DispatchEventResult>>,
@@ -473,28 +478,12 @@ impl MacWindowState {
         }
     }
 
-    fn start_display_link(&mut self) {
-        self.stop_display_link();
+    fn is_visible(&self) -> bool {
         unsafe {
-            if !self
-                .native_window
+            self.native_window
                 .occlusionState()
                 .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
-            {
-                return;
-            }
         }
-        let display_id = unsafe { display_id_for_screen(self.native_window.screen()) };
-        if let Some(mut display_link) =
-            DisplayLink::new(display_id, self.native_view.as_ptr() as *mut c_void, step).log_err()
-        {
-            display_link.start().log_err();
-            self.display_link = Some(display_link);
-        }
-    }
-
-    fn stop_display_link(&mut self) {
-        self.display_link = None;
     }
 
     fn is_maximized(&self) -> bool {
@@ -564,6 +553,257 @@ impl MacWindowState {
 }
 
 unsafe impl Send for MacWindowState {}
+
+/// Consecutive display refreshes without frame demand after which a window's display link
+/// stops. About 67 ms at 120 Hz and 133 ms at 60 Hz.
+const IDLE_REFRESHES_BEFORE_PAUSE: u32 = 8;
+
+/// How long a display link that should be running may go without a refresh before it is
+/// replaced, and how soon a failed start is retried while a frame is wanted. Doubles after
+/// each consecutive failure, up to 2^`MAX_WATCHDOG_BACKOFF` times, so a link that never
+/// works does not leak a replacement every period.
+const DISPLAY_LINK_WATCHDOG_PERIOD: Duration = Duration::from_millis(250);
+const MAX_WATCHDOG_BACKOFF: u32 = 5;
+
+/// How many times in a row a scene that found no drawable is presented again.
+const MAX_PRESENT_RETRIES: u32 = 3;
+
+/// Runs a window's CVDisplayLink only while GPUI has work for upcoming frames.
+///
+/// GPUI requests frames through [`PlatformWindow::frame_waker`]; the link stops after
+/// [`IDLE_REFRESHES_BEFORE_PAUSE`] refreshes that served no request. The link is started and
+/// stopped rather than recreated per frame. It is replaced when the window becomes visible,
+/// when it is bound to a display other than the window's, when a start fails, and when the
+/// watchdog finds that it should run but delivers no refreshes: upstream recreated the link
+/// on every occlusion change, activation and `displayLayer:`, which incidentally repaired
+/// such links, and a link that is believed to run but never fires would freeze the window.
+///
+/// Main thread only. The CoreVideo thread touches only the link's dispatch source. This
+/// lives outside the `MacWindowState` mutex so that frame requests never take that lock.
+struct MacFramePacer {
+    this: std::rc::Weak<MacFramePacer>,
+    pacing: Cell<FramePacing>,
+    display_link: RefCell<Option<DisplayLink>>,
+    /// Consecutive watchdog checks that found a stalled link or retried a failed start.
+    watchdog_failures: Cell<u32>,
+    /// The next frame must present even if GPUI draws nothing: the window just became
+    /// visible (its layer contents may be stale), or the last present found no drawable.
+    force_present: Cell<bool>,
+    present_retries: Cell<u32>,
+    native_window: id,
+    native_view: *mut c_void,
+}
+
+impl MacFramePacer {
+    fn new(native_window: id, native_view: id) -> Rc<Self> {
+        Rc::new_cyclic(|this| Self {
+            this: this.clone(),
+            pacing: Cell::new(FramePacing::new(IDLE_REFRESHES_BEFORE_PAUSE)),
+            display_link: RefCell::new(None),
+            watchdog_failures: Cell::new(0),
+            force_present: Cell::new(false),
+            present_retries: Cell::new(0),
+            native_window,
+            native_view: native_view as *mut c_void,
+        })
+    }
+
+    fn read<R>(&self, f: impl FnOnce(&mut FramePacing) -> R) -> R {
+        let mut pacing = self.pacing.get();
+        let result = f(&mut pacing);
+        self.pacing.set(pacing);
+        result
+    }
+
+    fn update(&self, f: impl FnOnce(&mut FramePacing) -> LinkAction) {
+        let action = self.read(f);
+        self.apply(action);
+    }
+
+    fn apply(&self, action: LinkAction) {
+        match action {
+            LinkAction::None => {}
+            LinkAction::Start => {
+                if self.start_link() {
+                    self.read(|pacing| pacing.source_started());
+                } else {
+                    // The next attempt creates a new link for the window's current display.
+                    self.drop_link();
+                    self.read(|pacing| pacing.start_failed());
+                }
+                self.arm_watchdog();
+            }
+            LinkAction::Stop => {
+                let stopped = self
+                    .display_link
+                    .borrow_mut()
+                    .as_mut()
+                    .is_none_or(|display_link| display_link.stop().log_err().is_some());
+                if !stopped {
+                    // Cancel its dispatch source so a link that keeps running does not wake
+                    // the main thread on every refresh. The next start creates a new link.
+                    self.drop_link();
+                }
+            }
+        }
+    }
+
+    fn start_link(&self) -> bool {
+        let screen = unsafe { self.native_window.screen() };
+        let display_id = (!screen.is_null()).then(|| unsafe { display_id_for_screen(screen) });
+        let mut display_link = self.display_link.borrow_mut();
+        // A link bound to another display may never fire, for example after a display
+        // reconfiguration that sent no `windowDidChangeScreen:`.
+        if let Some(display_id) = display_id
+            && display_link
+                .as_ref()
+                .is_some_and(|display_link| display_link.display_id() != display_id)
+        {
+            *display_link = None;
+        }
+        if display_link.is_none() {
+            let Some(display_id) = display_id else {
+                return false;
+            };
+            *display_link = DisplayLink::new(display_id, self.native_view, step).log_err();
+        }
+        display_link
+            .as_mut()
+            .is_some_and(|display_link| display_link.start().log_err().is_some())
+    }
+
+    fn drop_link(&self) {
+        let display_link = self.display_link.borrow_mut().take();
+        drop(display_link);
+    }
+
+    fn arm_watchdog(&self) {
+        if !self.read(|pacing| pacing.arm_watchdog()) {
+            return;
+        }
+        let backoff = self.watchdog_failures.get().min(MAX_WATCHDOG_BACKOFF);
+        let period = DISPLAY_LINK_WATCHDOG_PERIOD * (1 << backoff);
+        // A `dispatch_after` timer cannot be cancelled, so it holds a weak reference that
+        // `fire_display_link_watchdog` frees.
+        let context = Box::into_raw(Box::new(self.this.clone()));
+        unsafe {
+            let when = dispatch_time(DISPATCH_TIME_NOW as u64, period.as_nanos() as i64);
+            dispatch_after_f(
+                when,
+                dispatch_get_main_queue(),
+                context as *mut c_void,
+                Some(fire_display_link_watchdog),
+            );
+        }
+    }
+
+    fn watchdog(&self) {
+        match self.read(|pacing| pacing.watchdog()) {
+            Watchdog::Disarm => self.watchdog_failures.set(0),
+            Watchdog::Rearm(LinkAction::None) => {
+                self.watchdog_failures.set(0);
+                self.arm_watchdog();
+            }
+            Watchdog::Rearm(action) => {
+                self.watchdog_failures
+                    .set(self.watchdog_failures.get().saturating_add(1));
+                self.apply(action);
+                self.arm_watchdog();
+            }
+            Watchdog::Recreate => {
+                let failures = self.watchdog_failures.get();
+                log::warn!(
+                    "display link delivered no refresh for {:?}; recreating it",
+                    DISPLAY_LINK_WATCHDOG_PERIOD * (1 << failures.min(MAX_WATCHDOG_BACKOFF))
+                );
+                self.watchdog_failures.set(failures.saturating_add(1));
+                self.drop_link();
+                self.apply(LinkAction::Start);
+                self.arm_watchdog();
+            }
+        }
+    }
+
+    fn request(&self) {
+        self.update(|pacing| pacing.request());
+    }
+
+    fn set_visible(&self, visible: bool) {
+        let pacing = self.pacing.get();
+        if visible && !pacing.is_visible() && !pacing.is_closed() {
+            // Replace the link, as upstream did on every change to visible: one that stopped
+            // delivering refreshes while the window was hidden (display sleep, screensaver)
+            // must not be reused. Present the current scene again in case the layer's
+            // contents were discarded.
+            self.drop_link();
+            self.force_present.set(true);
+        }
+        self.update(|pacing| pacing.set_visible(visible));
+    }
+
+    /// Applies the window's current occlusion state.
+    fn update_visibility(&self) {
+        if self.pacing.get().is_closed() {
+            return;
+        }
+        let visible = unsafe {
+            self.native_window
+                .occlusionState()
+                .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
+        };
+        self.set_visible(visible);
+    }
+
+    /// The window moved to another display. Recreates the link for that display.
+    fn display_changed(&self) {
+        self.drop_link();
+        if self.pacing.get().is_running() {
+            self.apply(LinkAction::Start);
+        }
+        self.request();
+    }
+
+    /// Options for a frame callback that is about to run.
+    fn frame_options(&self) -> RequestFrameOptions {
+        let require_presentation = self.force_present.take();
+        if !require_presentation {
+            self.present_retries.set(0);
+        }
+        RequestFrameOptions {
+            require_presentation,
+            force_render: false,
+        }
+    }
+
+    /// Reports whether a present reached the layer. A scene that found no drawable is
+    /// presented again on the next frames, a few times at most.
+    fn presented(&self, presented: bool) {
+        if presented {
+            self.present_retries.set(0);
+            return;
+        }
+        let retries = self.present_retries.get();
+        if retries < MAX_PRESENT_RETRIES {
+            self.present_retries.set(retries + 1);
+            self.force_present.set(true);
+            self.request();
+        }
+    }
+
+    fn close(&self) {
+        let _ = self.read(|pacing| pacing.close());
+        self.drop_link();
+    }
+}
+
+/// Runs a window's display link watchdog. `context` is a `Box<Weak<MacFramePacer>>` leaked
+/// by [`MacFramePacer::arm_watchdog`].
+extern "C" fn fire_display_link_watchdog(context: *mut c_void) {
+    let frame_pacer = unsafe { Box::from_raw(context as *mut std::rc::Weak<MacFramePacer>) };
+    if let Some(frame_pacer) = frame_pacer.upgrade() {
+        frame_pacer.watchdog();
+    }
+}
 
 pub(crate) struct MacWindow(Arc<Mutex<MacWindowState>>);
 
@@ -688,7 +928,7 @@ impl MacWindow {
                 native_window,
                 native_view: NonNull::new_unchecked(native_view),
                 blurred_view: None,
-                display_link: None,
+                frame_pacer: MacFramePacer::new(native_window, native_view),
                 renderer: renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
@@ -934,7 +1174,7 @@ impl Drop for MacWindow {
         let mut this = self.0.lock();
         this.renderer.destroy();
         let window = this.native_window;
-        this.display_link.take();
+        this.frame_pacer.close();
         unsafe {
             this.native_window.setDelegate_(nil);
         }
@@ -1380,6 +1620,15 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().request_frame_callback = Some(callback);
     }
 
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let frame_pacer = Rc::downgrade(&self.0.lock().frame_pacer);
+        Some(Rc::new(move || {
+            if let Some(frame_pacer) = frame_pacer.upgrade() {
+                frame_pacer.request();
+            }
+        }))
+    }
+
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> crate::DispatchEventResult>) {
         self.0.as_ref().lock().event_callback = Some(callback);
     }
@@ -1471,7 +1720,16 @@ impl PlatformWindow for MacWindow {
 
     fn draw(&self, scene: &crate::Scene) {
         let mut this = self.0.lock();
-        this.renderer.draw(scene);
+        #[cfg(not(feature = "macos-blade"))]
+        let presented = this.renderer.draw(scene);
+        #[cfg(feature = "macos-blade")]
+        let presented = {
+            this.renderer.draw(scene);
+            true
+        };
+        let frame_pacer = this.frame_pacer.clone();
+        drop(this);
+        frame_pacer.presented(presented);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -1906,19 +2164,14 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
 
 extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
-    let lock = &mut *window_state.lock();
-    unsafe {
-        if lock
-            .native_window
-            .occlusionState()
-            .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
-        {
-            lock.move_traffic_light();
-            lock.start_display_link();
-        } else {
-            lock.stop_display_link();
-        }
+    let lock = window_state.lock();
+    let visible = lock.is_visible();
+    if visible {
+        lock.move_traffic_light();
     }
+    let frame_pacer = lock.frame_pacer.clone();
+    drop(lock);
+    frame_pacer.set_visible(visible);
 }
 
 extern "C" fn window_did_resize(this: &Object, _: Sel, _: id) {
@@ -1969,8 +2222,8 @@ extern "C" fn window_did_move(this: &Object, _: Sel, _: id) {
 
 extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
-    let mut lock = window_state.as_ref().lock();
-    lock.start_display_link();
+    let frame_pacer = window_state.as_ref().lock().frame_pacer.clone();
+    frame_pacer.display_changed();
 }
 
 extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) {
@@ -2008,19 +2261,27 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
         let mut lock = window_state.lock();
 
         if lock.activated_least_once {
+            let frame_pacer = lock.frame_pacer.clone();
             if let Some(mut callback) = lock.request_frame_callback.take() {
                 #[cfg(not(feature = "macos-blade"))]
                 lock.renderer.set_presents_with_transaction(true);
-                lock.stop_display_link();
                 drop(lock);
-                callback(Default::default());
+                let started = frame_pacer.read(|pacing| pacing.begin_sync_frame());
+                callback(frame_pacer.frame_options());
 
                 let mut lock = window_state.lock();
                 lock.request_frame_callback = Some(callback);
                 #[cfg(not(feature = "macos-blade"))]
                 lock.renderer.set_presents_with_transaction(false);
-                lock.start_display_link();
+                drop(lock);
+                if started {
+                    frame_pacer.update(|pacing| pacing.end_sync_frame());
+                }
+            } else {
+                drop(lock);
             }
+            // Read after the frame, which may have changed it.
+            frame_pacer.update_visibility();
         } else {
             lock.activated_least_once = true;
         }
@@ -2136,30 +2397,46 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
 extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
+    let frame_pacer = lock.frame_pacer.clone();
     if let Some(mut callback) = lock.request_frame_callback.take() {
         #[cfg(not(feature = "macos-blade"))]
         lock.renderer.set_presents_with_transaction(true);
-        lock.stop_display_link();
         drop(lock);
-        callback(Default::default());
+        let started = frame_pacer.read(|pacing| pacing.begin_sync_frame());
+        callback(frame_pacer.frame_options());
 
         let mut lock = window_state.lock();
         lock.request_frame_callback = Some(callback);
         #[cfg(not(feature = "macos-blade"))]
         lock.renderer.set_presents_with_transaction(false);
-        lock.start_display_link();
+        drop(lock);
+        if started {
+            frame_pacer.update(|pacing| pacing.end_sync_frame());
+        }
+    } else {
+        drop(lock);
     }
+    // Read after the frame, which may have changed it.
+    frame_pacer.update_visibility();
 }
 
 unsafe extern "C" fn step(view: *mut c_void) {
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
+    let frame_pacer = lock.frame_pacer.clone();
+    if !frame_pacer.read(|pacing| pacing.begin_tick()) {
+        return;
+    }
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);
-        callback(Default::default());
+        callback(frame_pacer.frame_options());
         window_state.lock().request_frame_callback = Some(callback);
+        frame_pacer.update(|pacing| pacing.end_tick());
+    } else {
+        drop(lock);
+        frame_pacer.read(|pacing| pacing.abort_frame());
     }
 }
 
@@ -2492,6 +2769,7 @@ unsafe fn display_id_for_screen(screen: id) -> CGDirectDisplayID {
         let device_description = NSScreen::deviceDescription(screen);
         let screen_number_key: id = NSString::alloc(nil).init_str("NSScreenNumber");
         let screen_number = device_description.objectForKey_(screen_number_key);
+        let _: () = msg_send![screen_number_key, release];
         let screen_number: NSUInteger = msg_send![screen_number, unsignedIntegerValue];
         screen_number as CGDirectDisplayID
     }

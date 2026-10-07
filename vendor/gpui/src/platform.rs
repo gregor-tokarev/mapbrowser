@@ -1,4 +1,6 @@
 mod app_menu;
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod frame_pacing;
 mod keyboard;
 mod keystroke;
 
@@ -499,6 +501,13 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn draw(&self, scene: &Scene);
     fn completed_frame(&self) {}
+    /// Returns a callback that GPUI invokes on the main thread whenever this window needs a
+    /// frame: it became dirty, queued a next-frame callback, or drew a scene that has not
+    /// been presented. Platforms that only produce frames on demand use it to resume their
+    /// vsync source. Platforms that request frames continuously return `None`.
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        None
+    }
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
 
     // macOS specific methods
