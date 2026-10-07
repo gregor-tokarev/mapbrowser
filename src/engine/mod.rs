@@ -126,6 +126,10 @@ pub enum EngineEvent {
         tab_id: u64,
     },
     Shortcut(Shortcut),
+    /// ⌃ was let go of, in any of the app's windows: a ⌃Tab walk ends.
+    /// Only macOS reports it, as GPUI doesn't see keys while a page has
+    /// keyboard focus.
+    ControlReleased,
 }
 
 /// Modifier keys held with a key press.

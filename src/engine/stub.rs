@@ -134,6 +134,7 @@ impl Engine {
 
     pub fn set_blocker(&mut self, _blocker: ContentBlocker) {}
     pub fn set_blocking_exceptions(&self, _hosts: HashSet<String>) {}
+    pub fn forget_space(&mut self, _space_id: u64) {}
     pub fn register_pending(&mut self) {}
     pub fn activate_tab(&mut self, _tab_id: u64) {}
     pub fn set_bounds(&mut self, _x: f64, _y: f64, _width: f64, _height: f64) {}

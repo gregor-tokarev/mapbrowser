@@ -7,9 +7,9 @@ use crate::{
     model::{Pin, SpaceId, THEME_COUNT, TabId},
 };
 use gpui::{
-    AnyElement, Context, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    Pixels, Point, SharedString, Size, StatefulInteractiveElement, Styled, Window, deferred, div,
-    point, prelude::FluentBuilder, px,
+    AnyElement, Bounds, Context, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Pixels, Point, SharedString, Size, StatefulInteractiveElement, Styled, Window,
+    deferred, div, point, prelude::FluentBuilder, px,
 };
 
 const PADDING: f32 = 5.;
@@ -19,9 +19,14 @@ const HEADER_HEIGHT: f32 = 22.;
 const SWATCH_ROW_HEIGHT: f32 = 30.;
 const ICON_ROW_HEIGHT: f32 = 28.;
 const ICONS_PER_ROW: usize = 7;
+/// A question: its title line and two lines of explanation.
+const PROMPT_HEIGHT: f32 = 64.;
+const CONFIRM_HEIGHT: f32 = 32.;
 const CLOSED_LIMIT: usize = 10;
 /// Distance the menu keeps from the sidebar's edges.
 const EDGE: f32 = 6.;
+/// Distance between a tab's row and its menu.
+const ROW_GAP: f32 = 3.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuKind {
@@ -31,13 +36,16 @@ pub enum MenuKind {
     Plus,
     /// Recently closed tabs, from the library button.
     Library,
+    /// Asks before deleting a space, in place of the space menu.
+    DeleteSpace(SpaceId),
 }
 
 pub struct OpenMenu {
     pub kind: MenuKind,
     /// Where it was asked for, in window coordinates. Menus open below it,
-    /// or above when there is no room.
+    /// or, when there is no room, above `above`.
     pub anchor: Point<Pixels>,
+    pub above: Pixels,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -56,6 +64,9 @@ enum Action {
     UnloadSpace(SpaceId),
     NewTab,
     Reopen(usize),
+    /// "Delete Space…": the menu asks first.
+    AskDeleteSpace(SpaceId),
+    DeleteSpace(SpaceId),
 }
 
 enum Entry {
@@ -63,6 +74,7 @@ enum Entry {
         label: SharedString,
         shortcut: &'static str,
         action: Action,
+        enabled: bool,
     },
     Separator,
     Header(&'static str),
@@ -73,6 +85,15 @@ enum Entry {
         title: SharedString,
     },
     Empty(&'static str),
+    Prompt {
+        title: SharedString,
+        detail: &'static str,
+    },
+    /// Cancel, and a red button that runs `action`.
+    Confirm {
+        label: &'static str,
+        action: Action,
+    },
 }
 
 impl Entry {
@@ -81,7 +102,16 @@ impl Entry {
             label: label.into(),
             shortcut,
             action,
+            enabled: true,
         }
+    }
+
+    /// Greyed out and inert unless `enabled`.
+    fn enabled(mut self, enabled: bool) -> Self {
+        if let Entry::Item { enabled: item, .. } = &mut self {
+            *item = enabled;
+        }
+        self
     }
 
     fn height(&self) -> f32 {
@@ -93,24 +123,58 @@ impl Entry {
             Entry::Icons(..) => {
                 ICON_ROW_HEIGHT * (space_icons().len() + 1).div_ceil(ICONS_PER_ROW) as f32
             }
+            Entry::Prompt { .. } => PROMPT_HEIGHT,
+            Entry::Confirm { .. } => CONFIRM_HEIGHT,
         }
     }
 }
 
-/// Top-left corner of a `size` menu for `anchor`, kept `EDGE` inside the
-/// sidebar (`width` wide) and the window (`height` tall).
-fn place(anchor: Point<Pixels>, menu: Size<f32>, width: f32, height: f32) -> Point<Pixels> {
+/// Top-left corner of a `size` menu opening below `anchor`, or above
+/// `above` when there is no room, kept `EDGE` inside the sidebar (`width`
+/// wide) and the window (`height` tall).
+fn place(
+    anchor: Point<Pixels>,
+    above: Pixels,
+    menu: Size<f32>,
+    width: f32,
+    height: f32,
+) -> Point<Pixels> {
     let (x, y) = (f32::from(anchor.x), f32::from(anchor.y));
     let left = x.min(width - EDGE - menu.width).max(EDGE);
     let top = if y + menu.height <= height - EDGE {
         y
     } else {
-        (y - menu.height).max(EDGE)
+        (f32::from(above) - menu.height).max(EDGE)
     };
     point(px(left), px(top))
 }
 
 impl BrowserApp {
+    /// A tab's menu opens just below its row or tile, level with the
+    /// pointer, or above it without room there: never over its title.
+    pub fn open_tab_menu(
+        &mut self,
+        tab_id: TabId,
+        pointer: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let row = self.tab_bounds(tab_id);
+        self.open_menu(MenuKind::Tab(tab_id), pointer, window, cx);
+        if let (Some(menu), Some(row)) = (&mut self.menu, row) {
+            menu.anchor.y = row.bottom() + px(ROW_GAP);
+            menu.above = row.top() - px(ROW_GAP);
+        }
+    }
+
+    /// Where the active space's tab was last drawn.
+    fn tab_bounds(&self, tab_id: TabId) -> Option<Bounds<Pixels>> {
+        let space = self.state.active_space();
+        let pin = space.tabs.iter().find(|tab| tab.id == tab_id)?.pin;
+        let index = space.section(pin).position(|tab| tab.id == tab_id)?;
+        self.drop_zones.borrow().tab(pin, index)
+    }
+
     fn menu_entries(&self, kind: MenuKind) -> Vec<Entry> {
         match kind {
             MenuKind::Tab(id) => {
@@ -171,6 +235,9 @@ impl BrowserApp {
                     Entry::Separator,
                     Entry::item("New Space", "", Action::NewSpace),
                     Entry::item("Unload Space", "", Action::UnloadSpace(id)),
+                    Entry::Separator,
+                    Entry::item("Delete Space…", "", Action::AskDeleteSpace(id))
+                        .enabled(self.state.spaces.len() > 1),
                 ]);
                 entries
             }
@@ -191,6 +258,21 @@ impl BrowserApp {
                 }
                 entries
             }
+            MenuKind::DeleteSpace(id) => {
+                let Some(space) = self.state.space(id) else {
+                    return Vec::new();
+                };
+                vec![
+                    Entry::Prompt {
+                        title: format!("Delete {}?", space.name).into(),
+                        detail: "Its tabs and site data will be removed.",
+                    },
+                    Entry::Confirm {
+                        label: "Delete",
+                        action: Action::DeleteSpace(id),
+                    },
+                ]
+            }
         }
     }
 
@@ -204,13 +286,14 @@ impl BrowserApp {
         let sidebar = self.sidebar_width().unwrap_or(f32::from(viewport.width));
         let width: f32 = match menu.kind {
             MenuKind::Tab(_) | MenuKind::Plus => 200.,
-            MenuKind::Space(_) | MenuKind::Library => 212.,
+            MenuKind::Space(_) | MenuKind::Library | MenuKind::DeleteSpace(_) => 212.,
         };
         let width = width.min(sidebar - 2. * EDGE);
         let entries = self.menu_entries(menu.kind);
         let height = 2. * PADDING + entries.iter().map(Entry::height).sum::<f32>();
         let origin = place(
             menu.anchor,
+            menu.above,
             Size { width, height },
             sidebar,
             f32::from(viewport.height),
@@ -266,7 +349,7 @@ impl BrowserApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let focus = theme.focus();
-        let item = |id: usize| {
+        let item = |id: usize, enabled: bool| {
             div()
                 .id(("menu-item", id))
                 .group("menu-item")
@@ -276,35 +359,42 @@ impl BrowserApp {
                 .px(px(9.))
                 .rounded(px(5.))
                 .text_size(px(13.))
-                .text_color(theme.title())
-                .hover(move |style| style.bg(focus).text_color(gpui::white()))
+                .text_color(if enabled {
+                    theme.title()
+                } else {
+                    theme.disabled()
+                })
+                .when(enabled, |item| {
+                    item.hover(move |style| style.bg(focus).text_color(gpui::white()))
+                })
         };
         match entry {
             Entry::Item {
                 label,
                 shortcut,
                 action,
-            } => {
-                item(index)
-                    .child(div().flex_1().child(label))
-                    .when(!shortcut.is_empty(), |row| {
-                        row.child(
-                            div()
-                                .text_color(theme.tertiary())
-                                .group_hover("menu-item", |style| {
-                                    style.text_color(gpui::white().opacity(0.8))
-                                })
-                                .child(shortcut),
-                        )
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
+                enabled,
+            } => item(index, enabled)
+                .child(div().flex_1().child(label))
+                .when(!shortcut.is_empty(), |row| {
+                    row.child(
+                        div()
+                            .text_color(theme.tertiary())
+                            .group_hover("menu-item", |style| {
+                                style.text_color(gpui::white().opacity(0.8))
+                            })
+                            .child(shortcut),
+                    )
+                })
+                .when(enabled, |row| {
+                    row.on_click(cx.listener(move |this, _, window, cx| {
                         this.run_menu_action(action, window, cx)
                     }))
-                    .into_any_element()
-            }
+                })
+                .into_any_element(),
             Entry::Closed { index, title } => {
                 let tab = &self.closed[index].tab;
-                item(1000 + index)
+                item(1000 + index, true)
                     .gap(px(8.))
                     .child(self.favicon(tab, 14., theme))
                     .child(truncated(title).flex_1().min_w_0())
@@ -402,10 +492,75 @@ impl BrowserApp {
                     }))
                     .into_any_element()
             }
+            Entry::Prompt { title, detail } => div()
+                .h(px(PROMPT_HEIGHT))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .px(px(9.))
+                .pt(px(4.))
+                .child(
+                    truncated(title)
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.title()),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .line_height(px(16.))
+                        .text_color(theme.muted())
+                        .child(detail),
+                )
+                .into_any_element(),
+            Entry::Confirm { label, action } => {
+                let button = |id: &'static str, text: &'static str| {
+                    div()
+                        .id(id)
+                        .flex()
+                        .items_center()
+                        .h(px(24.))
+                        .px(px(11.))
+                        .rounded(px(6.))
+                        .text_size(px(12.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(text)
+                };
+                let control_hover = theme.control_hover();
+                div()
+                    .h(px(CONFIRM_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(6.))
+                    .px(px(4.))
+                    .child(
+                        button("menu-cancel", "Cancel")
+                            .bg(theme.control())
+                            .hover(move |style| style.bg(control_hover))
+                            .text_color(theme.title())
+                            .on_click(cx.listener(|this, _, _, cx| this.close_menu(cx))),
+                    )
+                    .child(
+                        button("menu-confirm", label)
+                            .bg(theme.danger())
+                            .hover(|style| style.opacity(0.85))
+                            .text_color(gpui::white())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.run_menu_action(action, window, cx)
+                            })),
+                    )
+                    .into_any_element()
+            }
         }
     }
 
     fn run_menu_action(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        // The menu turns into the question, where it is.
+        if let (Action::AskDeleteSpace(id), Some(menu)) = (action, &mut self.menu) {
+            menu.kind = MenuKind::DeleteSpace(id);
+            return cx.notify();
+        }
         self.close_menu(cx);
         match action {
             Action::TogglePin(id) => self.toggle_pin(id, cx),
@@ -424,6 +579,8 @@ impl BrowserApp {
                 self.toggle_command_bar(super::command_bar::CommandMode::NewTab, window, cx)
             }
             Action::Reopen(index) => self.reopen_closed(Some(index), window, cx),
+            Action::AskDeleteSpace(_) => {}
+            Action::DeleteSpace(id) => self.delete_space(id, window, cx),
         }
     }
 }
@@ -438,25 +595,36 @@ mod tests {
             width: 200.,
             height: 150.,
         };
+        let at = |x: f32, y: f32, width: f32, height: f32| {
+            place(point(px(x), px(y)), px(y), menu, width, height)
+        };
         // Room below: opens at the anchor.
-        assert_eq!(
-            place(point(px(20.), px(100.)), menu, 228., 800.),
-            point(px(20.), px(100.))
-        );
+        assert_eq!(at(20., 100., 228., 800.), point(px(20.), px(100.)));
         // Too far right: pulled left to keep the edge.
-        assert_eq!(
-            place(point(px(150.), px(100.)), menu, 228., 800.),
-            point(px(22.), px(100.))
-        );
+        assert_eq!(at(150., 100., 228., 800.), point(px(22.), px(100.)));
         // No room below: opens above the anchor.
-        assert_eq!(
-            place(point(px(10.), px(760.)), menu, 228., 800.),
-            point(px(10.), px(610.))
-        );
+        assert_eq!(at(10., 760., 228., 800.), point(px(10.), px(610.)));
         // Never past the top or left edges.
-        assert_eq!(
-            place(point(px(-5.), px(100.)), menu, 228., 200.),
-            point(px(EDGE), px(EDGE))
-        );
+        assert_eq!(at(-5., 100., 228., 200.), point(px(EDGE), px(EDGE)));
+    }
+
+    #[test]
+    fn tab_menus_leave_their_row_uncovered() {
+        let menu = Size {
+            width: 200.,
+            height: 150.,
+        };
+        // Below a row from y 300 to 336, or above it near the bottom.
+        let below = |top: f32, bottom: f32| {
+            place(
+                point(px(40.), px(bottom + ROW_GAP)),
+                px(top - ROW_GAP),
+                menu,
+                228.,
+                800.,
+            )
+        };
+        assert_eq!(below(300., 336.), point(px(22.), px(339.)));
+        assert_eq!(below(700., 736.), point(px(22.), px(547.)));
     }
 }

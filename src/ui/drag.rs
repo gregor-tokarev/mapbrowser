@@ -86,6 +86,17 @@ impl DropZones {
         self.today = today.to_vec();
     }
 
+    /// The row, or tile, of the tab at `index` in `pin`'s section.
+    pub fn tab(&self, pin: Pin, index: usize) -> Option<Bounds<Pixels>> {
+        match pin {
+            Pin::Favorite => &self.favorites,
+            Pin::Pinned => &self.pinned,
+            Pin::Today => &self.today,
+        }
+        .get(index)
+        .copied()
+    }
+
     /// Above the space title a tab becomes a favorite, above the divider a
     /// pinned tab, below it a Today tab (Arc).
     pub fn target(&self, pointer: Point<Pixels>) -> DropTarget {

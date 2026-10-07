@@ -214,6 +214,11 @@ impl Theme {
         self.focus.into()
     }
 
+    /// Buttons that delete something, with white text.
+    pub fn danger(&self) -> Hsla {
+        rgb(0xd13b33).into()
+    }
+
     /// The command bar and menus.
     pub fn surface(&self) -> Hsla {
         self.surface.into()

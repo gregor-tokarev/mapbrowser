@@ -2,6 +2,7 @@
 //! process lifetime; GPUI only draws the browser controls.
 
 mod blocking;
+mod modifiers;
 
 use super::{
     EditCommand, EngineEvent, Modifiers, edit_command, merge_features, opens_in_tab,
@@ -651,6 +652,7 @@ impl Engine {
         let monitors = [
             install_key_monitor(events.clone(), keys.clone()),
             install_mouse_monitor(events.clone(), keys.clone()),
+            modifiers::install_control_monitor(events.clone()),
         ]
         .into_iter()
         .flatten()
@@ -836,6 +838,11 @@ impl Engine {
     /// Takes page hosts as persisted; subdomains are covered too.
     pub fn set_blocking_exceptions(&self, hosts: HashSet<String>) {
         self.blocker.set_exceptions(hosts);
+    }
+
+    /// Lets go of a deleted space's profile once its browsers have closed.
+    pub fn forget_space(&mut self, space_id: u64) {
+        self.contexts.remove(&space_id);
     }
 
     pub fn register_pending(&mut self) {

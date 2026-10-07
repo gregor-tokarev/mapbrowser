@@ -20,6 +20,10 @@ pub type TabId = u64;
 
 const STATE_FILE: &str = "state.json";
 const BACKUP_FILE: &str = "state.backup.json";
+const PROFILES_DIR: &str = "profiles";
+/// Chromium's process singleton lock in its root directory, `PROFILES_DIR`,
+/// while an instance runs (and after one crashed).
+const CHROMIUM_LOCK: &str = "SingletonLock";
 const SCHEMA_VERSION: u32 = 2;
 const BLANK_URL: &str = "about:blank";
 /// Space themes are indices below this; the UI owns the palettes.
@@ -83,8 +87,31 @@ pub struct BrowserState {
     /// off, subdomains included.
     #[serde(default)]
     blocking_exceptions: BTreeSet<String>,
+    /// The browser window's frame, to open it there again.
+    #[serde(default)]
+    pub window: Option<SavedWindow>,
     #[serde(skip, default = "data_dir")]
     storage_dir: PathBuf,
+    /// Whether this is the session saved last, read from state.json, rather
+    /// than a backup or the defaults.
+    #[serde(skip)]
+    from_state_file: bool,
+}
+
+/// Where the browser window was, in points.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedWindow {
+    /// The frame, from its display's top-left corner. In fullscreen, the
+    /// frame it leaves fullscreen for.
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    /// The display's UUID, which stays when displays reconnect.
+    #[serde(default)]
+    pub display: Option<String>,
+    #[serde(default)]
+    pub fullscreen: bool,
 }
 
 fn schema_version() -> u32 {
@@ -119,7 +146,9 @@ impl Default for BrowserState {
             sidebar_hidden: false,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             blocking_exceptions: BTreeSet::new(),
+            window: None,
             storage_dir: data_dir(),
+            from_state_file: false,
         }
     }
 }
@@ -310,7 +339,10 @@ impl BrowserState {
         let state_path = root.join(STATE_FILE);
         let backup_path = root.join(BACKUP_FILE);
         let state = match read_state(&state_path, root) {
-            Ok(state) => state,
+            Ok(state) => Self {
+                from_state_file: true,
+                ..state
+            },
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {
                 quarantine(&state_path)?;
                 match read_state(&backup_path, root) {
@@ -353,7 +385,7 @@ impl BrowserState {
 
     pub fn profile_dir(&self, space_id: SpaceId) -> PathBuf {
         self.storage_dir
-            .join("profiles")
+            .join(PROFILES_DIR)
             .join(format!("space-{space_id}"))
     }
 
@@ -364,6 +396,27 @@ impl BrowserState {
     pub fn ensure_profile_dirs(&self) -> io::Result<()> {
         for space in &self.spaces {
             fs::create_dir_all(self.cache_dir(space.id))?;
+        }
+        Ok(())
+    }
+
+    /// Deletes the profiles (cookies, storage, cache) of deleted spaces.
+    /// Chromium can hold a profile open until it quits, so a space's data
+    /// goes at the next launch: call this before Chromium starts. Only the
+    /// session read from state.json is trusted with it, as a backup or the
+    /// defaults may lack spaces whose data is still wanted, and only while
+    /// no other instance holds the profiles.
+    pub fn remove_orphaned_profiles(&self) -> io::Result<()> {
+        let profiles = self.storage_dir.join(PROFILES_DIR);
+        if !self.from_state_file
+            || !fs::symlink_metadata(&profiles).is_ok_and(|profiles| profiles.is_dir())
+            || fs::symlink_metadata(profiles.join(CHROMIUM_LOCK)).is_ok()
+        {
+            return Ok(());
+        }
+        let spaces = self.spaces.iter().map(|space| space.id).collect();
+        for orphan in orphaned_profiles(&profiles, &spaces)? {
+            fs::remove_dir_all(orphan)?;
         }
         Ok(())
     }
@@ -505,6 +558,20 @@ impl BrowserState {
         };
         space.name = name.to_owned();
         true
+    }
+
+    /// Removes a space and its tabs, unless it is the last one. A selected
+    /// space hands the selection to the next space, else the previous one.
+    pub fn remove_space(&mut self, id: SpaceId) -> Option<Space> {
+        if self.spaces.len() < 2 {
+            return None;
+        }
+        let index = self.spaces.iter().position(|space| space.id == id)?;
+        let space = self.spaces.remove(index);
+        if self.selected_space_id == id {
+            self.selected_space_id = self.spaces[index.min(self.spaces.len() - 1)].id;
+        }
+        Some(space)
     }
 
     pub fn set_space_theme(&mut self, id: SpaceId, theme: u8) -> bool {
@@ -762,6 +829,33 @@ fn fallback_title(url: &str) -> String {
     } else {
         url.to_owned()
     }
+}
+
+/// The space whose profile `name` is, for names `profile_dir` gives only:
+/// "space-007" and "space-+7" are someone else's.
+fn profile_space_id(name: &str) -> Option<SpaceId> {
+    let id = name.strip_prefix("space-")?.parse().ok()?;
+    (name == format!("space-{id}")).then_some(id)
+}
+
+/// Profile directories in `profiles` of no space in `spaces`: directories
+/// right inside it, never symlinks, named as `profile_dir` names them.
+fn orphaned_profiles(profiles: &Path, spaces: &HashSet<SpaceId>) -> io::Result<Vec<PathBuf>> {
+    let mut orphans = Vec::new();
+    for entry in fs::read_dir(profiles)? {
+        let entry = entry?;
+        // Unlike `Path::is_dir`, this doesn't follow symlinks.
+        if entry.file_type()?.is_dir()
+            && entry
+                .file_name()
+                .to_str()
+                .and_then(profile_space_id)
+                .is_some_and(|id| !spaces.contains(&id))
+        {
+            orphans.push(entry.path());
+        }
+    }
+    Ok(orphans)
 }
 
 fn sanitize_icon(icon: &str) -> Option<String> {
@@ -1827,5 +1921,154 @@ mod tests {
             assert!(!json.contains("fake-user"));
             assert!(!json.contains("fake-password"));
         }
+    }
+
+    #[test]
+    fn removing_a_space_selects_a_neighbour_and_never_the_last_space() {
+        let mut state = BrowserState::default();
+        let (personal, work) = (state.spaces[0].id, state.spaces[1].id);
+        let research = state.create_space("Research");
+        let tab = state.new_tab(personal, "a.com").unwrap();
+        let other = state.new_tab(research, "b.com").unwrap();
+        // The selected space hands over to the next one.
+        state.select_space(work);
+        assert_eq!(state.remove_space(work).unwrap().id, work);
+        assert_eq!(state.selected_space_id, research);
+        // The last in the list hands over to the one before it.
+        assert_eq!(state.remove_space(research).unwrap().tabs[0].id, other);
+        assert_eq!(state.selected_space_id, personal);
+        assert_eq!(active_id(&state), Some(tab));
+        // The only space stays.
+        assert_eq!(state.remove_space(personal), None);
+        assert_eq!(state.remove_space(12345), None);
+        assert_eq!(state.spaces.len(), 1);
+
+        // Other spaces keep their selection.
+        let mut state = BrowserState::default();
+        let (personal, work) = (state.spaces[0].id, state.spaces[1].id);
+        let selected = state.new_tab(personal, "a.com").unwrap();
+        state.new_background_tab(personal, "b.com");
+        assert!(state.remove_space(work).is_some());
+        assert_eq!(state.selected_space_id, personal);
+        assert_eq!(active_id(&state), Some(selected));
+        assert_eq!(state.tab(selected).unwrap().url, "a.com");
+    }
+
+    #[test]
+    fn profile_names_are_only_the_ones_the_app_gives() {
+        assert_eq!(profile_space_id("space-7"), Some(7));
+        assert_eq!(
+            profile_space_id("space-18446744073709551615"),
+            Some(u64::MAX)
+        );
+        for name in [
+            "space-",
+            "space-07",
+            "space-+7",
+            "space--7",
+            "space-7 ",
+            "space-7a",
+            "Space-7",
+            "space-18446744073709551616",
+            "default",
+            "7",
+        ] {
+            assert_eq!(profile_space_id(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn launch_removes_only_profiles_of_deleted_spaces() {
+        let root = TestDir::new();
+        let mut state = BrowserState::load_from(&root.0).unwrap();
+        let (personal, work) = (state.spaces[0].id, state.spaces[1].id);
+        let profiles = root.0.join(PROFILES_DIR);
+        fs::write(state.cache_dir(work).join("Cookies"), "work").unwrap();
+        assert!(state.remove_space(work).is_some());
+        state.save().unwrap();
+        // Not the app's, or not a space's directory: all stay.
+        let outside = TestDir::new();
+        fs::write(outside.0.join("keep"), "").unwrap();
+        std::os::unix::fs::symlink(&outside.0, profiles.join("space-90")).unwrap();
+        for name in ["default", "space-091", "space-x"] {
+            fs::create_dir(profiles.join(name)).unwrap();
+        }
+        fs::write(profiles.join("space-92"), "").unwrap();
+
+        let loaded = BrowserState::load_from(&root.0).unwrap();
+        loaded.remove_orphaned_profiles().unwrap();
+        let left = fs::read_dir(&profiles)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<BTreeSet<_>>();
+        let personal_dir = format!("space-{personal}");
+        let expected = [
+            "default",
+            &personal_dir,
+            "space-091",
+            "space-90",
+            "space-92",
+            "space-x",
+        ];
+        assert_eq!(left, expected.map(str::to_owned).into());
+        assert!(outside.0.join("keep").exists());
+        assert!(loaded.cache_dir(personal).is_dir());
+    }
+
+    #[test]
+    fn profiles_stay_unless_the_session_is_the_one_saved_last() {
+        let root = TestDir::new();
+        let state = BrowserState::load_from(&root.0).unwrap();
+        let orphan = root.0.join(PROFILES_DIR).join("space-50");
+        fs::create_dir_all(&orphan).unwrap();
+        // No state.json: the defaults.
+        state.remove_orphaned_profiles().unwrap();
+        assert!(orphan.is_dir());
+        // A damaged state.json: the backup, which may predate space 50.
+        state.save().unwrap();
+        fs::copy(root.0.join(STATE_FILE), root.0.join(BACKUP_FILE)).unwrap();
+        fs::write(root.0.join(STATE_FILE), "{ partial").unwrap();
+        let recovered = BrowserState::load_from(&root.0).unwrap();
+        recovered.remove_orphaned_profiles().unwrap();
+        assert!(orphan.is_dir());
+        // Another instance (or a crashed one) holds the profiles.
+        recovered.save().unwrap();
+        let lock = root.0.join(PROFILES_DIR).join(CHROMIUM_LOCK);
+        std::os::unix::fs::symlink("host-123", &lock).unwrap();
+        let loaded = BrowserState::load_from(&root.0).unwrap();
+        loaded.remove_orphaned_profiles().unwrap();
+        assert!(orphan.is_dir());
+        fs::remove_file(&lock).unwrap();
+        loaded.remove_orphaned_profiles().unwrap();
+        assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn the_window_frame_is_saved_and_optional() {
+        let root = TestDir::new();
+        let mut state = BrowserState::load_from(&root.0).unwrap();
+        assert_eq!(state.window, None);
+        let window = SavedWindow {
+            x: 40.,
+            y: 60.5,
+            width: 1400.,
+            height: 900.,
+            display: Some("37D8832A-2D66-02CA-B9F7-8F30A301B230".into()),
+            fullscreen: true,
+        };
+        state.window = Some(window.clone());
+        state.save().unwrap();
+        assert_eq!(
+            BrowserState::load_from(&root.0).unwrap().window,
+            Some(window)
+        );
+        let json = serde_json::json!({
+            "spaces": [{ "id": 1, "name": "x", "tabs": [] }],
+            "selected_space_id": 1,
+            "window": { "x": 1, "y": 2, "width": 3, "height": 4 }
+        });
+        fs::write(root.0.join(STATE_FILE), json.to_string()).unwrap();
+        let loaded = BrowserState::load_from(&root.0).unwrap().window.unwrap();
+        assert_eq!((loaded.display, loaded.fullscreen), (None, false));
     }
 }
