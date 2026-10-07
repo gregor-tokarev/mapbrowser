@@ -416,12 +416,12 @@ impl BrowserApp {
     pub fn shortcut(&mut self, shortcut: Shortcut, window: &mut Window, cx: &mut Context<Self>) {
         let active = self.state.active_tab().map(|tab| tab.id);
         match shortcut {
-            Shortcut::Address => {
+            Shortcut::EditAddress => {
                 self.engine.borrow().focus_shell();
                 self.address
                     .update(cx, |input, cx| input.select_all_focus(window, cx));
             }
-            Shortcut::NewTab => self.new_tab(window, cx),
+            Shortcut::CommandBar => self.new_tab(window, cx),
             Shortcut::CloseTab => {
                 if let Some(id) = active {
                     self.close_tab(id, cx)
@@ -457,13 +457,50 @@ impl BrowserApp {
                 };
                 self.switch_space(self.state.spaces[next].id, window, cx);
             }
-            Shortcut::NextTab => {
-                let tabs = &self.state.active_space().tabs;
-                let index = tabs.iter().position(|t| Some(t.id) == active).unwrap_or(0);
-                if let Some(next) = tabs.get((index + 1) % tabs.len().max(1)).map(|t| t.id) {
-                    self.select_tab(next, window, cx);
+            Shortcut::SelectSpace(number) => {
+                if let Some(space) = self.state.spaces.get(usize::from(number).saturating_sub(1)) {
+                    self.switch_space(space.id, window, cx);
                 }
             }
+            Shortcut::NextTab
+            | Shortcut::NextTabInList
+            | Shortcut::PreviousTab
+            | Shortcut::PreviousTabInList => {
+                let tabs = &self.state.active_space().tabs;
+                let count = tabs.len();
+                if count > 0 {
+                    let index = tabs.iter().position(|t| Some(t.id) == active).unwrap_or(0);
+                    let next = if matches!(shortcut, Shortcut::NextTab | Shortcut::NextTabInList) {
+                        (index + 1) % count
+                    } else {
+                        (index + count - 1) % count
+                    };
+                    let id = tabs[next].id;
+                    self.select_tab(id, window, cx);
+                }
+            }
+            Shortcut::SelectTab(number) => {
+                let tabs = &self.state.active_space().tabs;
+                // ⌘9 selects the last tab, as in other browsers.
+                let tab = if number == 9 {
+                    tabs.last()
+                } else {
+                    tabs.get(usize::from(number).saturating_sub(1))
+                };
+                if let Some(id) = tab.map(|tab| tab.id) {
+                    self.select_tab(id, window, cx);
+                }
+            }
+            Shortcut::CopyUrl => {
+                if let Some(tab) = self.state.active_tab() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(tab.url.clone()));
+                }
+            }
+            // Placeholders until the redesigned shell implements them.
+            Shortcut::ReopenClosedTab
+            | Shortcut::ToggleSidebar
+            | Shortcut::TogglePin
+            | Shortcut::ClearToday => {}
         }
     }
 
@@ -500,7 +537,9 @@ impl BrowserApp {
                     self.loading.remove(&tab_id);
                 }
             }
-            EngineEvent::OpenTab { opener_tab_id, url } => {
+            EngineEvent::OpenTab {
+                opener_tab_id, url, ..
+            } => {
                 let space_id = self
                     .state
                     .spaces
@@ -528,6 +567,11 @@ impl BrowserApp {
                 self.engine.borrow_mut().forget_closed(tab_id);
             }
             EngineEvent::Shortcut(shortcut) => self.shortcut(shortcut, window, cx),
+            EngineEvent::CopyText(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+            // Not shown by this shell yet; skip the redraw.
+            EngineEvent::Progress { .. }
+            | EngineEvent::Favicon { .. }
+            | EngineEvent::Fullscreen { .. } => return,
         }
         cx.notify();
     }
@@ -593,10 +637,12 @@ fn main() -> anyhow::Result<()> {
                     .expect("native window handle")
                     .as_raw()
                 {
+                    let mut engine = engine.borrow_mut();
                     engine
-                        .borrow_mut()
                         .attach(handle.ns_view.as_ptr())
                         .expect("attach browser view");
+                    // The card's 10 pt corners over the window background.
+                    engine.set_corner_caps(10., [0xFF00_0000 | ui::BG; 4]);
                 }
                 window.on_window_should_close(cx, |_, cx| {
                     cx.quit();

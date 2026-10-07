@@ -20,7 +20,9 @@ cef = { version = "=152.2.0", default-features = false, features = ["sandbox"] }
 dispatch2 = "0.3"
 objc2 = "0.6"
 objc2-app-kit = "0.3"
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "objc2", "CGPath"] }
 objc2-foundation = "0.3"
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "objc2-core-graphics", "CALayer", "CAShapeLayer", "CATransaction"] }
 raw-window-handle = "0.6"
 
 # Linux builds the GPUI shell without Chromium, for UI previews and tests.

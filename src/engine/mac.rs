@@ -1,7 +1,8 @@
 //! Chromium runs in native child NSViews. Pages keep their own compositor and
 //! process lifetime; GPUI only draws the browser controls.
 
-use super::{EngineEvent, Shortcut};
+use super::{EngineEvent, Modifiers, merge_features, progress_worth_reporting, shortcut_for_key};
+use crate::native::CornerCaps;
 use anyhow::{Context, Result, bail, ensure};
 use async_channel::{Receiver, Sender};
 use block2::RcBlock;
@@ -22,16 +23,57 @@ use std::{
     path::{Path, PathBuf},
     ptr::NonNull,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
+/// Browser-process switches from the energy research. Never add switches
+/// that disable background throttling: pages in hidden spaces keep running,
+/// throttled the way Chromium throttles hidden tabs.
+const ENERGY_SWITCHES: &[&str] = &[
+    // No Safe Browsing list updates, translate fetches or upgrade checks.
+    "disable-background-networking",
+];
+const DISABLE_FEATURES: &[&str] = &[
+    // Battery Saver must never freeze pages in hidden spaces.
+    "CPUMeasurementInFreezingPolicy",
+    "MemoryMeasurementInFreezingPolicy",
+    // No Cast, DIAL or mDNS discovery; there is no Cast UI.
+    "MediaRouter",
+    // No periodic network time queries.
+    "NetworkTimeServiceQuerying",
+    // No per-form server queries; without an API key they fail anyway.
+    "AutofillServerCommunication",
+];
+const ENABLE_FEATURES: &[&str] = &[
+    // Aligns wake-ups to 32 ms, only while Battery Saver is active.
+    "BatterySaverModeAlignWakeUps",
+];
+
+/// Opaque white (0xAARRGGBB), Chromium's default page colour, shown until a
+/// page paints so new and reloading views never flash another colour.
+const PAGE_BACKGROUND: u32 = 0xFFFF_FFFF;
+/// Favicons are drawn at 16 to 20 points: accept icons up to 32 points and
+/// render them for 2x displays.
+const FAVICON_SIZE: u32 = 32;
+const FAVICON_SCALE: f32 = 2.;
+const MENU_OPEN_LINK: i32 = sys::cef_menu_id_t::MENU_ID_USER_FIRST as i32;
+const MENU_COPY_LINK: i32 = MENU_OPEN_LINK + 1;
+/// kVK_Escape.
+const KEY_ESCAPE: u16 = 53;
+
+/// Browser lifecycle state shared with CEF callbacks. A tab can be closed (or
+/// unloaded) and created again before Chromium has finished closing its old
+/// browser, so each browser has its own instance number.
 #[derive(Default)]
 struct PendingBrowsers {
-    requested_urls: HashMap<u64, (String, String)>,
-    ready: Vec<(u64, Browser, String)>,
+    /// The instance representing each tab: requested, ready or live.
+    current: HashMap<u64, u64>,
+    /// URL each requested instance loads once it exists.
+    requested: HashMap<u64, String>,
+    ready: Vec<ReadyBrowser>,
     canceled: HashSet<u64>,
     shutting_down: bool,
     live: HashMap<u64, Browser>,
@@ -39,17 +81,99 @@ struct PendingBrowsers {
     initialized_surface: HashSet<u64>,
 }
 
+struct ReadyBrowser {
+    tab_id: u64,
+    instance: u64,
+    browser: Browser,
+    url: String,
+}
+
+/// What the key monitor needs to route keys into web content.
 #[derive(Default)]
-struct NativeEditing {
+struct KeyRouting {
     container: usize,
+    /// The active tab's browser, which receives web editing commands.
     browser: Option<Browser>,
+    /// The instance and browser in HTML fullscreen; Esc exits it.
+    fullscreen: Option<(u64, Browser)>,
+}
+
+/// Display state of one browser. Only touched on the UI thread.
+#[derive(Default)]
+struct PageState {
+    favicon_url: Option<String>,
+    progress: Option<f64>,
+}
+
+/// Identity and shared state the handlers of one browser report through.
+#[derive(Clone)]
+struct BrowserLink {
+    tab_id: u64,
+    instance: u64,
+    events: Sender<EngineEvent>,
+    pending: Arc<Mutex<PendingBrowsers>>,
+    keys: Arc<Mutex<KeyRouting>>,
+    live_browsers: Arc<AtomicUsize>,
+}
+
+impl BrowserLink {
+    fn send(&self, event: EngineEvent) {
+        // Unbounded, so this never blocks; it fails only once the shell has
+        // stopped listening while quitting.
+        let _ = self.events.try_send(event);
+    }
+
+    fn pending(&self) -> MutexGuard<'_, PendingBrowsers> {
+        self.pending.lock().expect("pending browser state")
+    }
+
+    fn keys(&self) -> MutexGuard<'_, KeyRouting> {
+        self.keys.lock().expect("key routing state")
+    }
+
+    /// Callbacks from the internal empty document that precedes the first
+    /// requested navigation are not reported.
+    fn navigation_started(&self) -> bool {
+        self.pending().started_navigation.contains(&self.instance)
+    }
 }
 
 wrap_app! {
     struct BrowserApp;
     impl App {
+        fn on_before_command_line_processing(&self, process_type: Option<&CefString>, command_line: Option<&mut CommandLine>) {
+            // Browser process only; helpers inherit its feature state.
+            if process_type.is_some_and(|kind| !kind.to_string().is_empty()) { return; }
+            if let Some(command_line) = command_line.filter(|command_line| command_line.is_read_only() == 0) {
+                apply_energy_switches(command_line);
+            }
+        }
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
             Some(PumpHandler::new())
+        }
+    }
+}
+
+fn apply_energy_switches(command_line: &CommandLine) {
+    for switch in ENERGY_SWITCHES {
+        let switch = CefString::from(*switch);
+        if command_line.has_switch(Some(&switch)) == 0 {
+            command_line.append_switch(Some(&switch));
+        }
+    }
+    // CEF has already written its own --disable-features (GlicActorUi,
+    // LensOverlay, ...) and Chromium keeps only a switch's last value.
+    for (switch, features) in [
+        ("disable-features", DISABLE_FEATURES),
+        ("enable-features", ENABLE_FEATURES),
+    ] {
+        let switch = CefString::from(switch);
+        let existing = CefString::from(&command_line.switch_value(Some(&switch))).to_string();
+        let merged = merge_features(&existing, features);
+        if merged != existing {
+            command_line.remove_switch(Some(&switch));
+            command_line
+                .append_switch_with_value(Some(&switch), Some(&CefString::from(merged.as_str())));
         }
     }
 }
@@ -67,57 +191,132 @@ wrap_browser_process_handler! {
 
 wrap_client! {
     struct TabClient {
-        tab_id: u64,
-        events: Sender<EngineEvent>,
-        live_browsers: Arc<AtomicUsize>,
-        pending: Arc<Mutex<PendingBrowsers>>,
+        display: DisplayHandler,
+        load: LoadHandler,
+        life: LifeSpanHandler,
+        menu: ContextMenuHandler,
     }
     impl Client {
         fn display_handler(&self) -> Option<DisplayHandler> {
-            Some(TabDisplay::new(self.tab_id, self.events.clone(), self.pending.clone()))
+            Some(self.display.clone())
         }
         fn load_handler(&self) -> Option<LoadHandler> {
-            Some(TabLoad::new(self.tab_id, self.events.clone(), self.pending.clone()))
+            Some(self.load.clone())
         }
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
-            Some(TabLife::new(self.tab_id, self.events.clone(), self.live_browsers.clone(), self.pending.clone()))
+            Some(self.life.clone())
+        }
+        fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
+            Some(self.menu.clone())
         }
     }
+}
+
+/// CEF asks for a handler on every callback, so each browser builds its
+/// handlers once and hands out references.
+fn tab_client(link: BrowserLink) -> Client {
+    TabClient::new(
+        TabDisplay::new(link.clone(), Arc::default()),
+        TabLoad::new(link.clone()),
+        TabLife::new(link.clone()),
+        TabMenu::new(link),
+    )
 }
 
 wrap_display_handler! {
-    struct TabDisplay { tab_id: u64, events: Sender<EngineEvent>, pending: Arc<Mutex<PendingBrowsers>> }
+    struct TabDisplay { link: BrowserLink, page: Arc<Mutex<PageState>> }
     impl DisplayHandler {
         fn on_address_change(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, url: Option<&CefString>) {
-            if !self.pending.lock().expect("pending browser state").started_navigation.contains(&self.tab_id) { return; }
+            if !self.link.navigation_started() { return; }
             if frame.is_some_and(|frame| frame.is_main() != 0) {
-                let _ = self.events.try_send(EngineEvent::Address { tab_id: self.tab_id, url: url.map(ToString::to_string).unwrap_or_default() });
+                self.link.send(EngineEvent::Address { tab_id: self.link.tab_id, url: url.map(ToString::to_string).unwrap_or_default() });
             }
         }
         fn on_title_change(&self, _browser: Option<&mut Browser>, title: Option<&CefString>) {
-            if !self.pending.lock().expect("pending browser state").started_navigation.contains(&self.tab_id) { return; }
-            let _ = self.events.try_send(EngineEvent::Title { tab_id: self.tab_id, title: title.map(ToString::to_string).unwrap_or_default() });
+            if !self.link.navigation_started() { return; }
+            self.link.send(EngineEvent::Title { tab_id: self.link.tab_id, title: title.map(ToString::to_string).unwrap_or_default() });
+        }
+        fn on_favicon_urlchange(&self, browser: Option<&mut Browser>, icon_urls: Option<&mut CefStringList>) {
+            // Take the borrowed list: iterating a clone of it yields nothing.
+            let Some(url) = icon_urls.map(std::mem::take).and_then(|urls| urls.into_iter().next()) else { return; };
+            {
+                let mut page = self.page.lock().expect("page state");
+                if page.favicon_url.as_ref() == Some(&url) { return; }
+                page.favicon_url = Some(url.clone());
+            }
+            if let Some(host) = browser.and_then(|browser| browser.host()) {
+                let mut callback = FaviconDownload::new(self.link.clone(), self.page.clone(), url.clone());
+                host.download_image(Some(&CefString::from(url.as_str())), 1, FAVICON_SIZE, 0, Some(&mut callback));
+            }
+        }
+        fn on_loading_progress_change(&self, _browser: Option<&mut Browser>, progress: f64) {
+            if !self.link.navigation_started() { return; }
+            {
+                let mut page = self.page.lock().expect("page state");
+                if !progress_worth_reporting(page.progress, progress) { return; }
+                page.progress = Some(progress);
+            }
+            self.link.send(EngineEvent::Progress { tab_id: self.link.tab_id, progress });
+        }
+        fn on_fullscreen_mode_change(&self, browser: Option<&mut Browser>, fullscreen: i32) {
+            let fullscreen = fullscreen != 0;
+            {
+                let mut keys = self.link.keys();
+                if fullscreen {
+                    keys.fullscreen = browser.map(|browser| (self.link.instance, browser.clone()));
+                } else if keys.fullscreen.as_ref().is_some_and(|(instance, _)| *instance == self.link.instance) {
+                    keys.fullscreen = None;
+                }
+            }
+            self.link.send(EngineEvent::Fullscreen { tab_id: self.link.tab_id, fullscreen });
         }
     }
 }
 
+wrap_download_image_callback! {
+    struct FaviconDownload { link: BrowserLink, page: Arc<Mutex<PageState>>, url: String }
+    impl DownloadImageCallback {
+        fn on_download_image_finished(&self, _image_url: Option<&CefString>, _http_status_code: i32, image: Option<&mut Image>) {
+            // A newer icon URL supersedes this download.
+            if self.page.lock().expect("page state").favicon_url.as_ref() != Some(&self.url) { return; }
+            let Some(image) = image.filter(|image| image.is_empty() == 0) else { return; };
+            let (mut width, mut height) = (0, 0);
+            let Some(png) = image.as_png(FAVICON_SCALE, 1, Some(&mut width), Some(&mut height)) else { return; };
+            let png = binary_to_vec(&png);
+            if !png.is_empty() {
+                self.link.send(EngineEvent::Favicon { tab_id: self.link.tab_id, png });
+            }
+        }
+    }
+}
+
+/// `BinaryValue::data` copies `buffer.len()` bytes, so pre-size the buffer.
+fn binary_to_vec(value: &BinaryValue) -> Vec<u8> {
+    let mut bytes = vec![0; value.size()];
+    if !bytes.is_empty() {
+        let read = value.data(Some(&mut bytes), 0);
+        bytes.truncate(read);
+    }
+    bytes
+}
+
 wrap_load_handler! {
-    struct TabLoad { tab_id: u64, events: Sender<EngineEvent>, pending: Arc<Mutex<PendingBrowsers>> }
+    struct TabLoad { link: BrowserLink }
     impl LoadHandler {
         fn on_loading_state_change(&self, _browser: Option<&mut Browser>, is_loading: i32, can_go_back: i32, can_go_forward: i32) {
-            let _ = self.events.try_send(EngineEvent::Loading { tab_id: self.tab_id, loading: is_loading != 0, can_go_back: can_go_back != 0, can_go_forward: can_go_forward != 0 });
+            self.link.send(EngineEvent::Loading { tab_id: self.link.tab_id, loading: is_loading != 0, can_go_back: can_go_back != 0, can_go_forward: can_go_forward != 0 });
         }
         fn on_load_error(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, error_code: Errorcode, error_text: Option<&CefString>, _failed_url: Option<&CefString>) {
             if error_code != Errorcode::ABORTED && frame.is_some_and(|frame| frame.is_main() != 0) {
-                let _ = self.events.try_send(EngineEvent::LoadError { tab_id: self.tab_id, message: error_text.map(ToString::to_string).unwrap_or_else(|| "Page could not be loaded".into()) });
+                self.link.send(EngineEvent::LoadError { tab_id: self.link.tab_id, message: error_text.map(ToString::to_string).unwrap_or_else(|| "Page could not be loaded".into()) });
             }
         }
         fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _http_status_code: i32) {
             if !frame.is_some_and(|frame| frame.is_main() != 0 && CefString::from(&frame.url()).to_string() != "about:blank") { return; }
-            if !self.pending.lock().expect("pending browser state").initialized_surface.insert(self.tab_id) { return; }
+            if !self.link.pending().initialized_surface.insert(self.link.instance) { return; }
             if let Some(view) = browser.and_then(|browser| browser_view(browser)) {
                 if std::env::var_os("MAPBROWSER_TRACE_CEF").is_some() {
-                    trace_native_layout(self.tab_id, view);
+                    trace_native_layout(self.link.tab_id, view);
                 }
                 // CEF 152 can leave its first native compositor surface stale
                 // even when this late-created renderer has correct bounds.
@@ -128,7 +327,7 @@ wrap_load_handler! {
                 view.setFrameSize(NSSize::new(size.width + 1., size.height));
                 view.setFrameSize(size);
                 if std::env::var_os("MAPBROWSER_TRACE_CEF").is_some() {
-                    eprintln!("CEF initialized native surface tab {} at {}x{}", self.tab_id, size.width, size.height);
+                    eprintln!("CEF initialized native surface tab {} at {}x{}", self.link.tab_id, size.width, size.height);
                 }
             }
         }
@@ -136,29 +335,30 @@ wrap_load_handler! {
 }
 
 wrap_life_span_handler! {
-    struct TabLife { tab_id: u64, events: Sender<EngineEvent>, live_browsers: Arc<AtomicUsize>, pending: Arc<Mutex<PendingBrowsers>> }
+    struct TabLife { link: BrowserLink }
     impl LifeSpanHandler {
         fn on_after_created(&self, browser: Option<&mut Browser>) {
             let Some(browser) = browser else { return; };
-            self.live_browsers.fetch_add(1, Ordering::SeqCst);
-            let mut pending = self.pending.lock().expect("pending browser state");
-            pending.live.insert(self.tab_id, browser.clone());
-            let url = pending.requested_urls.remove(&self.tab_id).filter(|(initial, current)| initial != current).map(|(_, current)| current).unwrap_or_default();
-            if pending.shutting_down || pending.canceled.remove(&self.tab_id) {
+            let link = &self.link;
+            link.live_browsers.fetch_add(1, Ordering::SeqCst);
+            let mut pending = link.pending();
+            pending.live.insert(link.instance, browser.clone());
+            let url = pending.requested.remove(&link.instance).unwrap_or_default();
+            if pending.shutting_down || pending.canceled.remove(&link.instance) {
                 drop(pending);
                 if let Some(host) = browser.host() { host.close_browser(1); }
             } else {
                 if let Some(view) = browser_view(browser) { view.setHidden(true); }
-                pending.ready.push((self.tab_id, browser.clone(), url));
+                pending.ready.push(ReadyBrowser { tab_id: link.tab_id, instance: link.instance, browser: browser.clone(), url });
                 drop(pending);
-                let _ = self.events.try_send(EngineEvent::Created { tab_id: self.tab_id });
+                link.send(EngineEvent::Created { tab_id: link.tab_id });
             }
         }
-        fn on_before_popup(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, _popup_id: i32, target_url: Option<&CefString>, _target_frame_name: Option<&CefString>, _target_disposition: WindowOpenDisposition, user_gesture: i32, _popup_features: Option<&PopupFeatures>, _window_info: Option<&mut WindowInfo>, _client: Option<&mut Option<Client>>, _settings: Option<&mut BrowserSettings>, _extra_info: Option<&mut Option<DictionaryValue>>, _no_javascript_access: Option<&mut i32>) -> i32 {
-            if user_gesture != 0 {
-                if let Some(url) = target_url.filter(|url| !url.to_string().is_empty()) {
-                    let _ = self.events.try_send(EngineEvent::OpenTab { opener_tab_id: self.tab_id, url: url.to_string() });
-                }
+        fn on_before_popup(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, _popup_id: i32, target_url: Option<&CefString>, _target_frame_name: Option<&CefString>, target_disposition: WindowOpenDisposition, user_gesture: i32, _popup_features: Option<&PopupFeatures>, _window_info: Option<&mut WindowInfo>, _client: Option<&mut Option<Client>>, _settings: Option<&mut BrowserSettings>, _extra_info: Option<&mut Option<DictionaryValue>>, _no_javascript_access: Option<&mut i32>) -> i32 {
+            if user_gesture != 0 && let Some(url) = target_url.map(ToString::to_string).filter(|url| !url.is_empty()) {
+                // ⌘-click and middle-click ask for a tab behind this one.
+                let background = target_disposition == WindowOpenDisposition::NEW_BACKGROUND_TAB;
+                self.link.send(EngineEvent::OpenTab { opener_tab_id: self.link.tab_id, url, background });
             }
             1
         }
@@ -168,12 +368,16 @@ wrap_life_span_handler! {
             if let Some(host) = browser.and_then(|browser| browser.host()) {
                 let raw = host.window_handle().cast::<NSView>();
                 if !raw.is_null() {
+                    // SAFETY: A valid browser's window handle is its live host
+                    // NSView, and this callback runs on the main thread.
                     let retained = unsafe { Retained::retain(raw) }.expect("CEF view");
                     let address = Retained::into_raw(retained) as usize;
                     let mut task = CloseViewTask::new(address);
                     if post_task(ThreadId::UI, Some(&mut task)) == 0 {
                         // Scheduling only fails during teardown. Release the
                         // extra retain so view hierarchy destruction can finish.
+                        // SAFETY: `address` came from `Retained::into_raw` above
+                        // and the task that would have consumed it never runs.
                         unsafe { drop(Retained::from_raw(address as *mut NSView)); }
                     }
                 }
@@ -181,17 +385,83 @@ wrap_life_span_handler! {
             1
         }
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
-            self.live_browsers.fetch_sub(1, Ordering::SeqCst);
-            let ready_to_quit = {
-                let mut pending = self.pending.lock().expect("pending browser state");
-                pending.live.remove(&self.tab_id);
-                pending.started_navigation.remove(&self.tab_id);
-                pending.initialized_surface.remove(&self.tab_id);
-                pending.shutting_down && pending.live.is_empty() && pending.requested_urls.is_empty()
+            let link = &self.link;
+            link.live_browsers.fetch_sub(1, Ordering::SeqCst);
+            let (ready_to_quit, report) = {
+                let mut pending = link.pending();
+                pending.live.remove(&link.instance);
+                pending.started_navigation.remove(&link.instance);
+                pending.initialized_surface.remove(&link.instance);
+                // A newer browser already represents this tab when it was
+                // closed and created again before this one finished closing.
+                let superseded = pending.current.get(&link.tab_id).is_some_and(|&current| current != link.instance);
+                if !superseded {
+                    pending.current.remove(&link.tab_id);
+                }
+                (pending.shutting_down && pending.live.is_empty() && pending.requested.is_empty(), !superseded)
             };
-            let _ = self.events.try_send(EngineEvent::Closed { tab_id: self.tab_id });
+            let was_fullscreen = {
+                let mut keys = link.keys();
+                let was_fullscreen = keys.fullscreen.as_ref().is_some_and(|(instance, _)| *instance == link.instance);
+                if was_fullscreen { keys.fullscreen = None; }
+                was_fullscreen
+            };
+            if report {
+                if was_fullscreen {
+                    link.send(EngineEvent::Fullscreen { tab_id: link.tab_id, fullscreen: false });
+                }
+                link.send(EngineEvent::Closed { tab_id: link.tab_id });
+            }
             if ready_to_quit { quit_message_loop(); }
         }
+    }
+}
+
+wrap_context_menu_handler! {
+    struct TabMenu { link: BrowserLink }
+    impl ContextMenuHandler {
+        fn on_before_context_menu(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, params: Option<&mut ContextMenuParams>, model: Option<&mut MenuModel>) {
+            let Some(model) = model else { return; };
+            model.remove(sys::cef_menu_id_t::MENU_ID_VIEW_SOURCE as i32);
+            model.remove(sys::cef_menu_id_t::MENU_ID_PRINT as i32);
+            if params.is_some_and(|params| !link_url(params).is_empty()) {
+                model.insert_item_at(0, MENU_OPEN_LINK, Some(&CefString::from("Open Link in New Tab")));
+                model.insert_item_at(1, MENU_COPY_LINK, Some(&CefString::from("Copy Link Address")));
+                model.insert_separator_at(2);
+            }
+            tidy_separators(model);
+        }
+        fn on_context_menu_command(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, params: Option<&mut ContextMenuParams>, command_id: i32, _event_flags: EventFlags) -> i32 {
+            let url = params.map(|params| link_url(params)).unwrap_or_default();
+            match command_id {
+                MENU_OPEN_LINK => self.link.send(EngineEvent::OpenTab { opener_tab_id: self.link.tab_id, url, background: false }),
+                MENU_COPY_LINK => self.link.send(EngineEvent::CopyText(url)),
+                _ => return 0,
+            }
+            1
+        }
+    }
+}
+
+fn link_url(params: &ContextMenuParams) -> String {
+    CefString::from(&params.link_url()).to_string()
+}
+
+/// Removing items can leave leading, trailing or doubled separators.
+fn tidy_separators(model: &MenuModel) {
+    let mut index = 0;
+    let mut after_separator = true;
+    while index < model.count() {
+        let separator = model.type_at(index) == MenuItemType::SEPARATOR;
+        if separator && after_separator {
+            model.remove_at(index);
+        } else {
+            after_separator = separator;
+            index += 1;
+        }
+    }
+    if after_separator && let Some(last) = model.count().checked_sub(1) {
+        model.remove_at(last);
     }
 }
 
@@ -199,10 +469,10 @@ wrap_task! {
     struct CloseViewTask { view_address: usize }
     impl Task {
         fn execute(&self) {
-            unsafe {
-                let view = Retained::from_raw(self.view_address as *mut NSView).expect("retained CEF view");
-                view.removeFromSuperview();
-            }
+            // SAFETY: `do_close` produced the address with `Retained::into_raw`
+            // and posts exactly one task per address, so it is released once.
+            let view = unsafe { Retained::from_raw(self.view_address as *mut NSView) }.expect("retained CEF view");
+            view.removeFromSuperview();
         }
     }
 }
@@ -213,13 +483,16 @@ pub struct Engine {
     browsers: HashMap<u64, Browser>,
     pending: Arc<Mutex<PendingBrowsers>>,
     container: Option<Retained<NSView>>,
+    caps: Option<CornerCaps>,
     parent: *mut NSView,
     monitor: Option<Retained<AnyObject>>,
-    editing: Arc<Mutex<NativeEditing>>,
+    keys: Arc<Mutex<KeyRouting>>,
     root_cache: PathBuf,
     events: Sender<EngineEvent>,
     live_browsers: Arc<AtomicUsize>,
+    next_instance: u64,
     active_tab: Option<u64>,
+    fullscreen_layout: bool,
     width: f64,
     height: f64,
 }
@@ -287,8 +560,8 @@ impl Engine {
         }
         crate::native::enable_cef_message_loop();
         let (events, receiver) = async_channel::unbounded();
-        let editing = Arc::new(Mutex::new(NativeEditing::default()));
-        let monitor = install_shortcuts(events.clone(), editing.clone());
+        let keys = Arc::new(Mutex::new(KeyRouting::default()));
+        let monitor = install_key_monitor(events.clone(), keys.clone());
         let pending = Arc::new(Mutex::new(PendingBrowsers::default()));
         let quit_pending = pending.clone();
         crate::native::set_quit_handler(move || {
@@ -297,7 +570,7 @@ impl Engine {
                 pending.shutting_down = true;
                 (
                     pending.live.values().cloned().collect::<Vec<_>>(),
-                    pending.live.is_empty() && pending.requested_urls.is_empty(),
+                    pending.live.is_empty() && pending.requested.is_empty(),
                 )
             };
             if can_quit {
@@ -307,10 +580,10 @@ impl Engine {
             // Keep the native loop running until OnBeforeClose acknowledges
             // every browser. Closing after NSApp.run returns is too late.
             for browser in browsers {
-                if browser.is_valid() != 0 {
-                    if let Some(host) = browser.host() {
-                        host.close_browser(1);
-                    }
+                if browser.is_valid() != 0
+                    && let Some(host) = browser.host()
+                {
+                    host.close_browser(1);
                 }
             }
         });
@@ -321,13 +594,16 @@ impl Engine {
                 browsers: HashMap::new(),
                 pending,
                 container: None,
+                caps: None,
                 parent: std::ptr::null_mut(),
                 monitor,
-                editing,
+                keys,
                 root_cache,
                 events,
                 live_browsers: Arc::new(AtomicUsize::new(0)),
+                next_instance: 0,
                 active_tab: None,
+                fullscreen_layout: false,
                 width: 800.,
                 height: 600.,
             },
@@ -341,24 +617,25 @@ impl Engine {
         if self.container.is_some() {
             return Ok(());
         }
-        self.parent = parent.cast();
         let mtm = MainThreadMarker::new().context("attach must run on the main thread")?;
+        self.parent = parent.cast();
+        let parent = self.parent_view().context("Missing native parent view")?;
         let container =
             NSView::initWithFrame(NSView::alloc(mtm), rect(0., 0., self.width, self.height));
         container.setWantsLayer(true);
-        unsafe {
-            let layer: *mut AnyObject = msg_send![&container, layer];
-            let _: () = msg_send![layer, setMasksToBounds: Bool::YES];
-            let _: () = msg_send![layer, setCornerRadius: 10.0f64];
-            (&*self.parent).addSubview(&container);
-        }
+        parent.addSubview(&container);
         container.setHidden(true);
-        self.editing.lock().expect("native editing state").container =
+        // Added after the container, so they draw above every web view.
+        let caps = CornerCaps::new(parent, mtm);
+        self.keys.lock().expect("key routing state").container =
             Retained::as_ptr(&container) as usize;
         self.container = Some(container);
+        self.caps = Some(caps);
         Ok(())
     }
 
+    /// Creates the tab's browser, or navigates the one it already has. Works
+    /// for any tab at any time, including one closed or unloaded moments ago.
     pub fn create_tab(&mut self, tab_id: u64, workspace_id: u64, url: &str) -> Result<()> {
         if std::env::var_os("MAPBROWSER_TRACE_CEF").is_some() {
             eprintln!(
@@ -366,13 +643,12 @@ impl Engine {
                 currently_on(ThreadId::UI)
             );
         }
-        if self.has_tab(tab_id)
-            || self
-                .pending
-                .lock()
-                .expect("pending browser state")
-                .requested_urls
-                .contains_key(&tab_id)
+        if self
+            .pending
+            .lock()
+            .expect("pending browser state")
+            .current
+            .contains_key(&tab_id)
         {
             self.navigate(tab_id, url);
             return Ok(());
@@ -381,18 +657,6 @@ impl Engine {
             .container
             .as_ref()
             .context("Attach the native view before creating a tab")?;
-        if !self.contexts.contains_key(&workspace_id) {
-            let path = self.root_cache.join(format!("space-{workspace_id}"));
-            std::fs::create_dir_all(&path)?;
-            let settings = RequestContextSettings {
-                cache_path: CefString::from(path.to_string_lossy().as_ref()),
-                persist_session_cookies: 1,
-                ..Default::default()
-            };
-            let context = request_context_create_context(Some(&settings), None)
-                .context("Could not create the space's Chromium profile")?;
-            self.contexts.insert(workspace_id, context);
-        }
         let window_info = WindowInfo {
             runtime_style: RuntimeStyle::ALLOY,
             ..Default::default()
@@ -406,17 +670,26 @@ impl Engine {
                 height: self.height as i32,
             },
         );
-        let mut client = TabClient::new(
+        let mut context = self.space_context(workspace_id)?;
+        self.next_instance += 1;
+        let instance = self.next_instance;
+        let mut client = tab_client(BrowserLink {
             tab_id,
-            self.events.clone(),
-            self.live_browsers.clone(),
-            self.pending.clone(),
-        );
-        self.pending
-            .lock()
-            .expect("pending browser state")
-            .requested_urls
-            .insert(tab_id, (String::new(), url.to_owned()));
+            instance,
+            events: self.events.clone(),
+            pending: self.pending.clone(),
+            keys: self.keys.clone(),
+            live_browsers: self.live_browsers.clone(),
+        });
+        {
+            let mut pending = self.pending.lock().expect("pending browser state");
+            pending.current.insert(tab_id, instance);
+            pending.requested.insert(instance, url.to_owned());
+        }
+        let settings = BrowserSettings {
+            background_color: PAGE_BACKGROUND,
+            ..Default::default()
+        };
         // CEF asynchronously initializes persistent profiles. Its async browser
         // creation waits for that initialization; CreateBrowserSync does not.
         let accepted = browser_host_create_browser(
@@ -426,24 +699,47 @@ impl Engine {
             // presented the native view. A fast initial document can otherwise
             // submit its first compositor frame while the container is hidden.
             None,
-            Some(&BrowserSettings::default()),
+            Some(&settings),
             None,
-            self.contexts.get_mut(&workspace_id),
+            Some(&mut context),
         );
         if accepted == 0 {
-            self.pending
-                .lock()
-                .expect("pending browser state")
-                .requested_urls
-                .remove(&tab_id);
+            let mut pending = self.pending.lock().expect("pending browser state");
+            pending.requested.remove(&instance);
+            pending.current.remove(&tab_id);
             bail!("Chromium could not create the tab");
         }
         Ok(())
     }
 
+    /// Each space is its own persistent Chromium profile: cookies, storage
+    /// and cache. Every space's request context is created here.
+    fn space_context(&mut self, space_id: u64) -> Result<RequestContext> {
+        if let Some(context) = self.contexts.get(&space_id) {
+            return Ok(context.clone());
+        }
+        let path = self.root_cache.join(format!("space-{space_id}"));
+        std::fs::create_dir_all(&path)?;
+        let settings = RequestContextSettings {
+            cache_path: CefString::from(path.to_string_lossy().as_ref()),
+            persist_session_cookies: 1,
+            ..Default::default()
+        };
+        let context = request_context_create_context(Some(&settings), None)
+            .context("Could not create the space's Chromium profile")?;
+        self.contexts.insert(space_id, context.clone());
+        Ok(context)
+    }
+
     pub fn register_pending(&mut self) {
         let ready = std::mem::take(&mut self.pending.lock().expect("pending browser state").ready);
-        for (tab_id, browser, url) in ready {
+        for ReadyBrowser {
+            tab_id,
+            instance,
+            browser,
+            url,
+        } in ready
+        {
             if browser.is_valid() == 0 {
                 continue;
             }
@@ -452,7 +748,7 @@ impl Engine {
                 .lock()
                 .expect("pending browser state")
                 .canceled
-                .remove(&tab_id)
+                .remove(&instance)
             {
                 if let Some(host) = browser.host() {
                     host.close_browser(1);
@@ -461,9 +757,7 @@ impl Engine {
             }
             let active = self.active_tab == Some(tab_id);
             if active {
-                if let Some(container) = &self.container {
-                    container.setHidden(false);
-                }
+                self.set_container_hidden(false);
             }
             if let Some(view) = browser_view(&browser) {
                 view.setAutoresizingMask(NSAutoresizingMaskOptions::empty());
@@ -477,34 +771,30 @@ impl Engine {
                     .lock()
                     .expect("pending browser state")
                     .started_navigation
-                    .insert(tab_id);
+                    .insert(instance);
                 if let Some(frame) = browser.main_frame() {
                     frame.load_url(Some(&CefString::from(url.as_str())));
                 }
             }
             self.browsers.insert(tab_id, browser);
             if active {
-                if let Some(container) = &self.container {
-                    container.setHidden(false);
-                }
+                self.set_container_hidden(false);
                 self.focus_tab(tab_id);
-                self.update_native_editing();
+                self.update_key_routing();
             }
         }
     }
 
     pub fn activate_tab(&mut self, tab_id: u64) {
         self.active_tab = Some(tab_id);
-        self.update_native_editing();
+        self.update_key_routing();
         for (&id, browser) in &self.browsers {
             if let Some(view) = browser_view(browser) {
                 view.setFrameOrigin(NSPoint::new(0., 0.));
                 view.setHidden(id != tab_id);
             }
         }
-        if let Some(container) = &self.container {
-            container.setHidden(!self.has_tab(tab_id));
-        }
+        self.set_container_hidden(!self.has_tab(tab_id));
         if self.has_tab(tab_id) {
             self.focus_tab(tab_id);
         } else {
@@ -514,13 +804,13 @@ impl Engine {
 
     /// Input is top-left logical pixels, matching GPUI's coordinate system.
     pub fn set_bounds(&mut self, x: f64, y: f64, width: f64, height: f64) {
-        let Some(container) = &self.container else {
+        let (Some(container), Some(parent)) = (&self.container, self.parent_view()) else {
             return;
         };
         let width = width.max(1.);
         let height = height.max(1.);
-        let parent = unsafe { &*self.parent };
-        let native_y = if parent.isFlipped() {
+        let flipped = parent.isFlipped();
+        let native_y = if flipped {
             y
         } else {
             parent.bounds().size.height - y - height
@@ -528,6 +818,9 @@ impl Engine {
         let frame = rect(x, native_y, width, height);
         if container.frame() != frame {
             container.setFrame(frame);
+        }
+        if let Some(caps) = &mut self.caps {
+            caps.set_card(frame, flipped);
         }
         if self.width != width || self.height != height {
             self.width = width;
@@ -545,11 +838,9 @@ impl Engine {
     pub fn set_transition(&mut self, from_tab: u64, to_tab: u64, progress: f32, direction: i32) {
         let p = progress.clamp(0., 1.) as f64;
         let distance = self.width * if direction < 0 { -1. } else { 1. };
-        if let Some(container) = &self.container {
-            container.setHidden(
-                !self.browsers.contains_key(&from_tab) && !self.browsers.contains_key(&to_tab),
-            );
-        }
+        self.set_container_hidden(
+            !self.browsers.contains_key(&from_tab) && !self.browsers.contains_key(&to_tab),
+        );
         for (&id, browser) in &self.browsers {
             if let Some(view) = browser_view(browser) {
                 let visible = id == from_tab || id == to_tab;
@@ -573,29 +864,33 @@ impl Engine {
             host.set_focus(1);
         }
     }
-    fn update_native_editing(&self) {
-        self.editing.lock().expect("native editing state").browser = self
+    fn update_key_routing(&self) {
+        self.keys.lock().expect("key routing state").browser = self
             .active_tab
             .and_then(|id| self.live_browser(id))
             .cloned();
     }
     pub fn focus_shell(&self) {
-        if let Some(parent) = unsafe { self.parent.as_ref() } {
-            if let Some(window) = parent.window() {
-                window.makeFirstResponder(Some(parent));
-            }
+        if let Some(parent) = self.parent_view()
+            && let Some(window) = parent.window()
+        {
+            window.makeFirstResponder(Some(parent));
         }
     }
     pub fn navigate(&self, tab_id: u64, url: &str) {
         {
             let mut pending = self.pending.lock().expect("pending browser state");
-            if let Some(requested) = pending.requested_urls.get_mut(&tab_id) {
-                requested.1 = url.to_owned();
-            }
-            if let Some((_, _, requested)) =
-                pending.ready.iter_mut().find(|(id, _, _)| *id == tab_id)
-            {
-                *requested = url.to_owned();
+            if let Some(&instance) = pending.current.get(&tab_id) {
+                if let Some(requested) = pending.requested.get_mut(&instance) {
+                    *requested = url.to_owned();
+                }
+                if let Some(ready) = pending
+                    .ready
+                    .iter_mut()
+                    .find(|ready| ready.instance == instance)
+                {
+                    ready.url = url.to_owned();
+                }
             }
         }
         if let Some(frame) = self.live_browser(tab_id).and_then(|b| b.main_frame()) {
@@ -617,6 +912,7 @@ impl Engine {
             browser.reload();
         }
     }
+    #[allow(dead_code)]
     pub fn stop(&self, tab_id: u64) {
         if let Some(browser) = self.live_browser(tab_id) {
             browser.stop_load();
@@ -630,27 +926,39 @@ impl Engine {
     pub fn has_tab(&self, tab_id: u64) -> bool {
         self.live_browser(tab_id).is_some()
     }
+    /// Drops the handle of a browser reported `Closed`. A browser created for
+    /// the tab since then stays.
     pub fn forget_closed(&mut self, tab_id: u64) {
-        self.browsers.remove(&tab_id);
+        if self
+            .browsers
+            .get(&tab_id)
+            .is_some_and(|browser| browser.is_valid() == 0)
+        {
+            self.browsers.remove(&tab_id);
+        }
     }
+    /// Closes the tab's browser, for closing the tab or for unloading it
+    /// (pinned tabs, "Unload Space") while the shell keeps its entry;
+    /// `create_tab` loads it again. `Closed` follows once Chromium is done.
     pub fn close_tab(&mut self, tab_id: u64) {
         {
             let mut pending = self.pending.lock().expect("pending browser state");
-            if pending.requested_urls.contains_key(&tab_id)
-                || pending.ready.iter().any(|(id, _, _)| *id == tab_id)
+            if let Some(instance) = pending.current.remove(&tab_id)
+                && (pending.requested.contains_key(&instance)
+                    || pending.ready.iter().any(|ready| ready.instance == instance))
             {
-                pending.canceled.insert(tab_id);
+                pending.canceled.insert(instance);
             }
         }
-        if let Some(browser) = self
+        if let Some(host) = self
             .browsers
             .remove(&tab_id)
             .filter(|browser| browser.is_valid() != 0)
+            .and_then(|browser| browser.host())
         {
-            if let Some(host) = browser.host() {
-                host.close_browser(1);
-            }
+            host.close_browser(1);
         }
+        self.update_key_routing();
     }
 
     /// Run before leaving the application's main thread. No CEF work is allowed
@@ -659,18 +967,24 @@ impl Engine {
         if self.library.is_none() {
             return Ok(());
         }
-        self.editing.lock().expect("native editing state").browser = None;
+        {
+            let mut keys = self.keys.lock().expect("key routing state");
+            keys.browser = None;
+            keys.fullscreen = None;
+        }
         self.pending
             .lock()
             .expect("pending browser state")
             .shutting_down = true;
         let ready = std::mem::take(&mut self.pending.lock().expect("pending browser state").ready);
-        for (_, browser, _) in ready {
+        for ReadyBrowser { browser, .. } in ready {
             if let Some(view) = browser_view(&browser) {
                 view.removeFromSuperview();
             }
         }
         if let Some(monitor) = self.monitor.take() {
+            // SAFETY: `monitor` is the token returned when the monitor was
+            // added, and it is removed exactly once.
             unsafe {
                 NSEvent::removeMonitor(&monitor);
             }
@@ -690,7 +1004,7 @@ impl Engine {
                 .pending
                 .lock()
                 .expect("pending browser state")
-                .requested_urls
+                .requested
                 .is_empty())
             && Instant::now() < deadline
         {
@@ -702,24 +1016,109 @@ impl Engine {
                 .pending
                 .lock()
                 .expect("pending browser state")
-                .requested_urls
+                .requested
                 .is_empty()
         {
             bail!("Chromium is still closing; skipping unsafe framework unload");
         }
         self.contexts.clear();
+        if let Some(caps) = self.caps.take() {
+            caps.remove();
+        }
         if let Some(container) = self.container.take() {
             container.removeFromSuperview();
         }
         shutdown();
         crate::native::disable_cef_message_loop();
         if let Some(mut library) = self.library.take() {
+            // SAFETY: Chromium has shut down and no CEF object is used after
+            // this point, so the framework can be unloaded exactly once.
             unsafe {
                 ManuallyDrop::drop(&mut library);
             }
         }
         Ok(())
     }
+
+    /// GPUI's window view; null until `attach`.
+    fn parent_view(&self) -> Option<&NSView> {
+        // SAFETY: `attach` stores GPUI's content view, which lives as long as
+        // the browser window. The engine is not `Send`, so this runs on the
+        // main thread.
+        unsafe { self.parent.as_ref() }
+    }
+
+    fn set_container_hidden(&mut self, hidden: bool) {
+        if let Some(container) = &self.container {
+            container.setHidden(hidden);
+        }
+        if let Some(caps) = &mut self.caps {
+            caps.set_hidden(hidden || self.fullscreen_layout);
+        }
+    }
+}
+
+/// Window and card chrome.
+// The redesigned shell calls these.
+#[allow(dead_code)]
+impl Engine {
+    /// Rounds the web card with `radius`, using the window colours
+    /// (0xAARRGGBB) behind its top-left, top-right, bottom-left and
+    /// bottom-right corners. Call again whenever they change, including on
+    /// every frame of a theme transition; a zero radius leaves corners square.
+    pub fn set_corner_caps(&mut self, radius: f64, colors: [u32; 4]) {
+        if let Some(caps) = &mut self.caps {
+            caps.set_style(radius, colors);
+        }
+    }
+
+    /// In HTML fullscreen the card fills the window with square corners.
+    pub fn set_fullscreen_layout(&mut self, fullscreen: bool) {
+        self.fullscreen_layout = fullscreen;
+        let hidden = self
+            .container
+            .as_ref()
+            .is_none_or(|container| container.isHidden());
+        self.set_container_hidden(hidden);
+    }
+
+    /// Leaves HTML fullscreen, for example when the window leaves fullscreen
+    /// or another tab is selected. `Fullscreen { fullscreen: false }` follows.
+    pub fn exit_fullscreen(&self, tab_id: u64) {
+        if let Some(host) = self.live_browser(tab_id).and_then(|b| b.host())
+            && host.is_fullscreen() != 0
+        {
+            host.exit_fullscreen(1);
+        }
+    }
+
+    /// `child_view` is the NSView of a GPUI pop-up window (the command bar).
+    /// It becomes a borderless child window directly above the browser
+    /// window. Detach it before closing it.
+    pub fn attach_child_window(&self, child_view: *mut c_void) {
+        if let (Some(parent), Some(child)) = (self.parent_view(), child_view_ref(child_view)) {
+            crate::native::attach_child_window(parent, child);
+        }
+    }
+
+    pub fn detach_child_window(&self, child_view: *mut c_void) {
+        if let (Some(parent), Some(child)) = (self.parent_view(), child_view_ref(child_view)) {
+            crate::native::detach_child_window(parent, child);
+        }
+    }
+
+    /// Hides the close, minimize and zoom buttons while the sidebar is hidden.
+    pub fn set_traffic_lights_hidden(&self, hidden: bool) {
+        if let Some(parent) = self.parent_view() {
+            crate::native::set_traffic_lights_hidden(parent, hidden);
+        }
+    }
+}
+
+fn child_view_ref<'a>(view: *mut c_void) -> Option<&'a NSView> {
+    // SAFETY: Callers pass the NSView from a live GPUI window's raw handle,
+    // on the main thread (the engine is not `Send`), or null.
+    unsafe { view.cast::<NSView>().as_ref() }
 }
 
 fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
@@ -751,6 +1150,8 @@ fn trace_native_layout(tab_id: u64, view: &NSView) {
             }
         }
     }
+    // SAFETY: Only reads the hierarchy on the main thread; the container and
+    // GPUI's view are alive while a browser view is.
     if let Some(parent) = unsafe { view.superview().and_then(|container| container.superview()) } {
         trace_view(&parent, 0);
     } else {
@@ -763,96 +1164,114 @@ fn browser_view(browser: &Browser) -> Option<&NSView> {
         return None;
     }
     let raw = browser.host()?.window_handle().cast::<NSView>();
-    // All callers execute on the UI thread; a valid browser's child NSView is
-    // retained by its parent. No event loop runs between this check and use.
+    // SAFETY: All callers execute on the UI thread; a valid browser's child
+    // NSView is retained by its parent. No event loop runs between this check
+    // and use.
     unsafe { raw.as_ref() }
 }
 
-fn install_shortcuts(
+fn install_key_monitor(
     events: Sender<EngineEvent>,
-    editing: Arc<Mutex<NativeEditing>>,
+    keys: Arc<Mutex<KeyRouting>>,
 ) -> Option<Retained<AnyObject>> {
     let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+        // SAFETY: AppKit passes a valid event that outlives this handler.
         let e = unsafe { event.as_ref() };
         let flags = e.modifierFlags();
-        let command = flags.contains(NSEventModifierFlags::Command);
-        let control = flags.contains(NSEventModifierFlags::Control);
-        let option = flags.contains(NSEventModifierFlags::Option);
-        let shift = flags.contains(NSEventModifierFlags::Shift);
-        let key = e.keyCode();
-        if command && !control && !option && matches!(key, 0 | 6 | 7 | 8 | 9) {
-            let (container, browser) = {
-                let editing = editing.lock().expect("native editing state");
-                (editing.container, editing.browser.clone())
-            };
-            let web_has_focus = e
-                .window(MainThreadMarker::new().expect("native event on main thread"))
-                .and_then(|window| window.firstResponder())
-                .is_some_and(|responder| unsafe {
-                    let is_view: Bool = msg_send![&responder, isKindOfClass: NSView::class()];
-                    if !is_view.as_bool() || container == 0 {
-                        return false;
-                    }
-                    let inside: Bool =
-                        msg_send![&responder, isDescendantOf: container as *mut NSView];
-                    inside.as_bool()
-                });
-            if web_has_focus {
-                if let Some(frame) = browser
-                    .filter(|browser| browser.is_valid() != 0)
-                    .and_then(|browser| browser.focused_frame())
-                {
-                    let handled = match (key, shift) {
-                        (0, false) => {
-                            frame.select_all();
-                            true
-                        }
-                        (8, false) => {
-                            frame.copy();
-                            true
-                        }
-                        (7, false) => {
-                            frame.cut();
-                            true
-                        }
-                        (9, false) => {
-                            frame.paste();
-                            true
-                        }
-                        (6, false) => {
-                            frame.undo();
-                            true
-                        }
-                        (6, true) => {
-                            frame.redo();
-                            true
-                        }
-                        _ => false,
-                    };
-                    if handled {
-                        return std::ptr::null_mut();
-                    }
-                }
-            }
-        }
-        let shortcut = match (command, control, option, shift, key) {
-            (true, false, false, false, 37) => Some(Shortcut::Address),
-            (true, false, false, false, 17) => Some(Shortcut::NewTab),
-            (true, false, false, false, 13) => Some(Shortcut::CloseTab),
-            (true, false, false, false, 15) => Some(Shortcut::Reload),
-            (true, false, false, false, 33) => Some(Shortcut::Back),
-            (true, false, false, false, 30) => Some(Shortcut::Forward),
-            (false, true, false, false, 48) => Some(Shortcut::NextTab),
-            (true, false, true, false, 123) => Some(Shortcut::PreviousSpace),
-            (true, false, true, false, 124) => Some(Shortcut::NextSpace),
-            _ => None,
+        let modifiers = Modifiers {
+            command: flags.contains(NSEventModifierFlags::Command),
+            control: flags.contains(NSEventModifierFlags::Control),
+            option: flags.contains(NSEventModifierFlags::Option),
+            shift: flags.contains(NSEventModifierFlags::Shift),
         };
-        if let Some(shortcut) = shortcut {
+        let key = e.keyCode();
+        if handle_in_page(e, key, modifiers, &keys) {
+            return std::ptr::null_mut();
+        }
+        if let Some(shortcut) = shortcut_for_key(key, modifiers) {
             let _ = events.try_send(EngineEvent::Shortcut(shortcut));
             std::ptr::null_mut()
         } else {
             event.as_ptr()
         }
     });
+    // SAFETY: The handler returns either the event or null to consume it, as
+    // local monitors must; AppKit copies the block.
     unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &block) }
+}
+
+/// Keys that act on the page itself: Esc leaves HTML fullscreen, and the
+/// standard editing commands go to the focused frame of the active page.
+fn handle_in_page(
+    event: &NSEvent,
+    key: u16,
+    modifiers: Modifiers,
+    keys: &Mutex<KeyRouting>,
+) -> bool {
+    if key == KEY_ESCAPE && modifiers == Modifiers::default() {
+        // Leaving fullscreen calls back into the display handler, which locks
+        // the routing state, so release it first.
+        let fullscreen = keys
+            .lock()
+            .expect("key routing state")
+            .fullscreen
+            .as_ref()
+            .map(|(_, browser)| browser.clone());
+        let Some(host) = fullscreen
+            .filter(|browser| browser.is_valid() != 0)
+            .and_then(|browser| browser.host())
+        else {
+            return false;
+        };
+        host.exit_fullscreen(1);
+        return true;
+    }
+    let Modifiers {
+        command,
+        control,
+        option,
+        shift,
+    } = modifiers;
+    if !command || control || option || !matches!(key, 0 | 6 | 7 | 8 | 9) {
+        return false;
+    }
+    let (container, browser) = {
+        let keys = keys.lock().expect("key routing state");
+        (keys.container, keys.browser.clone())
+    };
+    let web_has_focus = event
+        .window(MainThreadMarker::new().expect("native event on main thread"))
+        .and_then(|window| window.firstResponder())
+        .is_some_and(|responder| {
+            // SAFETY: Both messages are NSObject/NSView queries with object
+            // arguments; `container` is the live web container (checked
+            // non-zero) and `responder` is retained for this call.
+            unsafe {
+                let is_view: Bool = msg_send![&responder, isKindOfClass: NSView::class()];
+                if !is_view.as_bool() || container == 0 {
+                    return false;
+                }
+                let inside: Bool = msg_send![&responder, isDescendantOf: container as *mut NSView];
+                inside.as_bool()
+            }
+        });
+    if !web_has_focus {
+        return false;
+    }
+    let Some(frame) = browser
+        .filter(|browser| browser.is_valid() != 0)
+        .and_then(|browser| browser.focused_frame())
+    else {
+        return false;
+    };
+    match (key, shift) {
+        (0, false) => frame.select_all(),
+        (8, false) => frame.copy(),
+        (7, false) => frame.cut(),
+        (9, false) => frame.paste(),
+        (6, false) => frame.undo(),
+        (6, true) => frame.redo(),
+        _ => return false,
+    }
+    true
 }
