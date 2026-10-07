@@ -17,6 +17,9 @@ mod native {
 
     /// Only macOS has an application menu with About.
     pub fn show_about_panel() {}
+
+    /// Only macOS has a Window menu.
+    pub fn bring_all_to_front() {}
 }
 
 use app::{BrowserApp, external_web_url, run_shortcut};
@@ -26,7 +29,23 @@ use gpui::{prelude::*, *};
 use model::BrowserState;
 use std::{cell::RefCell, rc::Rc};
 
-actions!(mapbrowser, [Quit, About, NewSpace, Dismiss]);
+actions!(
+    mapbrowser,
+    [
+        Quit,
+        About,
+        Hide,
+        HideOthers,
+        ShowAll,
+        NewSpace,
+        Dismiss,
+        Undo,
+        Redo,
+        Minimize,
+        Zoom,
+        BringAllToFront
+    ]
+);
 
 /// A browser shortcut. GPUI binds the keys the macOS key monitor intercepts,
 /// so they also work where the monitor doesn't run, and the menu bar shows them.
@@ -44,6 +63,13 @@ fn key_bindings() -> Vec<KeyBinding> {
     use Shortcut::*;
     let mut bindings = vec![
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-h", Hide, None),
+        KeyBinding::new("alt-cmd-h", HideOthers, None),
+        KeyBinding::new("cmd-m", Minimize, None),
+        // The key monitor sends these to a focused page first; bound here
+        // so the Edit menu shows them.
+        KeyBinding::new("cmd-z", Undo, None),
+        KeyBinding::new("cmd-shift-z", Redo, None),
         KeyBinding::new("escape", Dismiss, Some("Browser")),
         KeyBinding::new("cmd-t", Browse(CommandBar), None),
         KeyBinding::new("cmd-l", Browse(EditAddress), None),
@@ -90,6 +116,10 @@ fn menus() -> Vec<Menu> {
             vec![
                 MenuItem::action("About Map", About),
                 MenuItem::separator(),
+                MenuItem::action("Hide Map", Hide),
+                MenuItem::action("Hide Others", HideOthers),
+                MenuItem::action("Show All", ShowAll),
+                MenuItem::separator(),
                 MenuItem::action("Quit Map", Quit),
             ],
         ),
@@ -103,10 +133,14 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Close Tab", Browse(CloseTab)),
             ],
         ),
-        // Routed to whichever view has focus, the web page included.
+        // Routed to whichever view has focus, the web page included. Undo
+        // and Redo act on the page only; the shell's text fields have none.
         menu(
             "Edit",
             vec![
+                MenuItem::os_action("Undo", Undo, OsAction::Undo),
+                MenuItem::os_action("Redo", Redo, OsAction::Redo),
+                MenuItem::separator(),
                 MenuItem::os_action("Cut", input::Cut, OsAction::Cut),
                 MenuItem::os_action("Copy", input::Copy, OsAction::Copy),
                 MenuItem::os_action("Paste", input::Paste, OsAction::Paste),
@@ -141,6 +175,16 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Clear Today Tabs", Browse(ClearToday)),
             ],
         ),
+        // The name makes it AppKit's Window menu, which lists the windows.
+        menu(
+            "Window",
+            vec![
+                MenuItem::action("Minimize", Minimize),
+                MenuItem::action("Zoom", Zoom),
+                MenuItem::separator(),
+                MenuItem::action("Bring All to Front", BringAllToFront),
+            ],
+        ),
     ]
 }
 
@@ -165,6 +209,10 @@ fn main() -> anyhow::Result<()> {
         cx.bind_keys(key_bindings());
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(|_: &About, _| native::show_about_panel());
+        cx.on_action(|_: &Hide, cx| cx.hide());
+        cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
+        cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+        cx.on_action(|_: &BringAllToFront, _| native::bring_all_to_front());
         cx.set_menus(menus());
         let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
         let window = cx
@@ -209,6 +257,28 @@ fn main() -> anyhow::Result<()> {
         cx.on_action(move |_: &NewSpace, cx| {
             cx.defer(move |cx| {
                 let _ = window.update(cx, |app, window, cx| app.new_space(window, cx));
+            })
+        });
+        // Like NewSpace, these act on the browser window, also while the
+        // command bar (a child window) has focus.
+        cx.on_action(move |_: &Minimize, cx| {
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |_, window, _| window.minimize_window());
+            })
+        });
+        cx.on_action(move |_: &Zoom, cx| {
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |_, window, _| window.zoom_window());
+            })
+        });
+        cx.on_action(move |_: &Undo, cx| {
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |app, _, _| app.engine.borrow().undo_in_page());
+            })
+        });
+        cx.on_action(move |_: &Redo, cx| {
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |app, _, _| app.engine.borrow().redo_in_page());
             })
         });
         cx.activate(true);

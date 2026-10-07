@@ -993,6 +993,26 @@ impl Engine {
             window.makeFirstResponder(Some(parent));
         }
     }
+    /// Edit > Undo and Redo, for the active page if it has keyboard focus
+    /// in the key window. ⌘Z and ⇧⌘Z reach it through the key monitor.
+    pub fn undo_in_page(&self) {
+        self.edit_page(EditCommand::Undo);
+    }
+    pub fn redo_in_page(&self) {
+        self.edit_page(EditCommand::Redo);
+    }
+    fn edit_page(&self, command: EditCommand) {
+        let (container, browser) = {
+            let keys = self.keys.lock().expect("key routing state");
+            (keys.container, keys.browser.clone())
+        };
+        if let Some(window) = self.parent_view().and_then(|parent| parent.window())
+            && window.isKeyWindow()
+            && page_has_focus(&window, container)
+        {
+            edit_frame(browser, command);
+        }
+    }
     pub fn navigate(&self, tab_id: u64, url: &str) {
         {
             let mut pending = self.pending.lock().expect("pending browser state");
@@ -1405,7 +1425,12 @@ fn handle_in_page(
         let keys = keys.lock().expect("key routing state");
         (keys.container, keys.browser.clone())
     };
-    let web_has_focus = window.firstResponder().is_some_and(|responder| {
+    page_has_focus(window, container) && edit_frame(browser, command)
+}
+
+/// Whether keyboard focus is in the web container at address `container`.
+fn page_has_focus(window: &NSWindow, container: usize) -> bool {
+    window.firstResponder().is_some_and(|responder| {
         // SAFETY: Both messages are NSObject/NSView queries with object
         // arguments; `container` is the live web container (checked
         // non-zero) and `responder` is retained for this call.
@@ -1417,10 +1442,11 @@ fn handle_in_page(
             let inside: Bool = msg_send![&responder, isDescendantOf: container as *mut NSView];
             inside.as_bool()
         }
-    });
-    if !web_has_focus {
-        return false;
-    }
+    })
+}
+
+/// Runs `command` in the page's focused frame; false without one.
+fn edit_frame(browser: Option<Browser>, command: EditCommand) -> bool {
     let Some(frame) = browser
         .filter(|browser| browser.is_valid() != 0)
         .and_then(|browser| browser.focused_frame())

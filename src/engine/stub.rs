@@ -140,6 +140,8 @@ impl Engine {
     pub fn set_transition(&mut self, _from: u64, _to: u64, _progress: f32, _direction: i32) {}
     pub fn focus_tab(&self, _tab_id: u64) {}
     pub fn focus_shell(&self) {}
+    pub fn undo_in_page(&self) {}
+    pub fn redo_in_page(&self) {}
 
     pub fn navigate(&self, tab_id: u64, url: &str) {
         {

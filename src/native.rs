@@ -390,6 +390,13 @@ pub fn show_about_panel() {
     }
 }
 
+/// Window > Bring All to Front.
+pub fn bring_all_to_front() {
+    if let Some(mtm) = MainThreadMarker::new() {
+        NSApplication::sharedApplication(mtm).arrangeInFront(None);
+    }
+}
+
 /// Shows or hides the window's close, minimize and zoom buttons.
 pub fn set_traffic_lights_hidden(view: &NSView, hidden: bool) {
     let Some(window) = view.window() else {
