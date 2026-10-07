@@ -6,16 +6,19 @@ mod content;
 pub mod drag;
 pub mod icons;
 pub mod menu;
+pub mod redraw;
 mod sidebar;
 pub mod swipe;
 pub mod theme;
+pub mod window_frame;
 
 use crate::{Dismiss, app::BrowserApp};
 use drag::DraggedEdge;
 use gpui::{
     AnyView, App, AppContext, Bounds, BoxShadow, Context, Div, DragMoveEvent, FontWeight,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Render, SharedString,
-    Styled, Window, div, point, prelude::FluentBuilder, px, size,
+    InteractiveElement, IntoElement, ModifiersChangedEvent, MouseButton, ParentElement, Pixels,
+    Render, SharedString, StatefulInteractiveElement, Styled, Window, div, point,
+    prelude::FluentBuilder, px, size,
 };
 use theme::Theme;
 
@@ -57,6 +60,20 @@ impl BrowserApp {
                 (viewport.height - px(2. * CARD_INSET)).max(px(1.)),
             ),
         )
+    }
+
+    /// A sidebar control's tooltip, but none while a menu is open: GPUI
+    /// would show a tooltip still waiting to appear over the menu.
+    fn tooltip(
+        &self,
+        text: impl Into<SharedString>,
+        shortcut: &'static str,
+        theme: &Theme,
+        width: f32,
+    ) -> Option<impl Fn(&mut Window, &mut App) -> AnyView + 'static> {
+        self.menu
+            .is_none()
+            .then(|| Tooltip::build(text, shortcut, theme, width))
     }
 
     /// Advances the space switch. Frames are requested only while it runs.
@@ -122,6 +139,13 @@ impl Render for BrowserApp {
             .key_context("Browser")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &Dismiss, _, cx| this.close_menu(cx)))
+            .on_modifiers_changed(
+                cx.listener(|this, event: &ModifiersChangedEvent, window, cx| {
+                    if !event.modifiers.control {
+                        this.finish_tab_switch(window, cx);
+                    }
+                }),
+            )
             // The sidebar's edge may be dragged anywhere, even with the sidebar hidden.
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<DraggedEdge>, _, cx| {
@@ -149,6 +173,21 @@ pub fn shadow(y: f32, blur: f32, alpha: f32) -> BoxShadow {
         spread_radius: px(0.),
     }
 }
+
+/// `tooltip`, for tooltips that may be withheld (`BrowserApp::tooltip`).
+pub trait MaybeTooltip: StatefulInteractiveElement {
+    fn maybe_tooltip(
+        self,
+        tooltip: Option<impl Fn(&mut Window, &mut App) -> AnyView + 'static>,
+    ) -> Self {
+        match tooltip {
+            Some(tooltip) => self.tooltip(tooltip),
+            None => self,
+        }
+    }
+}
+
+impl<E: StatefulInteractiveElement> MaybeTooltip for E {}
 
 /// Keeps a press on a control from reaching the sidebar, where it would
 /// start a window drag.

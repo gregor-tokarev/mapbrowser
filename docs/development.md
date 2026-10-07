@@ -48,7 +48,8 @@ MAPBROWSER_DATA_DIR="$PWD/.test-data/manual" MAPBROWSER_TRACE_ANIMATION=1 make d
 | `src/main.rs` | Entry point, actions, key bindings, menu bar, window creation |
 | `src/app.rs` | Browser behaviour: tabs, spaces, lazy loading, command bar actions, saving |
 | `src/ui/` | Sidebar, page card, command bar, menus, themes, icons, drag and drop, swipe |
-| `src/model.rs` | Saved state (schema 2): spaces, tabs, sections, themes, sidebar, blocking exceptions |
+| `src/model.rs` | Saved state (schema 2): spaces, tabs, sections, themes, sidebar, blocking exceptions, window frame; removing deleted spaces' profiles |
+| `src/recent.rs` | Recently used tabs per space, for ⌃Tab |
 | `src/favicons.rs` | Favicon cache keyed by host |
 | `src/blocker.rs` | Ad and tracker blocking with adblock-rust |
 | `src/engine/` | Chromium embedding (`mac.rs`), the Linux stand-in (`stub.rs`) and shared events |
@@ -63,6 +64,9 @@ MAPBROWSER_DATA_DIR="$PWD/.test-data/manual" MAPBROWSER_TRACE_ANIMATION=1 make d
 - **First paint.** CEF 152 needs a compositor workaround in this host: after the first real main-frame load, the app changes the native view width by one logical pixel and restores it, once per browser instance, without a reload or ongoing work.
 - **Message loop.** Chromium runs its native macOS message loop through the GPUI application; there is no polling timer for browser work.
 - **Frame scheduling.** The vendored GPUI runs its display link only while a frame is needed. See `vendor/gpui/MAPBROWSER_PATCH.md` and [energy design](energy.md).
+- **Deleting a space.** Each space is a Chromium profile in `<data dir>/profiles/space-<id>`, and Chromium can keep a profile's files open until it quits. Deleting a space therefore only closes its pages and drops it from the session; its directory is removed at the next launch, before Chromium starts (`BrowserState::remove_orphaned_profiles`). That sweep removes only real directories directly in `profiles/` named exactly `space-<id>` with an id no space has; it never follows symlinks and never touches `profiles/default`. It runs only when the session was read from `state.json` itself: after recovering from the backup, or starting from defaults, a space whose data is still wanted may be missing from the session. It also waits while Chromium's `profiles/SingletonLock` exists, since another running instance (or one that crashed) may hold the profiles. Space ids are never reused, so a removed directory can't belong to a later space.
+- **Recent tabs.** ⌃Tab walks the active space's five most recently shown tabs (kept in memory, filled up in sidebar order after a launch) and goes to the outlined one when ⌃ is released. The page usually has keyboard focus, so on macOS an AppKit flags-changed monitor reports ⌃'s release; GPUI's modifiers event covers the shell and Linux.
+- **Window frame.** The window's frame, display UUID and user-chosen fullscreen are saved with the session (at most every 10 s while it moves, and on quit) and restored at launch, moved and shrunk onto that display. If the display is gone, the window opens centred on the main display.
 
 ## Verify
 

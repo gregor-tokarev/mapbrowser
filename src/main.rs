@@ -6,6 +6,7 @@ mod input;
 mod model;
 #[cfg(target_os = "macos")]
 mod native;
+mod recent;
 mod ui;
 
 #[cfg(not(target_os = "macos"))]
@@ -191,6 +192,9 @@ fn menus() -> Vec<Menu> {
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let state = BrowserState::load()?;
+    if let Err(error) = state.remove_orphaned_profiles() {
+        eprintln!("Couldn't remove a deleted space's data: {error}");
+    }
     let blocker = ContentBlocker::load_in_background(state.root_dir().join("blocker"));
     let (mut engine, events) = Engine::initialize(state.root_dir())?;
     engine.set_blocker(blocker);
@@ -214,12 +218,13 @@ fn main() -> anyhow::Result<()> {
         cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
         cx.on_action(|_: &BringAllToFront, _| native::bring_all_to_front());
         cx.set_menus(menus());
-        let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
+        let (bounds, display_id) = ui::window_frame::initial(state.window.as_ref(), cx);
         let window = cx
             .open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(size(px(820.), px(540.))),
+                    window_bounds: Some(bounds),
+                    display_id,
+                    window_min_size: Some(ui::window_frame::MIN_SIZE),
                     titlebar: Some(TitlebarOptions {
                         title: Some("Map Browser".into()),
                         appears_transparent: true,

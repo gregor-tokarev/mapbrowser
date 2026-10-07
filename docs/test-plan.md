@@ -74,6 +74,11 @@ The redesign was built on a machine without macOS: it type-checks for macOS and 
 11. A tab, space, library or + menu closes when the page is clicked, and Esc then reaches the page.
 12. Rename Space (offered only for the active space): typing goes to the field; clicking the page, pressing ⌘1 or selecting a tab ends the rename and keeps the name; clicking back into the field resumes typing there.
 13. Menu bar: ⌘H hides the app, ⌥⌘H hides others, ⌘M minimizes (also with the sidebar hidden), Window > Zoom and Bring All to Front work, and Edit > Undo undoes typing in a web form.
+14. The space menu (… beside the name, or a right-click on a space dot) ends with Delete Space…, greyed out when only one space is left. It turns into "Delete <name>? Its tabs and site data will be removed." in the sidebar; Cancel and Esc keep the space. Delete closes its pages, moves to the next space if it was the active one, and leaves the other spaces' tabs and logins alone. ⇧⌘T no longer offers its closed tabs.
+15. After deleting a space, quit and reopen: `profiles/space-<id>` of the deleted space is gone and every other space keeps its logins. Delete one, then start a second copy with `open -n` before quitting the first: the second copy removes nothing.
+16. Resize the window, move it to a second display and quit: it reopens there at that size. Fullscreen from the green button reopens in fullscreen; a video's fullscreen doesn't. With that display disconnected, it opens centred on the built-in display.
+17. While renaming a space, ⌘Q or the red close button keeps the name typed so far.
+18. Right-clicking a tab opens its menu just below the row or favorite tile, never over its title, and the row stays highlighted while the menu is open. Pointing at a space dot or favorite and right-clicking at once shows no tooltip over the menu.
 
 ### Command bar
 
@@ -92,6 +97,7 @@ The redesign was built on a machine without macOS: it type-checks for macOS and 
 6. HTML fullscreen video fills the screen without the sidebar or card corners, and Esc returns to the normal layout. Leaving window fullscreen by other means also restores it.
 7. Keyboard shortcuts work both with the page focused and with the sidebar focused, including on AZERTY, Dvorak and Russian layouts: ⌘Z undoes in a web form, ⌘W closes the tab, ⌘Q quits, ⌘A selects all.
 8. Closing the window with the red button saves the latest tab changes, like ⌘Q.
+9. ⌃Tab, with the page focused and with the sidebar focused, goes back to the tab you were on, and pressed again returns. Holding ⌃ and pressing Tab again outlines older tabs of the space in the sidebar without loading them; releasing ⌃ goes to the outlined one. ⌃⇧Tab walks the other way. Releasing ⌃ in another app cancels the walk. ⌥⌘↓ and ⌥⌘↑ still follow the sidebar order.
 
 ### Blocking and Chromium switches
 
@@ -105,3 +111,5 @@ The redesign was built on a machine without macOS: it type-checks for macOS and 
 Follow the measuring section of [energy design](energy.md). The first check is the idle one: with one quiet page visible, the main process should show no periodic wakeups, also after pressing a command-bar result, moving slightly and releasing.
 
 Display sleep: on power, with audio playing in one tab and another tab whose title keeps changing, run `pmset displaysleepnow` and leave the display off for ten minutes (once with "Require password" set to a delay or off, so the window is not hidden by the lock screen). While it is off, the main process shows no periodic wakeups and the log no "display link" warnings. On waking, the sidebar and an open command bar redraw at once, without a freeze of several seconds, and show the latest titles.
+
+With `sudo powermetrics --samplers tasks --show-process-wakeups`, a page that changes `document.title` every second causes no periodic main-process wakeups in two setups: as the visible page with the sidebar hidden, and as a favorite that isn't selected with the sidebar shown. The favorite's tooltip still shows its current title.

@@ -4,7 +4,7 @@
 //! under the fixed navigation row and bottom bar.
 
 use super::{
-    SlideFrame, Tooltip,
+    MaybeTooltip, SlideFrame, Tooltip,
     command_bar::CommandMode,
     drag::{DraggedEdge, DraggedTab, EDGE_HANDLE, TabDrag, TabPreview},
     icons::{Icon, icon},
@@ -19,10 +19,10 @@ use crate::{
     model::{Pin, Space, Tab, TabId},
 };
 use gpui::{
-    AnyElement, AppContext, BoxShadow, ClickEvent, Context, Div, DragMoveEvent, EmptyView,
+    AnyElement, App, AppContext, BoxShadow, ClickEvent, Context, Div, DragMoveEvent, EmptyView,
     FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    Pixels, ScrollWheelEvent, Size, Stateful, StatefulInteractiveElement, Styled, div, img, point,
-    prelude::FluentBuilder, px, size,
+    Pixels, ScrollWheelEvent, Size, Stateful, StatefulInteractiveElement, Styled, Window, div, img,
+    point, prelude::FluentBuilder, px, size,
 };
 
 /// The navigation row's centre, level with the traffic lights.
@@ -47,6 +47,16 @@ pub fn space_icons() -> &'static [&'static str] {
 
 fn selected_shadow() -> Vec<BoxShadow> {
     vec![shadow(1., 2., 0.12)]
+}
+
+/// The outline of the tab a ⌃Tab walk has reached, over its row or tile.
+fn switch_outline(theme: &Theme) -> Div {
+    div()
+        .absolute()
+        .inset_0()
+        .rounded(px(10.))
+        .border_2()
+        .border_color(theme.focus())
 }
 
 /// A 28 pt toolbar button with a rounded hover fill.
@@ -195,7 +205,7 @@ impl BrowserApp {
             .map(|id| self.page(id))
             .unwrap_or_default();
         let has_tab = self.active_tab_id().is_some();
-        let tooltip = |text, shortcut| Tooltip::build(text, shortcut, theme, width);
+        let tooltip = |text, shortcut| self.tooltip(text, shortcut, theme, width);
         let button_top = px(TOP_ROW_CENTER - 14.);
         div()
             .absolute()
@@ -220,7 +230,7 @@ impl BrowserApp {
                     .absolute()
                     .left(px(72.))
                     .top(button_top)
-                    .tooltip(tooltip("Hide Sidebar", "⌘S"))
+                    .maybe_tooltip(tooltip("Hide Sidebar", "⌘S"))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
             )
             .child(
@@ -232,17 +242,17 @@ impl BrowserApp {
                     .gap(px(6.))
                     .child(
                         tool_button("back", Icon::ArrowLeft, 22., page.can_go_back, theme)
-                            .tooltip(tooltip("Back", "⌘["))
+                            .maybe_tooltip(tooltip("Back", "⌘["))
                             .on_click(cx.listener(|this, _, _, _| this.back())),
                     )
                     .child(
                         tool_button("forward", Icon::ArrowRight, 22., page.can_go_forward, theme)
-                            .tooltip(tooltip("Forward", "⌘]"))
+                            .maybe_tooltip(tooltip("Forward", "⌘]"))
                             .on_click(cx.listener(|this, _, _, _| this.forward())),
                     )
                     .child(
                         tool_button("reload", Icon::Reload, 18., has_tab, theme)
-                            .tooltip(tooltip("Reload", "⌘R"))
+                            .maybe_tooltip(tooltip("Reload", "⌘R"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(id) = this.active_tab_id() {
                                     this.reload(id, cx);
@@ -384,7 +394,7 @@ impl BrowserApp {
                     .hover(move |style| style.bg(hover))
                     .child(icon(glyph, 17., theme.icon())),
             )
-            .tooltip(Tooltip::build(tooltip, shortcut, theme, width))
+            .maybe_tooltip(self.tooltip(tooltip, shortcut, theme, width))
         };
         div()
             .id(("url-pill", space.id))
@@ -503,12 +513,15 @@ impl BrowserApp {
                     .w(tile_size.width)
                     .h(tile_size.height)
                     .rounded(px(10.))
+                    .relative()
                     .map(|tile| {
                         if is_selected {
                             tile.bg(gpui::white().opacity(if theme.dark { 0.14 } else { 0.92 }))
                                 .border_2()
                                 .border_color(theme.focus())
                                 .shadow(selected_shadow())
+                        } else if self.has_open_menu(id) {
+                            tile.bg(control_hover)
                         } else {
                             tile.bg(control).hover(move |style| style.bg(control_hover))
                         }
@@ -516,17 +529,33 @@ impl BrowserApp {
                     .when(self.is_dragged(id), |tile| tile.opacity(DRAGGED_OPACITY))
                     .child(self.favicon(tab, 20., theme))
                     .when(interactive, |tile| {
+                        // Its title when it opens: a favorite isn't redrawn
+                        // when only its title changes.
+                        let tooltip = self.menu.is_none().then(|| {
+                            let (app, theme) = (cx.weak_entity(), *theme);
+                            move |window: &mut Window, cx: &mut App| {
+                                let title = app.upgrade().and_then(|app| {
+                                    Some(app.read(cx).state.tab(id)?.title.clone())
+                                });
+                                Tooltip::build(title.unwrap_or_default(), "", &theme, width)(
+                                    window, cx,
+                                )
+                            }
+                        });
                         self.draggable(press_only(tile), tab, tile_size, true, theme)
-                            .tooltip(Tooltip::build(tab.title.clone(), "", theme, width))
+                            .maybe_tooltip(tooltip)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.select_tab(id, window, cx)
                             }))
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                    this.open_menu(MenuKind::Tab(id), event.position, window, cx)
+                                    this.open_tab_menu(id, event.position, window, cx)
                                 }),
                             )
+                            .when(self.is_switch_target(id), |tile| {
+                                tile.child(switch_outline(theme))
+                            })
                     })
             }))
     }
@@ -732,6 +761,19 @@ impl BrowserApp {
         self.tab_drag.is_some_and(|drag| drag.tab == tab_id)
     }
 
+    /// The tab whose menu is open stays highlighted, as in Arc.
+    fn has_open_menu(&self, tab_id: TabId) -> bool {
+        self.menu
+            .as_ref()
+            .is_some_and(|menu| menu.kind == MenuKind::Tab(tab_id))
+    }
+
+    fn is_switch_target(&self, tab_id: TabId) -> bool {
+        self.tab_switch
+            .as_ref()
+            .is_some_and(|switch| switch.target() == tab_id)
+    }
+
     /// Lets `element`, a row or tile of `tab`, be dragged to another place
     /// in the sidebar. A copy of it follows the pointer.
     fn draggable(
@@ -792,6 +834,8 @@ impl BrowserApp {
                 if selected {
                     row.bg(theme.selected())
                         .when(!theme.dark, |row| row.shadow(selected_shadow()))
+                } else if self.has_open_menu(id) {
+                    row.bg(hover)
                 } else {
                     row.hover(move |style| style.bg(hover))
                 }
@@ -807,6 +851,9 @@ impl BrowserApp {
                     .text_size(px(14.))
                     .text_color(theme.title()),
             )
+            .when(interactive && self.is_switch_target(id), |row| {
+                row.child(switch_outline(theme))
+            })
             .when(interactive, |row| {
                 let row_size = size(px(width - 16.), px(ROW_HEIGHT));
                 self.draggable(press_only(row), tab, row_size, false, theme)
@@ -816,7 +863,7 @@ impl BrowserApp {
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            this.open_menu(MenuKind::Tab(id), event.position, window, cx)
+                            this.open_tab_menu(id, event.position, window, cx)
                         }),
                     )
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -974,7 +1021,7 @@ impl BrowserApp {
                                 }
                             }),
                     )
-                    .tooltip(Tooltip::build(space.name.clone(), "", theme, width))
+                    .maybe_tooltip(self.tooltip(space.name.clone(), "", theme, width))
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.switch_space(id, window, cx)),
                     )
@@ -997,7 +1044,7 @@ impl BrowserApp {
                     .absolute()
                     .left(px(9.5))
                     .top(px(10.))
-                    .tooltip(Tooltip::build("Recently Closed", "", theme, width))
+                    .maybe_tooltip(self.tooltip("Recently Closed", "", theme, width))
                     .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                         let anchor = event.position() - point(px(14.), px(18.));
                         this.open_menu(MenuKind::Library, anchor, window, cx)
@@ -1009,7 +1056,7 @@ impl BrowserApp {
                     .absolute()
                     .left(px(width - 24.5 - 14.))
                     .top(px(10.))
-                    .tooltip(Tooltip::build("New Tab or Space", "", theme, width))
+                    .maybe_tooltip(self.tooltip("New Tab or Space", "", theme, width))
                     .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                         let anchor = event.position() - point(px(14.), px(18.));
                         this.open_menu(MenuKind::Plus, anchor, window, cx)
