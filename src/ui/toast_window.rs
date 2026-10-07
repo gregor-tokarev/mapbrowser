@@ -207,7 +207,7 @@ impl BrowserApp {
             .flatten();
         #[cfg(target_os = "macos")]
         if let Some(view) = native_view {
-            self.engine.borrow().attach_child_window(view);
+            self.engine.borrow().attach_child_window(view, false);
             ignore_mouse(view);
         }
         self.toast_window = Some(ToastWindow {

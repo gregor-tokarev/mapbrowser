@@ -1158,7 +1158,7 @@ impl BrowserApp {
             .flatten();
         #[cfg(target_os = "macos")]
         if let Some(view) = native_view {
-            self.engine.borrow().attach_child_window(view);
+            self.engine.borrow().attach_child_window(view, true);
         }
         let subscription = cx.subscribe_in(&bar, window, |this, _, event, window, cx| {
             this.command_bar_event(event, window, cx)

@@ -21,7 +21,7 @@ make run
 | `make fmt` | Format the Rust sources |
 | `make test-server` | Serve the local test pages on `http://127.0.0.1:8765/` |
 
-Quit the running app before rebuilding its bundle. Run the `.app`, not `cargo run`: Chromium needs the bundle structure, its sandboxed helper processes, and the local ad hoc signature. The bundle also carries the filter lists from `resources/filters/` and the licences from `licenses/`.
+`make build`, `make run` and `make dev` first quit a running copy of the app, which would otherwise keep running the old build (`open` only brings it to the front). Run the `.app`, not `cargo run`: Chromium needs the bundle structure, its sandboxed helper processes, and the local ad hoc signature. The bundle also carries the filter lists from `resources/filters/` and the licences from `licenses/`.
 
 ## Environment variables
 

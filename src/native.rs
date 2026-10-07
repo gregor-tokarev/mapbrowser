@@ -426,14 +426,13 @@ pub fn set_traffic_lights_hidden(view: &NSView, hidden: bool) {
 /// of `parent`'s window. It then stays directly above the browser window at
 /// normal level, moves with it, and lives only on its Space, instead of
 /// floating above every application on every Space.
-pub fn attach_child_window(parent: &NSView, child_view: &NSView) {
+pub fn attach_child_window(parent: &NSView, child_view: &NSView, focus: bool) {
     let (Some(parent), Some(child)) = (parent.window(), child_view.window()) else {
         return;
     };
     if child.parentWindow().is_some() {
         return;
     }
-    let was_key = child.isKeyWindow();
     // GPUI's panel class can still become key, which the text field needs.
     child.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
     // Leaving the titled style swaps the window's frame view, and with it the
@@ -458,8 +457,9 @@ pub fn attach_child_window(parent: &NSView, child_view: &NSView) {
     // SAFETY: Both windows are alive (retained above) and distinct; AppKit
     // keeps its own reference to the child until it is removed.
     unsafe { parent.addChildWindow_ordered(&child, NSWindowOrderingMode::Above) };
-    if was_key {
-        child.makeKeyWindow();
+    // Key status, if it ever was, doesn't reliably survive the changes above.
+    if focus {
+        child.makeKeyAndOrderFront(None);
     }
 }
 
@@ -487,7 +487,7 @@ pub fn show_overlay_window(parent: &NSView, child: &NSView, shown: bool) {
     };
     if shown {
         window.setIgnoresMouseEvents(true);
-        attach_child_window(parent, child);
+        attach_child_window(parent, child, false);
         // Only above the browser window: windows in front of it (a sign-in
         // popup) stay in front.
         window.orderWindow_relativeTo(NSWindowOrderingMode::Above, parent_window.windowNumber());

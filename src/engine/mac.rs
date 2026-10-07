@@ -1373,10 +1373,11 @@ impl Engine {
 
     /// `child_view` is the NSView of a GPUI pop-up window (the command bar).
     /// It becomes a borderless child window directly above the browser
-    /// window. Detach it before closing it.
-    pub fn attach_child_window(&self, child_view: *mut c_void) {
+    /// window, made key when `focus` (it has a text field). Detach it before
+    /// closing it.
+    pub fn attach_child_window(&self, child_view: *mut c_void, focus: bool) {
         if let (Some(parent), Some(child)) = (self.parent_view(), child_view_ref(child_view)) {
-            crate::native::attach_child_window(parent, child);
+            crate::native::attach_child_window(parent, child, focus);
         }
     }
 

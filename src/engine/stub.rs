@@ -447,7 +447,7 @@ impl Engine {
     pub fn set_traffic_lights_hidden(&self, _hidden: bool) {}
     /// The command bar is a child window only on macOS.
     #[allow(dead_code)]
-    pub fn attach_child_window(&self, _child_view: *mut c_void) {}
+    pub fn attach_child_window(&self, _child_view: *mut c_void, _focus: bool) {}
     #[allow(dead_code)]
     pub fn detach_child_window(&self, _child_view: *mut c_void) {}
     #[allow(dead_code)]
