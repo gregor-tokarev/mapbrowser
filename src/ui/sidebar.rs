@@ -178,7 +178,7 @@ impl BrowserApp {
                     .children(indicator),
             )
             .child(self.render_top_row(width, theme, cx))
-            .children(self.render_notice(theme, cx))
+            .children(self.render_notice(width, theme, cx))
             .child(self.render_bottom_bar(width, theme, cx))
             .child(render_edge(width, cx))
     }
@@ -916,8 +916,9 @@ impl BrowserApp {
             })
     }
 
-    /// The toast and, while a page view covers the card, its load error.
-    fn render_notice(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<Div> {
+    /// A permission request, the toast and, while a page view covers the
+    /// card, its load error.
+    fn render_notice(&self, width: f32, theme: &Theme, cx: &mut Context<Self>) -> Option<Div> {
         let card = |div: Div| {
             div.mx(px(8.))
                 .px(px(12.))
@@ -930,7 +931,8 @@ impl BrowserApp {
                 .text_size(px(12.5))
         };
         let error = self.error_text().filter(|_| self.page_covers_card());
-        if self.toast.is_none() && error.is_none() {
+        let permission = self.render_permission_card(width, theme, cx);
+        if self.toast.is_none() && error.is_none() && permission.is_none() {
             return None;
         }
         Some(
@@ -942,6 +944,7 @@ impl BrowserApp {
                 .flex()
                 .flex_col()
                 .gap(px(6.))
+                .children(permission)
                 .when_some(self.toast.as_ref(), |notice, toast| {
                     notice.child(
                         card(div())
@@ -1051,12 +1054,13 @@ impl BrowserApp {
                     .absolute()
                     .left(px(9.5))
                     .top(px(10.))
-                    .maybe_tooltip(self.tooltip("Recently Closed", "", theme, width))
+                    .maybe_tooltip(self.tooltip("Library", "", theme, width))
                     .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                         let anchor = event.position() - point(px(14.), px(18.));
                         this.open_menu(MenuKind::Library, anchor, window, cx)
                     })),
             )
+            .children(self.render_download_badge(theme))
             .children(spaces)
             .child(
                 tool_button("plus", Icon::Plus, 23., true, theme)

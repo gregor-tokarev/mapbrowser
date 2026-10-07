@@ -3,10 +3,12 @@
 
 pub mod command_bar;
 mod content;
+pub mod downloads;
 pub mod drag;
 pub mod find_bar;
 pub mod icons;
 pub mod menu;
+pub mod permissions;
 pub mod redraw;
 mod sidebar;
 pub mod swipe;
@@ -43,9 +45,12 @@ pub struct SlideFrame {
 }
 
 impl BrowserApp {
-    /// The sidebar's width, unless it is hidden or a page is fullscreen.
+    /// The sidebar's width, unless it is hidden or a page is fullscreen. A
+    /// hidden sidebar shows while the page on screen asks for a permission:
+    /// the question is in it.
     pub fn sidebar_width(&self) -> Option<f32> {
-        (!self.state.sidebar_hidden && !self.fullscreen).then(|| self.state.sidebar_width())
+        let shown = !self.state.sidebar_hidden || self.permission_shown().is_some();
+        (shown && !self.fullscreen).then(|| self.state.sidebar_width())
     }
 
     /// The page card in window coordinates; native web views cover exactly it.
@@ -140,7 +145,7 @@ impl Render for BrowserApp {
             .font_family(UI_FONT)
             .key_context("Browser")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|this, _: &Dismiss, _, cx| this.close_menu(cx)))
+            .on_action(cx.listener(|this, _: &Dismiss, _, cx| this.dismiss(cx)))
             .on_modifiers_changed(
                 cx.listener(|this, event: &ModifiersChangedEvent, window, cx| {
                     if !event.modifiers.control {

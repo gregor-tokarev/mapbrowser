@@ -21,6 +21,9 @@ mod native {
 
     /// Only macOS has a Window menu.
     pub fn bring_all_to_front() {}
+
+    /// Previews have no Finder.
+    pub fn reveal_in_finder(_path: &std::path::Path) {}
 }
 
 use app::{BrowserApp, external_web_url, run_shortcut};

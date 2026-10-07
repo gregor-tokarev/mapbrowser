@@ -3,15 +3,17 @@
 
 mod blocking;
 mod commands;
+mod downloads;
 mod find;
 mod modifiers;
 mod page_keys;
+mod permissions;
 mod popups;
 mod protocols;
 
 use super::{
-    EditCommand, EngineEvent, Modifiers, edit_command, merge_features, opens_in_tab,
-    progress_worth_reporting,
+    EditCommand, EngineEvent, Modifiers, PermissionDecision, edit_command, merge_features,
+    opens_in_tab, progress_worth_reporting,
 };
 use crate::blocker::ContentBlocker;
 use crate::native::CornerCaps;
@@ -144,6 +146,8 @@ struct BrowserLink {
     pending: Arc<Mutex<PendingBrowsers>>,
     keys: Arc<Mutex<KeyRouting>>,
     live_browsers: Arc<AtomicUsize>,
+    downloads: downloads::Downloads,
+    permissions: permissions::PermissionRequests,
 }
 
 impl BrowserLink {
@@ -219,37 +223,52 @@ wrap_browser_process_handler! {
     }
 }
 
-wrap_client! {
-    struct TabClient {
-        display: DisplayHandler,
-        load: LoadHandler,
-        life: LifeSpanHandler,
-        menu: ContextMenuHandler,
-        requests: RequestHandler,
-        keys: KeyboardHandler,
-        find: FindHandler,
-    }
-    impl Client {
-        fn display_handler(&self) -> Option<DisplayHandler> {
-            Some(self.display.clone())
+/// A tab browser's handlers. The generated constructor takes one argument
+/// per handler.
+#[allow(clippy::too_many_arguments)]
+mod client {
+    use cef::*;
+
+    wrap_client! {
+        pub(super) struct TabClient {
+            display: DisplayHandler,
+            load: LoadHandler,
+            life: LifeSpanHandler,
+            menu: ContextMenuHandler,
+            requests: RequestHandler,
+            keys: KeyboardHandler,
+            find: FindHandler,
+            downloads: DownloadHandler,
+            permissions: PermissionHandler,
         }
-        fn load_handler(&self) -> Option<LoadHandler> {
-            Some(self.load.clone())
-        }
-        fn life_span_handler(&self) -> Option<LifeSpanHandler> {
-            Some(self.life.clone())
-        }
-        fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
-            Some(self.menu.clone())
-        }
-        fn request_handler(&self) -> Option<RequestHandler> {
-            Some(self.requests.clone())
-        }
-        fn keyboard_handler(&self) -> Option<KeyboardHandler> {
-            Some(self.keys.clone())
-        }
-        fn find_handler(&self) -> Option<FindHandler> {
-            Some(self.find.clone())
+        impl Client {
+            fn display_handler(&self) -> Option<DisplayHandler> {
+                Some(self.display.clone())
+            }
+            fn load_handler(&self) -> Option<LoadHandler> {
+                Some(self.load.clone())
+            }
+            fn life_span_handler(&self) -> Option<LifeSpanHandler> {
+                Some(self.life.clone())
+            }
+            fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
+                Some(self.menu.clone())
+            }
+            fn request_handler(&self) -> Option<RequestHandler> {
+                Some(self.requests.clone())
+            }
+            fn keyboard_handler(&self) -> Option<KeyboardHandler> {
+                Some(self.keys.clone())
+            }
+            fn find_handler(&self) -> Option<FindHandler> {
+                Some(self.find.clone())
+            }
+            fn download_handler(&self) -> Option<DownloadHandler> {
+                Some(self.downloads.clone())
+            }
+            fn permission_handler(&self) -> Option<PermissionHandler> {
+                Some(self.permissions.clone())
+            }
         }
     }
 }
@@ -257,14 +276,16 @@ wrap_client! {
 /// CEF asks for a handler on every callback, so each browser builds its
 /// handlers once and hands out references.
 fn tab_client(link: BrowserLink) -> Client {
-    TabClient::new(
+    client::TabClient::new(
         TabDisplay::new(link.clone(), Arc::default()),
         TabLoad::new(link.clone()),
         TabLife::new(link.clone()),
         TabMenu::new(link.clone()),
         TabRequests::new(link.clone()),
         page_keys::PageKeys::new(link.clone(), false),
-        find::TabFind::new(link),
+        find::TabFind::new(link.clone()),
+        downloads::TabDownloads::new(link.clone()),
+        permissions::TabPermissions::new(link),
     )
 }
 
@@ -371,6 +392,11 @@ wrap_load_handler! {
                 self.link.send(EngineEvent::LoadError { tab_id: self.link.tab_id, url: failed_url.map(ToString::to_string).unwrap_or_default(), message: error_text.map(ToString::to_string).unwrap_or_else(|| "Page could not be loaded".into()) });
             }
         }
+        fn on_load_start(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, _transition_type: TransitionType) {
+            if frame.is_some_and(|frame| frame.is_main() != 0) {
+                self.link.permissions.drop_page(&self.link);
+            }
+        }
         fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _http_status_code: i32) {
             if !frame.is_some_and(|frame| frame.is_main() != 0 && CefString::from(&frame.url()).to_string() != "about:blank") { return; }
             if !self.link.pending().initialized_surface.insert(self.link.instance) { return; }
@@ -447,6 +473,7 @@ wrap_life_span_handler! {
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
             let link = &self.link;
             link.live_browsers.fetch_sub(1, Ordering::SeqCst);
+            link.permissions.drop_page(link);
             let (ready_to_quit, report) = {
                 let mut pending = link.pending();
                 pending.live.remove(&link.instance);
@@ -611,6 +638,8 @@ pub struct Engine {
     width: f64,
     height: f64,
     blocker: ContentBlocker,
+    downloads: downloads::Downloads,
+    permissions: permissions::PermissionRequests,
 }
 
 impl Engine {
@@ -687,7 +716,10 @@ impl Engine {
         .collect();
         let pending = Arc::new(Mutex::new(PendingBrowsers::default()));
         let quit_pending = pending.clone();
+        let downloads = downloads::Downloads::default();
+        let quit_downloads = downloads.clone();
         crate::native::set_quit_handler(move || {
+            quit_downloads.cancel_all();
             let (browsers, can_quit) = {
                 let mut pending = quit_pending.lock().expect("pending browser state");
                 pending.shutting_down = true;
@@ -729,6 +761,8 @@ impl Engine {
                 width: 800.,
                 height: 600.,
                 blocker: ContentBlocker::default(),
+                downloads,
+                permissions: permissions::PermissionRequests::default(),
             },
             receiver,
         ))
@@ -805,6 +839,8 @@ impl Engine {
             pending: self.pending.clone(),
             keys: self.keys.clone(),
             live_browsers: self.live_browsers.clone(),
+            downloads: self.downloads.clone(),
+            permissions: self.permissions.clone(),
         });
         {
             let mut pending = self.pending.lock().expect("pending browser state");
@@ -1142,6 +1178,11 @@ impl Engine {
         self.update_key_routing();
     }
 
+    /// Answers a `PermissionRequest`.
+    pub fn respond_permission(&self, id: u64, decision: PermissionDecision) {
+        self.permissions.respond(id, decision);
+    }
+
     /// Run before leaving the application's main thread. No CEF work is allowed
     /// after this returns. Waiting is bounded and only occurs while quitting.
     pub fn shutdown(&mut self) -> Result<()> {
@@ -1153,6 +1194,7 @@ impl Engine {
             keys.browser = None;
             keys.fullscreen = None;
         }
+        self.permissions.clear();
         let popups: Vec<Browser> = {
             let mut pending = self.pending.lock().expect("pending browser state");
             pending.shutting_down = true;

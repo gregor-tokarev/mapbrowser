@@ -1,15 +1,22 @@
 //! Popover menus for tabs, spaces, the library and "+". They are drawn in
 //! GPUI and kept inside the sidebar, where no native web view covers them.
 
-use super::{press_only, shadow, sidebar::space_icons, theme::Theme, truncated};
+use super::{
+    downloads::DownloadState,
+    icons::{Icon, icon},
+    press_only, shadow,
+    sidebar::space_icons,
+    theme::Theme,
+    truncated,
+};
 use crate::{
     app::BrowserApp,
     model::{Pin, SpaceId, THEME_COUNT, TabId},
 };
 use gpui::{
     AnyElement, Bounds, Context, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, Point, SharedString, Size, StatefulInteractiveElement, Styled, Window,
-    deferred, div, point, prelude::FluentBuilder, px,
+    ParentElement, Pixels, Point, SharedString, Size, StatefulInteractiveElement, StyleRefinement,
+    Styled, Window, deferred, div, point, prelude::FluentBuilder, px,
 };
 
 const PADDING: f32 = 5.;
@@ -34,7 +41,8 @@ pub enum MenuKind {
     Space(SpaceId),
     /// The bottom bar's "+".
     Plus,
-    /// Recently closed tabs, from the library button.
+    /// This session's downloads and recently closed tabs, from the library
+    /// button.
     Library,
     /// Asks before deleting a space, in place of the space menu.
     DeleteSpace(SpaceId),
@@ -67,6 +75,7 @@ enum Action {
     /// "Delete Space…": the menu asks first.
     AskDeleteSpace(SpaceId),
     DeleteSpace(SpaceId),
+    RevealDownload(u64),
 }
 
 enum Entry {
@@ -94,6 +103,13 @@ enum Entry {
         label: &'static str,
         action: Action,
     },
+    /// A download; finished and running ones show in Finder when clicked.
+    Download {
+        id: u64,
+        name: SharedString,
+        status: Option<String>,
+        failed: bool,
+    },
 }
 
 impl Entry {
@@ -116,7 +132,10 @@ impl Entry {
 
     fn height(&self) -> f32 {
         match self {
-            Entry::Item { .. } | Entry::Closed { .. } | Entry::Empty(_) => ITEM_HEIGHT,
+            Entry::Item { .. }
+            | Entry::Closed { .. }
+            | Entry::Empty(_)
+            | Entry::Download { .. } => ITEM_HEIGHT,
             Entry::Separator => SEPARATOR_HEIGHT,
             Entry::Header(_) => HEADER_HEIGHT,
             Entry::Swatches(..) => SWATCH_ROW_HEIGHT,
@@ -246,7 +265,19 @@ impl BrowserApp {
                 Entry::item("New Space", "", Action::NewSpace),
             ],
             MenuKind::Library => {
-                let mut entries = vec![Entry::Header("Recently Closed")];
+                let mut entries = Vec::new();
+                let downloads = self.downloads.recent().map(|download| Entry::Download {
+                    id: download.id,
+                    name: download.name.clone(),
+                    status: download.status(),
+                    failed: download.state == DownloadState::Failed,
+                });
+                entries.extend(downloads);
+                if !entries.is_empty() {
+                    entries.insert(0, Entry::Header("Downloads"));
+                    entries.push(Entry::Separator);
+                }
+                entries.push(Entry::Header("Recently Closed"));
                 entries.extend(self.closed.iter().enumerate().rev().take(CLOSED_LIMIT).map(
                     |(index, closed)| Entry::Closed {
                         index,
@@ -400,6 +431,40 @@ impl BrowserApp {
                     .child(truncated(title).flex_1().min_w_0())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.run_menu_action(Action::Reopen(index), window, cx)
+                    }))
+                    .into_any_element()
+            }
+            Entry::Download {
+                id,
+                name,
+                status,
+                failed,
+            } => {
+                let muted = theme.tertiary();
+                let highlighted =
+                    |style: StyleRefinement| style.text_color(gpui::white().opacity(0.8));
+                // A failed download has nothing to show in Finder.
+                item(2000 + index, !failed)
+                    .gap(px(8.))
+                    .when(!failed, |row| {
+                        row.on_click(cx.listener(move |this, _, window, cx| {
+                            this.run_menu_action(Action::RevealDownload(id), window, cx)
+                        }))
+                    })
+                    .child(
+                        icon(Icon::File, 14., muted)
+                            .when(!failed, |icon| icon.group_hover("menu-item", highlighted)),
+                    )
+                    .child(truncated(name).flex_1().min_w_0())
+                    .children(status.map(|status| {
+                        div()
+                            .flex_none()
+                            .text_size(px(11.5))
+                            .text_color(muted)
+                            .when(!failed, |status| {
+                                status.group_hover("menu-item", highlighted)
+                            })
+                            .child(status)
                     }))
                     .into_any_element()
             }
@@ -581,6 +646,7 @@ impl BrowserApp {
             Action::Reopen(index) => self.reopen_closed(Some(index), window, cx),
             Action::AskDeleteSpace(_) => {}
             Action::DeleteSpace(id) => self.delete_space(id, window, cx),
+            Action::RevealDownload(id) => self.reveal_download(id),
         }
     }
 }

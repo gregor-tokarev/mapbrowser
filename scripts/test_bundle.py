@@ -188,8 +188,18 @@ class BundleArtifactTests(unittest.TestCase):
             self.assertEqual(helper_entitlements, bundle.JIT_ENTITLEMENTS)
             self.assertFalse(stale_helper.exists())
             main_path, _ = bundle.prepare_signing_artifacts(app, [helper], bundle.SigningPlan())
-            self.assertEqual(plistlib.loads(main_path.read_bytes()), bundle.JIT_ENTITLEMENTS)
+            self.assertEqual(plistlib.loads(main_path.read_bytes()), {**bundle.JIT_ENTITLEMENTS, **bundle.DEVICE_ENTITLEMENTS})
             self.assertFalse((app / "Contents" / "embedded.provisionprofile").exists())
+
+    def test_app_may_use_the_devices_sites_ask_for(self):
+        # Under the hardened runtime macOS refuses camera, microphone and
+        # location to an app without these, whatever the user allows.
+        for plan in [bundle.SigningPlan(), bundle.SigningPlan(FINGERPRINT, b"CMS", f"{TEAM}.{IDENTIFIER}", TEAM)]:
+            with self.subTest(identity=plan.identity):
+                entitlements = plan.main_entitlements()
+                for key in ["com.apple.security.device.camera", "com.apple.security.device.audio-input", "com.apple.security.personal-information.location"]:
+                    self.assertIs(entitlements[key], True)
+        self.assertFalse(set(bundle.DEVICE_ENTITLEMENTS) & set(bundle.JIT_ENTITLEMENTS))
 
     def test_every_signed_component_uses_validated_certificate(self):
         app = Path("/bundle/Mapbrowser.app")
@@ -229,6 +239,9 @@ class BundleArtifactTests(unittest.TestCase):
             self.assertEqual(registration["CFBundleTypeRole"], "Viewer")
             self.assertEqual(registration["LSHandlerRank"], "Alternate")
             self.assertEqual(main_info["CFBundleIdentifier"], "dev.test.browser")
+            # macOS ends an app that asks for these without saying why.
+            for key in ["NSCameraUsageDescription", "NSMicrophoneUsageDescription", "NSLocationUsageDescription", "NSLocationWhenInUseUsageDescription", "NSAudioCaptureUsageDescription", "NSBluetoothAlwaysUsageDescription"]:
+                self.assertTrue(main_info[key].strip(), key)
             helpers = list((app / "Contents" / "Frameworks").glob("*.app"))
             self.assertEqual(len(helpers), 5)
             for helper in helpers:

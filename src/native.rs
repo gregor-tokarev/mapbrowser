@@ -21,10 +21,12 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSColor, NSEventType, NSNormalWindowLevel, NSResponder, NSView, NSWindowButton,
-    NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask,
+    NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_core_graphics::CGMutablePath;
-use objc2_foundation::{NSNotification, NSObject, NSPoint, NSRect, NSSize};
+use objc2_foundation::{
+    NSArray, NSNotification, NSObject, NSPoint, NSRect, NSSize, NSString, NSURL,
+};
 use objc2_quartz_core::{CAShapeLayer, CATransaction};
 
 type SendEvent = unsafe extern "C-unwind" fn(&AnyObject, Sel, &AnyObject);
@@ -388,6 +390,13 @@ pub fn show_about_panel() {
     if let Some(mtm) = MainThreadMarker::new() {
         NSApplication::sharedApplication(mtm).orderFrontStandardAboutPanel(None);
     }
+}
+
+/// Shows `path` selected in a Finder window.
+pub fn reveal_in_finder(path: &std::path::Path) {
+    let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+    NSWorkspace::sharedWorkspace()
+        .activateFileViewerSelectingURLs(&NSArray::from_retained_slice(&[url]));
 }
 
 /// Window > Bring All to Front.

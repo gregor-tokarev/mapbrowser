@@ -35,6 +35,8 @@ impl Engine {
             pending: self.pending.clone(),
             keys: self.keys.clone(),
             live_browsers: self.live_browsers.clone(),
+            downloads: self.downloads.clone(),
+            permissions: self.permissions.clone(),
         });
         host.show_dev_tools(
             Some(&WindowInfo::default()),

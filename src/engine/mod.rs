@@ -12,6 +12,8 @@ mod stub;
 #[cfg(not(target_os = "macos"))]
 pub use stub::Engine;
 
+use std::path::PathBuf;
+
 /// Browser shortcuts. On macOS the engine reports those pressed in the
 /// browser window. A focused web page gets all but the reserved ones
 /// (`Shortcut::reserved`) first, as in Chrome; they run only if the page
@@ -194,6 +196,190 @@ pub enum EngineEvent {
         active: u32,
         final_update: bool,
     },
+    /// A download started, saved straight to `path` in the Downloads
+    /// folder. `blank_tab`: the tab never showed a page (a link that opened
+    /// a new tab for the file), so it has nothing to keep it open for.
+    /// Events stop once the tab's browser closes: keep it until the
+    /// download finishes.
+    DownloadStarted {
+        id: u64,
+        tab_id: u64,
+        name: String,
+        path: PathBuf,
+        blank_tab: bool,
+    },
+    /// Bytes received so far, coalesced to steps of 5 % or one second.
+    DownloadProgress {
+        id: u64,
+        received: u64,
+        total: Option<u64>,
+    },
+    /// The download completed (`ok`), was cancelled or failed.
+    DownloadFinished {
+        id: u64,
+        ok: bool,
+    },
+    /// A page asks to use `permissions` (sorted, without repeats). Answer
+    /// once with `Engine::respond_permission`.
+    PermissionRequest {
+        id: u64,
+        tab_id: u64,
+        origin: String,
+        permissions: Vec<Permission>,
+    },
+    /// The request ended unanswered (the page navigated or closed).
+    PermissionDismissed {
+        id: u64,
+    },
+}
+
+/// Something a page asks permission to use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+// Previews ask for a few kinds only.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub enum Permission {
+    Camera,
+    Microphone,
+    /// The screen (getDisplayMedia), with or without its sound.
+    Screen,
+    Location,
+    Notifications,
+    Clipboard,
+    Midi,
+    /// Several downloads from one page.
+    Downloads,
+    /// Embedded content's own cookies and site data.
+    StorageAccess,
+    /// Anything else Chromium asks about.
+    Other,
+}
+
+/// The answer to a permission request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionDecision {
+    Allow,
+    Block,
+    /// Neither: the card was closed. Chromium remembers nothing.
+    Dismiss,
+}
+
+/// cef_media_access_permission_types_t, for OnRequestMediaAccessPermission.
+#[cfg(any(target_os = "macos", test))]
+const MEDIA_PERMISSIONS: [(u32, Permission); 4] = [
+    (1, Permission::Microphone),
+    (2, Permission::Camera),
+    (4, Permission::Screen),
+    (8, Permission::Screen),
+];
+
+/// cef_permission_request_types_t, for OnShowPermissionPrompt. Other bits
+/// are `Permission::Other`.
+#[cfg(any(target_os = "macos", test))]
+const PROMPT_PERMISSIONS: [(u32, Permission); 10] = [
+    (2, Permission::Camera),
+    (4, Permission::Camera),
+    (16, Permission::Clipboard),
+    (32, Permission::StorageAccess),
+    (256, Permission::Location),
+    (4096, Permission::Microphone),
+    (8192, Permission::Midi),
+    (16384, Permission::Downloads),
+    (32768, Permission::Notifications),
+    (1 << 20, Permission::StorageAccess),
+];
+
+/// The permissions in a CEF media access bit set.
+#[cfg(any(target_os = "macos", test))]
+pub fn media_permissions(bits: u32) -> Vec<Permission> {
+    permissions(bits, &MEDIA_PERMISSIONS)
+}
+
+/// The permissions in a CEF permission prompt bit set.
+#[cfg(any(target_os = "macos", test))]
+pub fn prompt_permissions(bits: u32) -> Vec<Permission> {
+    permissions(bits, &PROMPT_PERMISSIONS)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn permissions(bits: u32, table: &[(u32, Permission)]) -> Vec<Permission> {
+    let mut permissions: Vec<Permission> = (0..u32::BITS)
+        .map(|bit| 1 << bit)
+        .filter(|flag| bits & flag != 0)
+        .map(|flag| {
+            table
+                .iter()
+                .find(|(known, _)| *known == flag)
+                .map_or(Permission::Other, |(_, permission)| *permission)
+        })
+        .collect();
+    permissions.sort();
+    permissions.dedup();
+    permissions
+}
+
+/// The name a download is saved under: the last part of Chromium's
+/// suggestion, without characters Finder or the path would trip over.
+#[cfg(any(target_os = "macos", test))]
+pub fn download_file_name(suggested: &str) -> String {
+    let name: String = suggested
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .map(|ch| {
+            if ch == ':' || ch.is_control() {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let name = name.trim().trim_start_matches('.');
+    if name.is_empty() {
+        "download".to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
+/// `name` if it isn't `taken`, else the first free "name (1).ext",
+/// "name (2).ext"…, as Chrome numbers them. ".tar.gz" and the like stay
+/// whole.
+#[cfg(any(target_os = "macos", test))]
+pub fn unique_file_name(name: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(name) {
+        return name.to_owned();
+    }
+    let lower = name.to_ascii_lowercase();
+    let split = [".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst"]
+        .iter()
+        .find(|double| lower.ends_with(*double) && lower.len() > double.len())
+        .map(|double| name.len() - double.len())
+        .or_else(|| name.rfind('.').filter(|&dot| dot > 0))
+        .unwrap_or(name.len());
+    let (stem, extension) = name.split_at(split);
+    (1..)
+        .map(|count| format!("{stem} ({count}){extension}"))
+        .find(|candidate| !taken(candidate))
+        .expect("an unused name")
+}
+
+/// Download updates arrive about twice a second. Report steps of at least
+/// 5 %, or a second's worth of progress; downloads of unknown size only
+/// the latter.
+#[cfg(any(target_os = "macos", test))]
+pub fn download_progress_worth_reporting(
+    last: Option<(std::time::Instant, u64)>,
+    now: std::time::Instant,
+    received: u64,
+    total: Option<u64>,
+) -> bool {
+    let Some((at, reported)) = last else {
+        return true;
+    };
+    received != reported
+        && (now.duration_since(at) >= std::time::Duration::from_secs(1)
+            || total.is_some_and(|total| received.abs_diff(reported) * 20 >= total))
 }
 
 /// Modifier keys held with a key press.
@@ -1001,5 +1187,107 @@ mod tests {
         assert_eq!(merge_features("", &["A", "B", "A"]), "A,B");
         assert_eq!(merge_features(" A , ,B<Trial", &["B", "C"]), "A,B<Trial,C");
         assert_eq!(merge_features("A:x/1", &["A"]), "A:x/1");
+    }
+
+    #[test]
+    fn reads_permission_bits() {
+        use Permission::*;
+        // getUserMedia({audio, video}), and getDisplayMedia with its sound.
+        assert_eq!(media_permissions(1 | 2), [Camera, Microphone]);
+        assert_eq!(media_permissions(4 | 8), [Screen]);
+        assert_eq!(media_permissions(0), []);
+        assert_eq!(prompt_permissions(256), [Location]);
+        assert_eq!(
+            prompt_permissions(4 | 4096 | 32768),
+            [Camera, Microphone, Notifications]
+        );
+        // Unknown and unnamed bits (window management, idle detection).
+        assert_eq!(prompt_permissions(1 << 23 | 2048 | 16), [Clipboard, Other]);
+    }
+
+    #[test]
+    fn download_names_are_single_safe_file_names() {
+        assert_eq!(download_file_name("report.pdf"), "report.pdf");
+        assert_eq!(download_file_name("../../etc/passwd"), "passwd");
+        assert_eq!(download_file_name("a\\b:c.txt"), "b_c.txt");
+        assert_eq!(download_file_name(".profile"), "profile");
+        assert_eq!(download_file_name("  "), "download");
+        assert_eq!(download_file_name("dir/"), "download");
+    }
+
+    #[test]
+    fn numbers_names_that_are_taken() {
+        let taken = |names: &'static [&'static str]| move |name: &str| names.contains(&name);
+        assert_eq!(unique_file_name("a.pdf", taken(&[])), "a.pdf");
+        assert_eq!(unique_file_name("a.pdf", taken(&["a.pdf"])), "a (1).pdf");
+        assert_eq!(
+            unique_file_name("a.pdf", taken(&["a.pdf", "a (1).pdf"])),
+            "a (2).pdf"
+        );
+        assert_eq!(unique_file_name("README", taken(&["README"])), "README (1)");
+        assert_eq!(
+            unique_file_name("src.tar.gz", taken(&["src.tar.gz"])),
+            "src (1).tar.gz"
+        );
+        assert_eq!(
+            unique_file_name("my.app.zip", taken(&["my.app.zip"])),
+            "my.app (1).zip"
+        );
+        assert_eq!(
+            unique_file_name(".tar.gz", taken(&[".tar.gz"])),
+            ".tar (1).gz"
+        );
+    }
+
+    #[test]
+    fn coalesces_download_progress() {
+        let start = std::time::Instant::now();
+        let later = |ms| start + std::time::Duration::from_millis(ms);
+        let mb = 1_000_000;
+        assert!(download_progress_worth_reporting(
+            None,
+            start,
+            0,
+            Some(100 * mb)
+        ));
+        let last = Some((start, mb));
+        // Under 5 % and under a second: skipped.
+        assert!(!download_progress_worth_reporting(
+            last,
+            later(500),
+            4 * mb,
+            Some(100 * mb)
+        ));
+        assert!(download_progress_worth_reporting(
+            last,
+            later(500),
+            6 * mb,
+            Some(100 * mb)
+        ));
+        assert!(download_progress_worth_reporting(
+            last,
+            later(1000),
+            2 * mb,
+            Some(100 * mb)
+        ));
+        // Unknown sizes report once a second; nothing new, nothing to say.
+        assert!(!download_progress_worth_reporting(
+            last,
+            later(900),
+            90 * mb,
+            None
+        ));
+        assert!(download_progress_worth_reporting(
+            last,
+            later(1000),
+            2 * mb,
+            None
+        ));
+        assert!(!download_progress_worth_reporting(
+            last,
+            later(5000),
+            mb,
+            None
+        ));
     }
 }

@@ -106,6 +106,28 @@ The redesign was built on a machine without macOS: it type-checks for macOS and 
 15. ⌘+ (also ⌘=), ⌘− and ⌘0 zoom the page in Chrome's steps with a "Zoom 110%" toast, also on German (⌘+ on its own key) and AZERTY layouts. Another tab of the same site in the same space follows; another space doesn't. While a page loads the reload button is a × (Stop); it, ⌘. and Esc (when the page has no use for it) stop the load. ⌥⌘I opens DevTools in a window of its own and closes it again. The View menu lists Stop, Actual Size, Zoom In, Zoom Out and Developer Tools.
 16. ⌘F opens the find bar at the card's top right, ready for typing; matches highlight as you type with "n of m". Return, ⇧Return, the chevrons, and ⌘G or ⇧⌘G (also with the page focused) move between matches. ⌘F again selects the text. The bar stays while the page is clicked and scrolled, follows the card when the window resizes or the sidebar toggles, and closes on a tab or space switch or when the page goes to another address. Esc or × closes it, clears the highlights and returns focus to the page. Edit > Find lists Find…, Find Next and Find Previous.
 
+### Downloads and site permissions
+
+Downloads (CEF 152 without a handler saved files to ~/Downloads silently through Chrome's code, and could hold "dangerous" ones forever with no bubble to approve them):
+
+1. A download link (a PDF served as an attachment, a .zip, a .dmg) saves to ~/Downloads without a dialog. Downloading the same file again saves `name (1).ext`. The .dmg finishes too (no stall) and macOS asks before opening it the first time (`xattr -l` shows `com.apple.quarantine`).
+2. While files download, the library button shows a ring badge that fills as they progress and disappears when the last one ends; "Downloaded name" appears above the bottom bar.
+3. The library lists this session's downloads above Recently Closed, with a percentage (or size) while running and "Failed" for one interrupted by turning Wi-Fi off. Clicking a finished one opens Finder with the file selected.
+4. A `target=_blank` download link: the empty tab it opens closes again, the page with the link is selected, and Recently Closed stays empty.
+5. ⌘W, or unloading a pinned tab, during a large download: the ring keeps moving and the toast still appears.
+6. ⌘Q during a download quits without asking; Downloads then holds no partial file under the final name (unfinished downloads are cancelled). Restarting lists no downloads.
+7. Idle with no download: no redraws (energy check above); during a download the window redraws about once a second at most.
+
+Permissions (with Alloy style and no handler, Chromium denied camera and microphone and ignored every other prompt):
+
+1. https://webrtc.github.io/samples/src/content/getusermedia/gum/: a card in the sidebar says "webrtc.github.io wants to use your camera". Allow: macOS asks once for Map Browser's camera access, then the video shows. Reload: no card (the answer holds for the session). After a restart it asks again.
+2. Google Meet: joining a call asks once for camera and microphone together, and both work. Block on another site: the page reports the device blocked, and reloading doesn't ask again until a restart.
+3. × on the card, or Esc while the sidebar has keyboard focus: the page is refused this time only; reloading asks again.
+4. Location (Google Maps "Your location", or https://browserleaks.com/geo): "wants to know your location"; Allow, then macOS asks for Map Browser's location access, then the position appears. Chromium keeps location, notification and other prompt answers in the space's profile across restarts; there is no way to reset them in the app yet.
+5. Screen sharing in Meet asks every time ("wants to share your screen"). Allow shares the whole screen after macOS's Screen Recording permission (no window picker yet).
+6. A request from a tab in another space, or a background tab, waits: the card appears when that tab is selected, and goes away if the tab closes or navigates. With the sidebar hidden (⌘S) the sidebar appears with the card and hides again once answered. Typing in the page continues while a card shows.
+7. Notifications and clipboard reading (a page calling `navigator.clipboard.readText()`) ask with their own wording.
+
 ### Blocking and Chromium switches
 
 1. With `MAPBROWSER_TRACE_CEF=1 make dev`, the log reports the content blocker as ready.

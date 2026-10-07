@@ -13,9 +13,11 @@ use crate::{
             self, ActiveTab, Command, CommandBar, CommandBarEvent, CommandContext, CommandMode,
             TabEntry,
         },
+        downloads::Downloads,
         drag::{self, DropZones, TabDrag},
         find_bar::Find,
         menu::{MenuKind, OpenMenu},
+        permissions::PermissionPrompts,
         redraw::{self, Drawn},
         swipe::SwipeTracker,
         theme::Theme,
@@ -120,6 +122,10 @@ pub struct BrowserApp {
     save_task: Option<Task<()>>,
     /// When `save_task` writes.
     save_due: Option<Instant>,
+    pub downloads: Downloads,
+    pub permissions: PermissionPrompts,
+    /// Tabs pages opened this session, and the tab that opened each.
+    pub openers: HashMap<TabId, TabId>,
     _subscriptions: Vec<Subscription>,
     recent: RecentTabs,
     /// A ⌃Tab walk, while ⌃ is held; the sidebar marks its target.
@@ -222,6 +228,9 @@ impl BrowserApp {
             focus_handle: cx.focus_handle(),
             save_task: None,
             save_due: None,
+            downloads: Downloads::default(),
+            permissions: PermissionPrompts::default(),
+            openers: HashMap::new(),
             _subscriptions: Vec::new(),
             recent: RecentTabs::default(),
             tab_switch: None,
@@ -398,8 +407,10 @@ impl BrowserApp {
         }
     }
 
+    /// A tab still downloading keeps its browser until the download ends:
+    /// Chromium reports nothing more once it closes.
     fn drop_browser(&mut self, tab_id: TabId) {
-        if self.loaded.remove(&tab_id) {
+        if self.loaded.remove(&tab_id) && !self.downloads.running_in(tab_id) {
             self.engine.borrow_mut().close_tab(tab_id);
         }
         self.pages.remove(&tab_id);
@@ -1555,6 +1566,26 @@ impl BrowserApp {
                 active,
                 ..
             } => self.find_result(tab_id, count, active, cx),
+            EngineEvent::DownloadStarted {
+                id,
+                tab_id,
+                name,
+                path,
+                blank_tab,
+            } => self.download_started(id, tab_id, name, path, blank_tab, cx),
+            EngineEvent::DownloadProgress {
+                id,
+                received,
+                total,
+            } => self.download_progress(id, received, total, cx),
+            EngineEvent::DownloadFinished { id, ok } => self.download_finished(id, ok, cx),
+            EngineEvent::PermissionRequest {
+                id,
+                tab_id,
+                origin,
+                permissions,
+            } => self.permission_requested(id, tab_id, origin, permissions, window, cx),
+            EngineEvent::PermissionDismissed { id } => self.permission_dismissed(id, cx),
         }
     }
 
@@ -1582,6 +1613,9 @@ impl BrowserApp {
         let Some(id) = id else {
             return;
         };
+        let state = &self.state;
+        self.openers.retain(|tab, _| state.tab(*tab).is_some());
+        self.openers.insert(id, opener);
         self.ensure_loaded(id);
         if shown {
             if !background {

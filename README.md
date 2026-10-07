@@ -48,13 +48,17 @@ Web apps keep their own shortcuts: in an editor such as VS Code for the web or G
 
 Drag the sidebar's edge to resize it; double-click the edge to reset it. The shield beside the address turns ad and tracker blocking off for that site.
 
+**Downloads.** Files go straight to your Downloads folder, numbered if a file with that name is already there. While they download, the library button at the bottom left shows their progress; the library lists them, and a click shows one in Finder. Quitting stops downloads that haven't finished.
+
+**Camera, microphone and location.** Sites ask before using your camera, microphone, screen, location or notifications. The question appears in the sidebar. Your answer holds for that site in that space, for camera and microphone until you quit; screen sharing asks every time.
+
 Sign-in and payment windows, such as "Continue with Google" or PayPal, open as small windows and finish signing you in on the page that asked. Email and phone links open Mail and FaceTime.
 
 Spaces, tabs and selections come back when you reopen Map Browser, and the window opens where you left it, at the same size. Your browsing data stays on your Mac.
 
 ## Status
 
-Map Browser is an early prototype for macOS. It has no extensions, split view, sync, bookmarks, history, download manager or password manager yet, and it doesn't update itself. Battery life on par with Helium is the goal, but it hasn't been measured on a Mac yet.
+Map Browser is an early prototype for macOS. It has no extensions, split view, sync, bookmarks, history or password manager yet, downloads are listed only until you quit, and it doesn't update itself. Battery life on par with Helium is the goal, but it hasn't been measured on a Mac yet.
 
 ## Credits
 

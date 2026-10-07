@@ -28,6 +28,14 @@ JIT_ENTITLEMENTS = {
     "com.apple.security.cs.allow-unsigned-executable-memory": True,
     "com.apple.security.cs.disable-library-validation": True,
 }
+# The hardened runtime refuses these devices to apps without them, even
+# after the user allows a site. macOS asks the app (Chromium's capture
+# helpers act for it), so only the app carries them, as in Chrome.
+DEVICE_ENTITLEMENTS = {
+    "com.apple.security.device.camera": True,
+    "com.apple.security.device.audio-input": True,
+    "com.apple.security.personal-information.location": True,
+}
 
 
 class SigningError(ValueError):
@@ -42,7 +50,7 @@ class SigningPlan:
     team_identifier: str | None = None
 
     def main_entitlements(self):
-        result = dict(JIT_ENTITLEMENTS)
+        result = {**JIT_ENTITLEMENTS, **DEVICE_ENTITLEMENTS}
         if self.profile_bytes is not None:
             result.update({
                 APP_IDENTIFIER_ENTITLEMENT: self.app_identifier,
@@ -271,6 +279,11 @@ def main():
         "LSEnvironment": {"MallocNanoZone": "0"},
         "NSCameraUsageDescription": "Allow websites you choose to use the camera.",
         "NSMicrophoneUsageDescription": "Allow websites you choose to use the microphone.",
+        # Chromium locates through Core Location, which needs these to ask.
+        "NSLocationUsageDescription": "Allow websites you choose to know your location.",
+        "NSLocationWhenInUseUsageDescription": "Allow websites you choose to know your location.",
+        # Sharing a screen with its sound may tap system audio (macOS 14.2+).
+        "NSAudioCaptureUsageDescription": "Allow websites you choose to hear your Mac's sound when you share your screen.",
         # Chromium checks Bluetooth during cross-device passkey authentication.
         # macOS terminates the process if this purpose string is missing.
         "NSBluetoothAlwaysUsageDescription": "Use Bluetooth for passkeys on nearby devices and to connect to Bluetooth devices you choose on websites.",

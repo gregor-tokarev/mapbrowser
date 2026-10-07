@@ -2,24 +2,38 @@
 //! tests). It shows no web pages, but every tab gets an in-memory history and
 //! reports the events a quick page load would, so the shell's flows (titles,
 //! progress, navigation buttons, closing) behave as they do on macOS.
+//!
+//! Addresses containing "download-demo" download a file instead (one with
+//! "fail" fails halfway), and pages whose address contains
+//! "permission-demo" ask to use the camera and microphone ("location" or
+//! "notifications" in the address ask for those).
 
-use super::{EngineEvent, ZoomStep, step_zoom};
+use super::{EngineEvent, Permission, PermissionDecision, ZoomStep, step_zoom};
 use crate::blocker::ContentBlocker;
 use anyhow::Result;
 use async_channel::{Receiver, Sender};
 use gpui::http_client::Url;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     ffi::c_void,
     path::Path,
+    time::Duration,
 };
+
+/// A demo download takes this many steps of `DOWNLOAD_STEP`.
+const DOWNLOAD_STEPS: u64 = 20;
+const DOWNLOAD_STEP: Duration = Duration::from_millis(600);
+const DOWNLOAD_SIZE: u64 = 48_000_000;
 
 /// Methods mirror the macOS engine; `allow(dead_code)` marks those this
 /// platform's shell never calls.
 pub struct Engine {
     events: Sender<EngineEvent>,
     pages: RefCell<HashMap<u64, History>>,
+    next_id: Cell<u64>,
+    /// Unanswered permission requests and their tabs.
+    permission_requests: RefCell<HashMap<u64, u64>>,
 }
 
 struct History {
@@ -80,6 +94,10 @@ fn page_title(url: &str) -> String {
         .unwrap_or_else(|| url.to_owned())
 }
 
+fn is_download(url: &str) -> bool {
+    url.contains("download-demo")
+}
+
 /// Decodes %XX escapes; invalid UTF-8 becomes U+FFFD.
 fn percent_decode(text: &str) -> String {
     let bytes = text.as_bytes();
@@ -110,6 +128,8 @@ impl Engine {
         let engine = Self {
             events,
             pages: RefCell::default(),
+            next_id: Cell::new(0),
+            permission_requests: RefCell::default(),
         };
         Ok((engine, receiver))
     }
@@ -124,17 +144,26 @@ impl Engine {
             self.navigate(tab_id, url);
             return Ok(());
         }
+        let download = is_download(url);
         self.pages.borrow_mut().insert(
             tab_id,
             History {
-                entries: vec![url.to_owned()],
+                entries: if download {
+                    Vec::new()
+                } else {
+                    vec![url.to_owned()]
+                },
                 index: 0,
                 zoom: 100,
                 find_active: 0,
             },
         );
         self.send(EngineEvent::Created { tab_id });
-        self.load(tab_id);
+        if download {
+            self.download(tab_id, url, true);
+        } else {
+            self.load(tab_id);
+        }
         Ok(())
     }
 
@@ -156,6 +185,11 @@ impl Engine {
             let Some(page) = pages.get_mut(&tab_id) else {
                 return;
             };
+            if is_download(url) {
+                let blank = page.entries.is_empty();
+                drop(pages);
+                return self.download(tab_id, url, blank);
+            }
             page.entries.truncate(page.index + 1);
             page.entries.push(url.to_owned());
             page.index = page.entries.len() - 1;
@@ -196,12 +230,15 @@ impl Engine {
             let Some(page) = pages.get_mut(&tab_id) else {
                 return;
             };
-            let url = &page.entries[page.index];
+            // A tab that only downloaded a file has no page.
+            let Some(url) = page.entries.get(page.index).cloned() else {
+                return;
+            };
             let text = text.to_lowercase();
             let count = if text.is_empty() {
                 0
             } else {
-                let page_text = format!("{} {url}", page_title(url)).to_lowercase();
+                let page_text = format!("{} {url}", page_title(&url)).to_lowercase();
                 page_text.matches(text.as_str()).count() as u32
             };
             let current = page.find_active.clamp(1, count.max(1));
@@ -239,8 +276,13 @@ impl Engine {
     /// not at all if the tab was created again by then.
     pub fn close_tab(&mut self, tab_id: u64) {
         if self.pages.borrow_mut().remove(&tab_id).is_some() {
+            self.dismiss_requests(tab_id);
             self.send(EngineEvent::Closed { tab_id });
         }
+    }
+
+    pub fn respond_permission(&self, id: u64, _decision: PermissionDecision) {
+        self.permission_requests.borrow_mut().remove(&id);
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
@@ -270,15 +312,15 @@ impl Engine {
     fn load(&self, tab_id: u64) {
         let (url, can_go_back, can_go_forward) = {
             let pages = self.pages.borrow();
-            let Some(page) = pages.get(&tab_id) else {
+            let Some((page, url)) = pages
+                .get(&tab_id)
+                .and_then(|page| Some((page, page.entries.get(page.index)?)))
+            else {
                 return;
             };
-            (
-                page.entries[page.index].clone(),
-                page.can_go_back(),
-                page.can_go_forward(),
-            )
+            (url.clone(), page.can_go_back(), page.can_go_forward())
         };
+        self.dismiss_requests(tab_id);
         let loading = |loading| EngineEvent::Loading {
             tab_id,
             loading,
@@ -286,6 +328,7 @@ impl Engine {
             can_go_forward,
         };
         let title = page_title(&url);
+        let asks = url.contains("permission-demo").then(|| url.clone());
         self.send(loading(true));
         self.send(EngineEvent::Address { tab_id, url });
         self.send(EngineEvent::Title { tab_id, title });
@@ -293,6 +336,89 @@ impl Engine {
             self.send(EngineEvent::Progress { tab_id, progress });
         }
         self.send(loading(false));
+        if let Some(url) = asks {
+            self.request_permissions(tab_id, &url);
+        }
+    }
+
+    fn next_id(&self) -> u64 {
+        self.next_id.set(self.next_id.get() + 1);
+        self.next_id.get()
+    }
+
+    /// Downloads the demo file from `url` (named after its last path
+    /// segment) in steps on another thread, as Chromium reports progress.
+    fn download(&self, tab_id: u64, url: &str, blank_tab: bool) {
+        let id = self.next_id();
+        let name = Url::parse(url)
+            .ok()
+            .and_then(|url| Some(percent_decode(url.path_segments()?.next_back()?)))
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "download-demo".to_owned());
+        let path = dirs::download_dir().unwrap_or_default().join(&name);
+        self.send(EngineEvent::DownloadStarted {
+            id,
+            tab_id,
+            name,
+            path,
+            blank_tab,
+        });
+        let (events, fails) = (self.events.clone(), url.contains("fail"));
+        std::thread::spawn(move || {
+            for step in 1..=DOWNLOAD_STEPS {
+                std::thread::sleep(DOWNLOAD_STEP);
+                let event = if fails && step > DOWNLOAD_STEPS / 2 {
+                    EngineEvent::DownloadFinished { id, ok: false }
+                } else {
+                    EngineEvent::DownloadProgress {
+                        id,
+                        received: DOWNLOAD_SIZE * step / DOWNLOAD_STEPS,
+                        total: Some(DOWNLOAD_SIZE),
+                    }
+                };
+                let finished = matches!(event, EngineEvent::DownloadFinished { .. });
+                if events.try_send(event).is_err() || finished {
+                    return;
+                }
+            }
+            let _ = events.try_send(EngineEvent::DownloadFinished { id, ok: true });
+        });
+    }
+
+    fn request_permissions(&self, tab_id: u64, url: &str) {
+        let permissions = if url.contains("location") {
+            vec![Permission::Location]
+        } else if url.contains("notifications") {
+            vec![Permission::Notifications]
+        } else {
+            vec![Permission::Camera, Permission::Microphone]
+        };
+        let id = self.next_id();
+        self.permission_requests.borrow_mut().insert(id, tab_id);
+        self.send(EngineEvent::PermissionRequest {
+            id,
+            tab_id,
+            origin: Url::parse(url)
+                .map(|url| format!("{}/", url.origin().ascii_serialization()))
+                .unwrap_or_default(),
+            permissions,
+        });
+    }
+
+    /// The tab's page is gone, and with it its requests.
+    fn dismiss_requests(&self, tab_id: u64) {
+        let mut ids: Vec<u64> = self
+            .permission_requests
+            .borrow()
+            .iter()
+            .filter(|&(_, &tab)| tab == tab_id)
+            .map(|(&id, _)| id)
+            .collect();
+        ids.sort();
+        for id in ids {
+            self.permission_requests.borrow_mut().remove(&id);
+            self.send(EngineEvent::PermissionDismissed { id });
+        }
     }
 
     fn send(&self, event: EngineEvent) {
@@ -492,6 +618,70 @@ mod tests {
         assert_eq!(result(&events), (3, 3));
         engine.find(1, "nowhere", true, false);
         assert_eq!(result(&events), (0, 0));
+    }
+
+    #[test]
+    fn demo_downloads_leave_the_page_alone() {
+        let (mut engine, events) = Engine::initialize(Path::new("/unused")).unwrap();
+        engine.create_tab(1, 1, "https://a.test/").unwrap();
+        drain(&events);
+        engine.navigate(1, "https://files.test/download-demo/Q3%20report.pdf");
+        let started = drain(&events);
+        assert!(matches!(
+            started.as_slice(),
+            [EngineEvent::DownloadStarted { tab_id: 1, name, blank_tab: false, .. }]
+                if name == "Q3 report.pdf"
+        ));
+        // A new tab for a download never shows a page.
+        engine
+            .create_tab(2, 1, "https://files.test/download-demo")
+            .unwrap();
+        let events = drain(&events);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                EngineEvent::Created { tab_id: 2 },
+                EngineEvent::DownloadStarted {
+                    tab_id: 2,
+                    blank_tab: true,
+                    ..
+                }
+            ]
+        ));
+        assert_eq!(engine.pages.borrow()[&1].entries, ["https://a.test/"]);
+    }
+
+    #[test]
+    fn permission_requests_end_with_their_page() {
+        let (mut engine, events) = Engine::initialize(Path::new("/unused")).unwrap();
+        engine
+            .create_tab(1, 1, "https://meet.test/permission-demo")
+            .unwrap();
+        let request = drain(&events).into_iter().find_map(|event| match event {
+            EngineEvent::PermissionRequest {
+                id,
+                origin,
+                permissions,
+                ..
+            } => Some((id, origin, permissions)),
+            _ => None,
+        });
+        let (id, origin, permissions) = request.expect("a request");
+        assert_eq!(origin, "https://meet.test/");
+        assert_eq!(permissions, [Permission::Camera, Permission::Microphone]);
+        // Answered requests are gone; a new page ends unanswered ones.
+        engine.reload(1);
+        assert!(drain(&events).iter().any(
+            |event| matches!(event, EngineEvent::PermissionDismissed { id: dismissed } if *dismissed == id)
+        ));
+        let id = id + 1;
+        engine.respond_permission(id, PermissionDecision::Allow);
+        engine.close_tab(1);
+        assert!(
+            !drain(&events)
+                .iter()
+                .any(|event| matches!(event, EngineEvent::PermissionDismissed { .. }))
+        );
     }
 
     #[test]
