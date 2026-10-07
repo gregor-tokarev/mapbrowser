@@ -395,6 +395,11 @@ wrap_load_handler! {
         fn on_load_start(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, _transition_type: TransitionType) {
             if frame.is_some_and(|frame| frame.is_main() != 0) {
                 self.link.permissions.drop_page(&self.link);
+                // CEF calls this as a navigation to another document commits,
+                // never for same-document ones, then reports the address.
+                if self.link.navigation_started() {
+                    self.link.send(EngineEvent::NewDocument { tab_id: self.link.tab_id });
+                }
             }
         }
         fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _http_status_code: i32) {

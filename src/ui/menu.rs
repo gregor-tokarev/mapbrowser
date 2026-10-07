@@ -41,11 +41,13 @@ pub enum MenuKind {
     Space(SpaceId),
     /// The bottom bar's "+".
     Plus,
-    /// This session's downloads and recently closed tabs, from the library
-    /// button.
+    /// This session's downloads and the recently closed tabs, from the
+    /// library button.
     Library,
     /// Asks before deleting a space, in place of the space menu.
     DeleteSpace(SpaceId),
+    /// The spaces a tab can move to, in place of the tab menu.
+    MoveTab(TabId),
 }
 
 pub struct OpenMenu {
@@ -76,6 +78,9 @@ enum Action {
     AskDeleteSpace(SpaceId),
     DeleteSpace(SpaceId),
     RevealDownload(u64),
+    /// "Move to Space ›": the menu lists the spaces.
+    AskMoveTab(TabId),
+    MoveTab(TabId, SpaceId),
 }
 
 enum Entry {
@@ -110,6 +115,15 @@ enum Entry {
         status: Option<String>,
         failed: bool,
     },
+    /// A space, with its icon or its theme's dot.
+    Space {
+        name: SharedString,
+        icon: Option<String>,
+        theme: u8,
+        action: Action,
+    },
+    /// A line of explanation.
+    Note(&'static str),
 }
 
 impl Entry {
@@ -135,7 +149,9 @@ impl Entry {
             Entry::Item { .. }
             | Entry::Closed { .. }
             | Entry::Empty(_)
-            | Entry::Download { .. } => ITEM_HEIGHT,
+            | Entry::Download { .. }
+            | Entry::Space { .. }
+            | Entry::Note(_) => ITEM_HEIGHT,
             Entry::Separator => SEPARATOR_HEIGHT,
             Entry::Header(_) => HEADER_HEIGHT,
             Entry::Swatches(..) => SWATCH_ROW_HEIGHT,
@@ -223,10 +239,15 @@ impl BrowserApp {
                     Entry::Separator,
                     Entry::item("Copy Link", "⇧⌘C", Action::CopyLink(id)),
                     Entry::item("Duplicate", "", Action::Duplicate(id)),
+                ];
+                if self.state.spaces.len() > 1 {
+                    entries.push(Entry::item("Move to Space", "›", Action::AskMoveTab(id)));
+                }
+                entries.extend([
                     Entry::item("Reload", "⌘R", Action::Reload(id)),
                     Entry::Separator,
                     Entry::item("Close Tab", "⌘W", Action::Close(id)),
-                ];
+                ]);
                 // Closing a pinned tab only unloads it; this removes it.
                 if tab.pin != Pin::Today {
                     entries.push(Entry::item("Delete Tab", "", Action::Delete(id)));
@@ -278,13 +299,14 @@ impl BrowserApp {
                     entries.push(Entry::Separator);
                 }
                 entries.push(Entry::Header("Recently Closed"));
-                entries.extend(self.closed.iter().enumerate().rev().take(CLOSED_LIMIT).map(
+                let closed = self.state.closed_tabs();
+                entries.extend(closed.iter().enumerate().rev().take(CLOSED_LIMIT).map(
                     |(index, closed)| Entry::Closed {
                         index,
                         title: closed.tab.title.clone().into(),
                     },
                 ));
-                if self.closed.is_empty() {
+                if closed.is_empty() {
                     entries.push(Entry::Empty("No recently closed tabs"));
                 }
                 entries
@@ -304,6 +326,25 @@ impl BrowserApp {
                     },
                 ]
             }
+            MenuKind::MoveTab(id) => {
+                let Some(from) = self.state.space_of_tab(id) else {
+                    return Vec::new();
+                };
+                let spaces = self.state.spaces.iter().filter(|space| space.id != from);
+                std::iter::once(Entry::Header("Move to Space"))
+                    .chain(spaces.map(|space| Entry::Space {
+                        name: space.name.clone().into(),
+                        icon: space.icon.clone(),
+                        theme: space.theme(),
+                        action: Action::MoveTab(id, space.id),
+                    }))
+                    // Each space is a profile of its own.
+                    .chain([
+                        Entry::Separator,
+                        Entry::Note("Opens with that space's logins"),
+                    ])
+                    .collect()
+            }
         }
     }
 
@@ -316,7 +357,7 @@ impl BrowserApp {
     ) -> AnyElement {
         let sidebar = self.sidebar_width().unwrap_or(f32::from(viewport.width));
         let width: f32 = match menu.kind {
-            MenuKind::Tab(_) | MenuKind::Plus => 200.,
+            MenuKind::Tab(_) | MenuKind::Plus | MenuKind::MoveTab(_) => 200.,
             MenuKind::Space(_) | MenuKind::Library | MenuKind::DeleteSpace(_) => 212.,
         };
         let width = width.min(sidebar - 2. * EDGE);
@@ -424,7 +465,7 @@ impl BrowserApp {
                 })
                 .into_any_element(),
             Entry::Closed { index, title } => {
-                let tab = &self.closed[index].tab;
+                let tab = &self.state.closed_tabs()[index].tab;
                 item(1000 + index, true)
                     .gap(px(8.))
                     .child(self.favicon(tab, 14., theme))
@@ -617,13 +658,54 @@ impl BrowserApp {
                     )
                     .into_any_element()
             }
+            Entry::Space {
+                name,
+                icon,
+                theme: space_theme,
+                action,
+            } => {
+                let dot = Theme::new(space_theme, theme.dark).swatch();
+                item(3000 + index, true)
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .size(px(16.))
+                            .map(|slot| match icon {
+                                Some(emoji) => slot.text_size(px(13.)).child(emoji),
+                                None => slot.child(div().size(px(7.)).rounded_full().bg(dot)),
+                            }),
+                    )
+                    .child(truncated(name).flex_1().min_w_0())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.run_menu_action(action, window, cx)
+                    }))
+                    .into_any_element()
+            }
+            Entry::Note(text) => div()
+                .h(px(ITEM_HEIGHT))
+                .flex()
+                .items_center()
+                .px(px(9.))
+                .text_size(px(11.5))
+                .text_color(theme.tertiary())
+                .child(text)
+                .into_any_element(),
         }
     }
 
     fn run_menu_action(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
-        // The menu turns into the question, where it is.
-        if let (Action::AskDeleteSpace(id), Some(menu)) = (action, &mut self.menu) {
-            menu.kind = MenuKind::DeleteSpace(id);
+        // The menu turns into the question, or the list, where it is.
+        let next = match action {
+            Action::AskDeleteSpace(id) => Some(MenuKind::DeleteSpace(id)),
+            Action::AskMoveTab(id) => Some(MenuKind::MoveTab(id)),
+            _ => None,
+        };
+        if let (Some(kind), Some(menu)) = (next, &mut self.menu) {
+            menu.kind = kind;
             return cx.notify();
         }
         self.close_menu(cx);
@@ -644,9 +726,10 @@ impl BrowserApp {
                 self.toggle_command_bar(super::command_bar::CommandMode::NewTab, window, cx)
             }
             Action::Reopen(index) => self.reopen_closed(Some(index), window, cx),
-            Action::AskDeleteSpace(_) => {}
+            Action::AskDeleteSpace(_) | Action::AskMoveTab(_) => {}
             Action::DeleteSpace(id) => self.delete_space(id, window, cx),
             Action::RevealDownload(id) => self.reveal_download(id),
+            Action::MoveTab(id, space_id) => self.move_tab_to_space(id, space_id, cx),
         }
     }
 }

@@ -31,6 +31,8 @@ pub const THEME_COUNT: u8 = 8;
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 228.;
 pub const MIN_SIDEBAR_WIDTH: f32 = 180.;
 pub const MAX_SIDEBAR_WIDTH: f32 = 420.;
+/// Closed Today tabs that ⇧⌘T and the library can bring back.
+pub const REOPEN_LIMIT: usize = 20;
 
 /// The sidebar section a tab belongs to. Variants are declared in sidebar
 /// order, so sorting by `Pin` groups favorites, pinned tabs, then Today.
@@ -52,6 +54,14 @@ pub struct Tab {
     pub title: String,
     #[serde(default)]
     pub pin: Pin,
+}
+
+/// A Today tab closed with ⌘W or Clear, which ⇧⌘T and the library bring
+/// back into its space.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClosedTab {
+    pub space_id: SpaceId,
+    pub tab: Tab,
 }
 
 /// `tabs` stays grouped by section, so its order is the sidebar order.
@@ -90,6 +100,10 @@ pub struct BrowserState {
     /// The browser window's frame, to open it there again.
     #[serde(default)]
     pub window: Option<SavedWindow>,
+    /// Recently closed Today tabs, the most recent last. Saved, so a Clear
+    /// can still be undone after a restart.
+    #[serde(default)]
+    closed: Vec<ClosedTab>,
     #[serde(skip, default = "data_dir")]
     storage_dir: PathBuf,
     /// Whether this is the session saved last, read from state.json, rather
@@ -147,6 +161,7 @@ impl Default for BrowserState {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             blocking_exceptions: BTreeSet::new(),
             window: None,
+            closed: Vec::new(),
             storage_dir: data_dir(),
             from_state_file: false,
         }
@@ -571,6 +586,8 @@ impl BrowserState {
         if self.selected_space_id == id {
             self.selected_space_id = self.spaces[index.min(self.spaces.len() - 1)].id;
         }
+        // Its closed tabs would reopen in another space's profile.
+        self.closed.retain(|closed| closed.space_id != id);
         Some(space)
     }
 
@@ -637,7 +654,17 @@ impl BrowserState {
         Some(id)
     }
 
+    /// Selects the tab and its space.
     pub fn select_tab(&mut self, space_id: SpaceId, tab_id: TabId) -> bool {
+        let selected = self.select_tab_in_space(space_id, tab_id);
+        if selected {
+            self.selected_space_id = space_id;
+        }
+        selected
+    }
+
+    /// Selects the tab within its space only: the active space stays.
+    pub fn select_tab_in_space(&mut self, space_id: SpaceId, tab_id: TabId) -> bool {
         let Some(space) = self.space_mut(space_id) else {
             return false;
         };
@@ -645,7 +672,6 @@ impl BrowserState {
             return false;
         }
         space.selected_tab_id = Some(tab_id);
-        self.selected_space_id = space_id;
         true
     }
 
@@ -701,6 +727,31 @@ impl BrowserState {
         true
     }
 
+    /// Moves a tab to the same section of another space under a new id, as
+    /// its page opens again there, in that space's profile: Today tabs at
+    /// the top of Today, pinned tabs and favorites at the end of theirs.
+    /// Its own space hands the selection on as when the tab is closed; the
+    /// other space keeps its selection unless it had no tabs.
+    pub fn move_tab_to_space(&mut self, tab_id: TabId, target: SpaceId) -> Option<TabId> {
+        let source = self.space_of_tab(tab_id)?;
+        if source == target || self.space(target).is_none() {
+            return None;
+        }
+        let id = self.allocate_id();
+        let space = self.space_mut(source)?;
+        let index = space.tab_index(tab_id)?;
+        let mut tab = space.remove_at(index);
+        tab.id = id;
+        let space = self.space_mut(target)?;
+        let at = match tab.pin {
+            Pin::Today => space.section_start(Pin::Today),
+            pin => space.section_end(pin),
+        };
+        space.tabs.insert(at, tab);
+        space.selected_tab_id.get_or_insert(id);
+        Some(id)
+    }
+
     /// Removes every Today tab. A selected Today tab passes the selection to
     /// the first remaining tab, if any.
     pub fn clear_today(&mut self, space_id: SpaceId) -> Vec<Tab> {
@@ -738,6 +789,34 @@ impl BrowserState {
         tab.url = new_url;
         tab.title = new_title;
         changed
+    }
+
+    /// Recently closed Today tabs, the most recent last.
+    pub fn closed_tabs(&self) -> &[ClosedTab] {
+        &self.closed
+    }
+
+    /// Remembers a closed Today tab for reopening; past `REOPEN_LIMIT` the
+    /// oldest is forgotten.
+    pub fn remember_closed(&mut self, space_id: SpaceId, tab: Tab) {
+        self.closed.push(ClosedTab { space_id, tab });
+        self.trim_closed();
+    }
+
+    fn trim_closed(&mut self) {
+        let excess = self.closed.len().saturating_sub(REOPEN_LIMIT);
+        self.closed.drain(..excess);
+    }
+
+    /// Takes a closed tab, by default the most recent one, off the list.
+    pub fn take_closed(&mut self, index: Option<usize>) -> Option<ClosedTab> {
+        let index = index.or(self.closed.len().checked_sub(1))?;
+        (index < self.closed.len()).then(|| self.closed.remove(index))
+    }
+
+    /// Forgets a closed tab that isn't worth reopening.
+    pub fn forget_closed(&mut self, tab_id: TabId) {
+        self.closed.retain(|closed| closed.tab.id != tab_id);
     }
 
     fn validate_and_repair(&mut self) -> io::Result<()> {
@@ -807,6 +886,12 @@ impl BrowserState {
             self.selected_space_id = self.spaces[0].id;
         }
         self.sidebar_width = clamp_sidebar_width(self.sidebar_width);
+        // A closed tab of a space that is gone (in a backup, say) must not
+        // reopen in another space's profile.
+        let spaces: HashSet<SpaceId> = self.spaces.iter().map(|space| space.id).collect();
+        self.closed
+            .retain(|closed| spaces.contains(&closed.space_id));
+        self.trim_closed();
         self.blocking_exceptions = std::mem::take(&mut self.blocking_exceptions)
             .iter()
             .filter_map(|host| normalize_host(host))
@@ -2070,5 +2155,144 @@ mod tests {
         fs::write(root.0.join(STATE_FILE), json.to_string()).unwrap();
         let loaded = BrowserState::load_from(&root.0).unwrap().window.unwrap();
         assert_eq!((loaded.display, loaded.fullscreen), (None, false));
+    }
+
+    #[test]
+    fn selecting_within_a_space_keeps_the_active_space() {
+        let mut state = BrowserState::default();
+        let (personal, work) = (state.spaces[0].id, state.spaces[1].id);
+        let opener = state.new_tab(personal, "a.com").unwrap();
+        let blank = state.new_tab(personal, "b.com").unwrap();
+        state.select_space(work);
+        assert!(state.select_tab_in_space(personal, opener));
+        assert_eq!(state.selected_space_id, work);
+        assert_eq!(selected(&state, personal), Some(opener));
+        assert!(!state.select_tab_in_space(work, blank));
+        assert!(!state.select_tab_in_space(12345, blank));
+        assert!(state.select_tab(personal, blank));
+        assert_eq!(state.selected_space_id, personal);
+    }
+
+    #[test]
+    fn tabs_move_to_their_section_of_another_space_under_a_new_id() {
+        let root = TestDir::new();
+        let mut state = BrowserState::load_from(&root.0).unwrap();
+        let (personal, work) = (state.spaces[0].id, state.spaces[1].id);
+        let pinned = state.new_tab(personal, "a.com").unwrap();
+        state.set_pin(pinned, Pin::Pinned);
+        let older = state.new_tab(personal, "b.com").unwrap();
+        let newer = state.new_tab(personal, "c.com").unwrap();
+        state.update_tab(newer, "https://c.com/", "C");
+
+        // Into an empty space: it is selected there; here the selection
+        // moves on as on closing. The active space stays.
+        let moved = state.move_tab_to_space(newer, work).unwrap();
+        assert!(moved > newer);
+        assert_eq!(sidebar(&state, personal), [pinned, older]);
+        assert_eq!(selected(&state, personal), Some(older));
+        assert_eq!(sidebar(&state, work), [moved]);
+        assert_eq!(selected(&state, work), Some(moved));
+        assert_eq!(state.selected_space_id, personal);
+        let tab = state.tab(moved).unwrap();
+        assert_eq!(
+            (tab.url.as_str(), tab.title.as_str()),
+            ("https://c.com/", "C")
+        );
+        assert_eq!(state.tab(newer), None);
+
+        // Today tabs go to the top of Today, pinned tabs after the pinned
+        // ones; the other space keeps its selection.
+        let moved_today = state.move_tab_to_space(older, work).unwrap();
+        let moved_pinned = state.move_tab_to_space(pinned, work).unwrap();
+        assert_eq!(sidebar(&state, work), [moved_pinned, moved_today, moved]);
+        assert_eq!(state.tab(moved_pinned).unwrap().pin, Pin::Pinned);
+        assert_eq!(selected(&state, work), Some(moved));
+        // The last tab leaves an empty space.
+        assert!(state.active_space().tabs.is_empty());
+        assert_eq!(state.active_tab(), None);
+
+        // Within the same space, unknown tabs and spaces: refused.
+        assert_eq!(state.move_tab_to_space(moved, work), None);
+        assert_eq!(state.move_tab_to_space(12345, personal), None);
+        assert_eq!(state.move_tab_to_space(moved, 12345), None);
+        assert_eq!(sidebar(&state, work), [moved_pinned, moved_today, moved]);
+        state.save().unwrap();
+        let loaded = BrowserState::load_from(&root.0).unwrap();
+        assert_eq!(loaded.spaces, state.spaces);
+    }
+
+    fn closed_tab(id: TabId) -> Tab {
+        Tab {
+            id,
+            url: format!("https://{id}.test/"),
+            title: id.to_string(),
+            pin: Pin::Today,
+        }
+    }
+
+    #[test]
+    fn closed_tabs_are_capped_and_taken_newest_first() {
+        let mut state = BrowserState::default();
+        let space = state.selected_space_id;
+        assert_eq!(state.take_closed(None), None);
+        for id in 100..100 + REOPEN_LIMIT as u64 + 2 {
+            state.remember_closed(space, closed_tab(id));
+        }
+        let ids = |state: &BrowserState| -> Vec<TabId> {
+            state
+                .closed_tabs()
+                .iter()
+                .map(|closed| closed.tab.id)
+                .collect()
+        };
+        assert_eq!(ids(&state).len(), REOPEN_LIMIT);
+        assert_eq!(ids(&state)[0], 102);
+        assert_eq!(state.take_closed(None).unwrap().tab.id, 121);
+        assert_eq!(state.take_closed(Some(0)).unwrap().tab.id, 102);
+        assert_eq!(state.take_closed(Some(REOPEN_LIMIT)), None);
+        state.forget_closed(110);
+        assert!(!ids(&state).contains(&110));
+        assert_eq!(ids(&state).len(), REOPEN_LIMIT - 3);
+    }
+
+    #[test]
+    fn closed_tabs_are_saved_and_go_with_their_space() {
+        let root = TestDir::new();
+        let mut state = BrowserState::load_from(&root.0).unwrap();
+        let (personal, work) = (state.spaces[0].id, state.spaces[1].id);
+        state.remember_closed(personal, closed_tab(100));
+        state.remember_closed(work, closed_tab(101));
+        state.save().unwrap();
+        let mut loaded = BrowserState::load_from(&root.0).unwrap();
+        assert_eq!(loaded.closed_tabs(), state.closed_tabs());
+        loaded.remove_space(work);
+        assert_eq!(loaded.closed_tabs().len(), 1);
+        assert_eq!(loaded.closed_tabs()[0].space_id, personal);
+
+        // Files from before have none; entries of unknown spaces go.
+        let json = serde_json::json!({
+            "spaces": [{ "id": 1, "name": "x", "tabs": [] }],
+            "selected_space_id": 1,
+        });
+        fs::write(root.0.join(STATE_FILE), json.to_string()).unwrap();
+        assert!(BrowserState::load_from(&root.0).unwrap().closed.is_empty());
+        let closed: Vec<serde_json::Value> = (0..25)
+            .map(|index| {
+                serde_json::json!({
+                    "space_id": if index == 24 { 9 } else { 1 },
+                    "tab": { "id": 100 + index, "url": "https://a.test/", "title": "A" }
+                })
+            })
+            .collect();
+        let json = serde_json::json!({
+            "spaces": [{ "id": 1, "name": "x", "tabs": [] }],
+            "selected_space_id": 1,
+            "closed": closed,
+        });
+        fs::write(root.0.join(STATE_FILE), json.to_string()).unwrap();
+        let loaded = BrowserState::load_from(&root.0).unwrap();
+        assert_eq!(loaded.closed.len(), REOPEN_LIMIT);
+        assert!(loaded.closed.iter().all(|closed| closed.space_id == 1));
+        assert_eq!(loaded.closed.last().unwrap().tab.id, 123);
     }
 }

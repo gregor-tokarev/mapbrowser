@@ -5,7 +5,7 @@ use crate::{
     engine::{Engine, EngineEvent, Navigation, Shortcut, ZoomStep, navigation_for},
     favicons::{FaviconStore, host_of},
     input::{InputEvent, InputStyle, TextInput},
-    model::{self, BrowserState, Pin, Space, SpaceId, Tab, TabId},
+    model::{self, BrowserState, ClosedTab, Pin, Space, SpaceId, Tab, TabId},
     native,
     recent::{RecentTabs, TabSwitch},
     ui::{
@@ -21,6 +21,7 @@ use crate::{
         redraw::{self, Drawn},
         swipe::SwipeTracker,
         theme::Theme,
+        toast_window::ToastWindow,
         window_frame::WindowFrame,
     },
 };
@@ -42,8 +43,6 @@ const SAVE_DELAY: Duration = Duration::from_millis(500);
 /// tickers), in every space: those changes alone are saved this rarely.
 const PAGE_SAVE_DELAY: Duration = Duration::from_secs(10);
 const TOAST_DURATION: Duration = Duration::from_millis(1500);
-/// Closed Today tabs that ⇧⌘T and the library can bring back.
-const REOPEN_LIMIT: usize = 20;
 
 /// Navigation state of a loaded tab, for the toolbar and the progress bar.
 #[derive(Clone, Copy, Debug, Default)]
@@ -52,11 +51,6 @@ pub struct PageStatus {
     pub progress: f64,
     pub can_go_back: bool,
     pub can_go_forward: bool,
-}
-
-pub struct ClosedTab {
-    pub space_id: SpaceId,
-    pub tab: Tab,
 }
 
 /// A space switch in progress: the sidebar pages, the window colours and
@@ -92,8 +86,6 @@ pub struct BrowserApp {
     /// tab is unloaded: it shows its saved title and cached icon only.
     loaded: HashSet<TabId>,
     pages: HashMap<TabId, PageStatus>,
-    /// Recently closed Today tabs, the most recent last.
-    pub closed: Vec<ClosedTab>,
     /// The active tab's last load error.
     pub error: Option<String>,
     pub slide: Option<Slide>,
@@ -132,6 +124,8 @@ pub struct BrowserApp {
     pub tab_switch: Option<TabSwitch>,
     window_frame: WindowFrame,
     pub find: Find,
+    /// The toast over the card while the sidebar is hidden.
+    pub(crate) toast_window: Option<ToastWindow>,
 }
 
 /// OS open-URL events are web addresses, never address-bar search queries.
@@ -207,7 +201,6 @@ impl BrowserApp {
             favicons,
             loaded: HashSet::new(),
             pages: HashMap::new(),
-            closed: Vec::new(),
             error: None,
             slide: None,
             menu: None,
@@ -236,6 +229,7 @@ impl BrowserApp {
             tab_switch: None,
             window_frame: WindowFrame::default(),
             find: Find::default(),
+            toast_window: None,
         };
         this._subscriptions.extend([
             cx.subscribe_in(
@@ -322,11 +316,13 @@ impl BrowserApp {
             engine.set_blocking_exceptions(this.state.blocking_exceptions());
             engine.set_traffic_lights_hidden(this.state.sidebar_hidden);
         }
+        let closed = this.state.closed_tabs().iter().map(|closed| &closed.tab);
         let hosts = this
             .state
             .spaces
             .iter()
             .flat_map(|space| &space.tabs)
+            .chain(closed)
             .filter_map(|tab| host_of(&tab.url))
             .collect();
         this.load_favicons(hosts, cx);
@@ -599,7 +595,7 @@ impl BrowserApp {
             return;
         };
         self.drop_browser(tab_id);
-        self.remember_closed(space_id, tab);
+        self.state.remember_closed(space_id, tab);
         if space_id == self.state.selected_space_id {
             self.show_selected();
         }
@@ -643,13 +639,6 @@ impl BrowserApp {
         cx.notify();
     }
 
-    fn remember_closed(&mut self, space_id: SpaceId, tab: Tab) {
-        if self.closed.len() == REOPEN_LIMIT {
-            self.closed.remove(0);
-        }
-        self.closed.push(ClosedTab { space_id, tab });
-    }
-
     /// Reopens a closed tab (the most recent one by default) at the top of
     /// Today in its space.
     pub fn reopen_closed(
@@ -658,17 +647,8 @@ impl BrowserApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = index.or(self.closed.len().checked_sub(1)) else {
+        let Some(ClosedTab { space_id, tab }) = self.state.take_closed(index) else {
             return;
-        };
-        if index >= self.closed.len() {
-            return;
-        }
-        let ClosedTab { space_id, tab } = self.closed.remove(index);
-        let space_id = if self.state.space(space_id).is_some() {
-            space_id
-        } else {
-            self.state.selected_space_id
         };
         if let Some(id) = self.state.new_background_tab(space_id, &tab.url) {
             self.state.update_tab(id, &tab.url, &tab.title);
@@ -690,7 +670,7 @@ impl BrowserApp {
         // Pushed bottom first, so ⇧⌘T restores the top tab first.
         for tab in cleared.into_iter().rev() {
             self.drop_browser(tab.id);
-            self.remember_closed(space_id, tab);
+            self.state.remember_closed(space_id, tab);
         }
         self.error = None;
         self.show_selected();
@@ -734,6 +714,33 @@ impl BrowserApp {
             self.state.update_tab(id, &url, &title);
             self.go_to(space_id, Some(id), window, cx);
         }
+    }
+
+    /// Moves a tab to another space. Each space is a profile of its own, so
+    /// its page opens again there, with that space's logins, when shown.
+    /// The window stays in the space on screen, as in Arc.
+    pub fn move_tab_to_space(&mut self, tab_id: TabId, space_id: SpaceId, cx: &mut Context<Self>) {
+        let Some(from) = self.state.space_of_tab(tab_id) else {
+            return;
+        };
+        self.finish_slide();
+        if self.is_active(tab_id) {
+            self.exit_page_fullscreen();
+            self.error = None;
+        }
+        if self.state.move_tab_to_space(tab_id, space_id).is_none() {
+            return;
+        }
+        self.drop_browser(tab_id);
+        self.openers.remove(&tab_id);
+        if self.state.selected_space_id == from || self.state.selected_space_id == space_id {
+            self.show_selected();
+        }
+        if let Some(space) = self.state.space(space_id) {
+            self.show_toast(format!("Moved to {}", space.name), cx);
+        }
+        self.persist_later(cx);
+        cx.notify();
     }
 
     pub fn copy_url(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
@@ -812,8 +819,6 @@ impl BrowserApp {
             self.drop_browser(tab.id);
         }
         self.engine.borrow_mut().forget_space(space_id);
-        // Its closed tabs would reopen in another space's profile.
-        self.closed.retain(|closed| closed.space_id != space_id);
         self.recent.forget_space(space_id);
         self.tab_switch = None;
         self.menu = None;
@@ -893,10 +898,10 @@ impl BrowserApp {
         cx.notify();
     }
 
-    /// Ends a rename, keeping the name typed so far. Shortcuts and presses
-    /// on the page move keyboard focus to the page without GPUI noticing,
-    /// so they end it here.
-    fn end_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Ends a rename, keeping the name typed so far. Shortcuts, presses on
+    /// the page and sidebar buttons that show another page move keyboard
+    /// focus to the page without GPUI noticing, so they end it here.
+    pub(crate) fn end_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.renaming.is_some() {
             let name = self.rename_input.read(cx).text().to_owned();
             self.finish_rename(Some(&name), window, cx);
@@ -1104,6 +1109,8 @@ impl BrowserApp {
     }
 
     fn open_command_bar(&mut self, mode: CommandMode, window: &mut Window, cx: &mut Context<Self>) {
+        // The bar taking key status would end it too, but only later.
+        self.end_rename(window, cx);
         self.menu = None;
         self.finish_slide();
         let prefill = match mode {
@@ -1239,7 +1246,7 @@ impl BrowserApp {
                 .iter()
                 .map(|space| (space.id, space.name.clone()))
                 .collect(),
-            can_reopen: !self.closed.is_empty(),
+            can_reopen: !self.state.closed_tabs().is_empty(),
             sidebar_hidden: self.state.sidebar_hidden,
             has_today: active_space.section(Pin::Today).next().is_some(),
         }
@@ -1503,6 +1510,7 @@ impl BrowserApp {
                 if let Some(page) = self.pages.get_mut(&tab_id) {
                     page.loading = false;
                 }
+                self.page_replaced(tab_id, cx);
                 // The tab shows the address that failed, as Chrome's address
                 // bar does, so ⌘L can fix a typo and Reload tries it again.
                 if !url.is_empty()
@@ -1586,6 +1594,7 @@ impl BrowserApp {
                 permissions,
             } => self.permission_requested(id, tab_id, origin, permissions, window, cx),
             EngineEvent::PermissionDismissed { id } => self.permission_dismissed(id, cx),
+            EngineEvent::NewDocument { tab_id } => self.page_replaced(tab_id, cx),
         }
     }
 

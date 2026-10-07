@@ -688,7 +688,10 @@ impl BrowserApp {
                             .child(icon(Icon::Broom, 12., theme.tertiary()))
                             .child("Clear"),
                     )
-                    .on_click(cx.listener(|this, _, _, cx| this.clear_today(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.end_rename(window, cx);
+                        this.clear_today(cx)
+                    })),
                 )
             })
     }
@@ -770,9 +773,9 @@ impl BrowserApp {
 
     /// The tab whose menu is open stays highlighted, as in Arc.
     fn has_open_menu(&self, tab_id: TabId) -> bool {
-        self.menu
-            .as_ref()
-            .is_some_and(|menu| menu.kind == MenuKind::Tab(tab_id))
+        self.menu.as_ref().is_some_and(
+            |menu| matches!(menu.kind, MenuKind::Tab(id) | MenuKind::MoveTab(id) if id == tab_id),
+        )
     }
 
     fn is_switch_target(&self, tab_id: TabId) -> bool {
@@ -906,8 +909,9 @@ impl BrowserApp {
                                     .child(icon(glyph, 18., theme.icon())),
                             )
                             .on_click(cx.listener(
-                                move |this, _, _, cx| {
+                                move |this, _, window, cx| {
                                     cx.stop_propagation();
+                                    this.end_rename(window, cx);
                                     this.close_tab(id, cx);
                                 },
                             )),
@@ -953,8 +957,8 @@ impl BrowserApp {
                             .gap(px(8.))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme.title())
-                            .child(icon(Icon::Check, 14., theme.focus()))
-                            .child(toast.text.clone()),
+                            .child(icon(Icon::Check, 14., theme.focus()).flex_none())
+                            .child(truncated(toast.text.clone()).min_w_0()),
                     )
                 })
                 .when_some(error, |notice, error| {

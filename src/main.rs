@@ -3,6 +3,7 @@ mod blocker;
 mod engine;
 mod favicons;
 mod input;
+mod launch_error;
 mod model;
 #[cfg(target_os = "macos")]
 mod native;
@@ -32,6 +33,7 @@ use engine::{Engine, Shortcut};
 use gpui::{prelude::*, *};
 use model::BrowserState;
 use std::{cell::RefCell, rc::Rc};
+use ui::downloads::request_quit;
 
 actions!(
     mapbrowser,
@@ -220,12 +222,15 @@ fn menus() -> Vec<Menu> {
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
-    let state = BrowserState::load()?;
+    let state = BrowserState::load()
+        .unwrap_or_else(|error| launch_error::exit_for_session(&error, &model::data_dir()));
     if let Err(error) = state.remove_orphaned_profiles() {
         eprintln!("Couldn't remove a deleted space's data: {error}");
     }
     let blocker = ContentBlocker::load_in_background(state.root_dir().join("blocker"));
-    let (mut engine, events) = Engine::initialize(state.root_dir())?;
+    let (mut engine, events) = Engine::initialize(state.root_dir()).unwrap_or_else(|error| {
+        launch_error::exit("Map Browser couldn't start.", &format!("{error:#}"))
+    });
     engine.set_blocker(blocker);
     let engine = Rc::new(RefCell::new(engine));
     let retained_engine = engine.clone();
@@ -241,7 +246,6 @@ fn main() -> anyhow::Result<()> {
         ui::command_bar::init(cx);
         ui::find_bar::init(cx);
         cx.bind_keys(key_bindings());
-        cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(|_: &About, _| native::show_about_panel());
         cx.on_action(|_: &Hide, cx| cx.hide());
         cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
@@ -273,8 +277,11 @@ fn main() -> anyhow::Result<()> {
                     // The close button quits the way ⌘Q does. The window, and
                     // with it the browser state that saves on quit, must stay
                     // until App::shutdown has run the quit observers.
-                    window.on_window_should_close(cx, |_, cx| {
-                        cx.quit();
+                    let handle = window.window_handle().downcast::<BrowserApp>();
+                    window.on_window_should_close(cx, move |_, cx| {
+                        if let Some(window) = handle {
+                            cx.defer(move |cx| request_quit(window, cx));
+                        }
                         false
                     });
                     cx.new(|cx| {
@@ -289,6 +296,7 @@ fn main() -> anyhow::Result<()> {
         cx.on_action(move |&Browse(shortcut), cx| {
             cx.defer(move |cx| run_shortcut(window, shortcut, cx))
         });
+        cx.on_action(move |_: &Quit, cx| cx.defer(move |cx| request_quit(window, cx)));
         cx.on_action(move |_: &NewSpace, cx| {
             cx.defer(move |cx| {
                 let _ = window.update(cx, |app, window, cx| app.new_space(window, cx));

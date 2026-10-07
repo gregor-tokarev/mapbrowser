@@ -2,7 +2,9 @@
 //! pop-up window of its own like the command bar, because the native web
 //! views cover anything GPUI draws in the browser window. It stays open
 //! while the page is used, follows the card, and closes when the tab
-//! changes or its page goes to another document.
+//! changes or its page goes to another document. As in Chrome, changes
+//! within the document keep it: fragments, and pages rewriting their
+//! address with the History API (infinite scroll, filters, maps).
 
 use super::{
     UI_FONT,
@@ -257,8 +259,6 @@ pub struct Find {
 
 struct FindBarWindow {
     tab_id: TabId,
-    /// The document searched: the tab's address without its fragment.
-    page: String,
     handle: WindowHandle<FindBar>,
     bar: Entity<FindBar>,
     /// The card the window was placed over.
@@ -267,10 +267,6 @@ struct FindBarWindow {
     #[cfg(target_os = "macos")]
     native_view: Option<*mut std::ffi::c_void>,
     _subscription: Subscription,
-}
-
-fn document(url: &str) -> &str {
-    url.split('#').next().unwrap_or(url)
 }
 
 impl BrowserApp {
@@ -318,14 +314,8 @@ impl BrowserApp {
         let subscription = cx.subscribe_in(&bar, window, |this, _, event, window, cx| {
             this.find_bar_event(event, window, cx)
         });
-        let page = self
-            .state
-            .tab(tab_id)
-            .map(|tab| document(&tab.url).to_owned())
-            .unwrap_or_default();
         self.find.bar = Some(FindBarWindow {
             tab_id,
-            page,
             handle,
             bar,
             card,
@@ -374,9 +364,21 @@ impl BrowserApp {
         let _ = bar.handle.update(cx, |_, window, _| window.remove_window());
     }
 
+    /// The tab's page went to another document (or an error page): the
+    /// matches are gone, and so is its bar.
+    pub(crate) fn page_replaced(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        if self
+            .find
+            .bar
+            .as_ref()
+            .is_some_and(|bar| bar.tab_id == tab_id)
+        {
+            self.close_find_bar(cx);
+        }
+    }
+
     /// Called on every frame of the browser window: the bar follows the
-    /// card, and goes when its tab is no longer on screen or loads another
-    /// document.
+    /// card, and goes when its tab is no longer on screen.
     pub(super) fn sync_find_bar(
         &mut self,
         card: Bounds<Pixels>,
@@ -386,12 +388,7 @@ impl BrowserApp {
         let Some(bar) = &self.find.bar else {
             return;
         };
-        let current = self
-            .state
-            .active_tab()
-            .filter(|tab| tab.id == bar.tab_id && self.is_loaded(tab.id))
-            .is_some_and(|tab| document(&tab.url) == bar.page);
-        if !current {
+        if self.active_tab_id() != Some(bar.tab_id) || !self.is_loaded(bar.tab_id) {
             cx.defer_in(window, |this, _, cx| this.close_find_bar(cx));
             return;
         }
@@ -458,6 +455,5 @@ mod tests {
         assert_eq!(result_label(12, 3), "3 of 12");
         assert_eq!(result_label(2, 0), "1 of 2");
         assert_eq!(result_label(0, 0), "No matches");
-        assert_eq!(document("https://a.test/p#section"), "https://a.test/p");
     }
 }

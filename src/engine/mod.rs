@@ -231,6 +231,13 @@ pub enum EngineEvent {
     PermissionDismissed {
         id: u64,
     },
+    /// The tab's page committed a new document: a link, a reload, Back to
+    /// another page. Changes within the document (fragments, the History
+    /// API's pushState and replaceState) report only `Address`. Arrives
+    /// just before that document's `Address`.
+    NewDocument {
+        tab_id: u64,
+    },
 }
 
 /// Something a page asks permission to use.

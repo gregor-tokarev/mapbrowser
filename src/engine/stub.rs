@@ -330,6 +330,7 @@ impl Engine {
         let title = page_title(&url);
         let asks = url.contains("permission-demo").then(|| url.clone());
         self.send(loading(true));
+        self.send(EngineEvent::NewDocument { tab_id });
         self.send(EngineEvent::Address { tab_id, url });
         self.send(EngineEvent::Title { tab_id, title });
         for progress in [0.4, 1.0] {
@@ -485,6 +486,7 @@ mod tests {
                 EngineEvent::Title { title, .. } => format!("title {title}"),
                 EngineEvent::Address { url, .. } => format!("address {url}"),
                 EngineEvent::Progress { progress, .. } => format!("progress {progress}"),
+                EngineEvent::NewDocument { tab_id } => format!("new document {tab_id}"),
                 other => format!("{other:?}"),
             })
             .collect();
@@ -493,6 +495,7 @@ mod tests {
             [
                 "created 7",
                 "loading true",
+                "new document 7",
                 "address https://www.example.com/page",
                 "title Page",
                 "progress 0.4",

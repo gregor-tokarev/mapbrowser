@@ -155,6 +155,98 @@ fn url_text(url: &str) -> &str {
     url.strip_prefix("www.").unwrap_or(url)
 }
 
+/// How clearly typed text names a tab or space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Naming {
+    /// One of the name's words ("gmail" for "Inbox - me@gmail.com - Gmail").
+    Word,
+    /// The start of the name ("hack", "hacker ne" for "Hacker News").
+    Prefix,
+    Exact,
+}
+
+/// How `query` (lowercase, single spaces) names `name`, if clearly. Inside
+/// a name only a whole word counts, and only typed alone: phrases are
+/// mostly searches ("rust lang" for "The Rust Programming Language").
+fn naming(name: &str, query: &str) -> Option<Naming> {
+    let name = name
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if name == query {
+        Some(Naming::Exact)
+    } else if name.starts_with(query) {
+        Some(Naming::Prefix)
+    } else if !query.contains(' ')
+        && name
+            .split(|ch: char| !ch.is_alphanumeric())
+            .any(|word| word == query)
+    {
+        Some(Naming::Word)
+    } else {
+        None
+    }
+}
+
+/// What Return should switch to rather than search for or open, as with
+/// Arc's "⌘T, then the tab's or space's name": the other tab or space that
+/// typed text names best (`naming`; spaces win ties, then the bar's order).
+/// A tab is named by its title or the start of its host ("mail" for
+/// mail.google.com, not "google"); an address names the tab at it or, if a
+/// bare host, any tab on that host.
+fn named(query: &str, context: &CommandContext) -> Option<CommandItem> {
+    let query = query
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    // A single letter is too little to go on.
+    if query.chars().count() < 2 {
+        return None;
+    }
+    let active = context.active.as_ref().map(|active| active.id);
+    let mut tabs = context.tabs.iter().filter(|tab| Some(tab.id) != active);
+    if !model::is_search_query(&query) {
+        let typed = url_text(&query).trim_end_matches('/');
+        let bare_host = !typed.contains(['/', '?', '#']);
+        return tabs
+            .find(|tab| {
+                url_text(&tab.url)
+                    .trim_end_matches('/')
+                    .eq_ignore_ascii_case(typed)
+                    || (bare_host && host_of(&tab.url).as_deref() == Some(typed))
+            })
+            .map(|tab| switch_item(tab, context));
+    }
+    let spaces = context
+        .spaces
+        .iter()
+        .filter(|(id, _)| *id != context.space_id)
+        .filter_map(|(id, name)| {
+            let item = CommandItem {
+                command: Command::SwitchToSpace(*id),
+                title: name.clone(),
+                detail: Some("Space".into()),
+                hint: "Switch to Space",
+                icon: ItemIcon::Glyph(Icon::ArrowRight),
+            };
+            Some((naming(name, &query)?, item))
+        });
+    let tabs = tabs.filter_map(|tab| {
+        let host = host_of(&tab.url)
+            .and_then(|host| naming(&host, &query))
+            .filter(|naming| *naming > Naming::Word);
+        let naming = naming(&tab.title, &query).max(host)?;
+        Some((naming, switch_item(tab, context)))
+    });
+    // The first of the best.
+    spaces
+        .chain(tabs)
+        .min_by_key(|(naming, _)| std::cmp::Reverse(*naming))
+        .map(|(_, item)| item)
+}
+
 fn switch_item(tab: &TabEntry, context: &CommandContext) -> CommandItem {
     let host = host_of(&tab.url);
     CommandItem {
@@ -275,7 +367,8 @@ fn actions(context: &CommandContext) -> Vec<(CommandItem, &'static str)> {
 
 /// The bar's rows for `query`. Without a query: the active space's tabs,
 /// the selected one first. With one: opening it (an address or a search),
-/// matching tabs from every space, then matching actions.
+/// matching tabs from every space, then matching actions; before all of
+/// them, for a new tab, a tab or space the text clearly names (`named`).
 pub fn results(mode: CommandMode, query: &str, context: &CommandContext) -> Vec<CommandItem> {
     let query = query.trim();
     let active_id = context.active.as_ref().map(|active| active.id);
@@ -338,6 +431,12 @@ pub fn results(mode: CommandMode, query: &str, context: &CommandContext) -> Vec<
         }
     }];
 
+    // ⌘L edits the tab's own address: Return always loads it.
+    let promoted = (!in_place).then(|| named(query, context)).flatten();
+    let promoted_command = promoted.as_ref().map(|item| item.command.clone());
+    let promoted_tab = matches!(promoted_command, Some(Command::SwitchToTab(_)));
+    items.splice(0..0, promoted);
+
     let words: Vec<String> = query
         .to_lowercase()
         .split_whitespace()
@@ -347,6 +446,7 @@ pub fn results(mode: CommandMode, query: &str, context: &CommandContext) -> Vec<
         .tabs
         .iter()
         .filter(|tab| !(in_place && Some(tab.id) == active_id))
+        .filter(|tab| promoted_command != Some(Command::SwitchToTab(tab.id)))
         .filter_map(|tab| {
             let best = score(&tab.title, &words).max(score(url_text(&tab.url), &words))?;
             Some((best, tab))
@@ -355,12 +455,13 @@ pub fn results(mode: CommandMode, query: &str, context: &CommandContext) -> Vec<
     tabs.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
     items.extend(
         tabs.into_iter()
-            .take(MAX_TABS)
+            .take(MAX_TABS - usize::from(promoted_tab))
             .map(|(_, tab)| switch_item(tab, context)),
     );
 
     let mut actions: Vec<(u32, CommandItem)> = actions(context)
         .into_iter()
+        .filter(|(item, _)| promoted_command.as_ref() != Some(&item.command))
         .filter_map(|(item, keywords)| {
             Some((score(&format!("{} {keywords}", item.title), &words)?, item))
         })
@@ -806,6 +907,76 @@ mod tests {
             &context,
         );
         assert_eq!(same[0].command, Command::Reload);
+    }
+
+    #[test]
+    fn return_switches_to_the_tab_or_space_the_text_names() {
+        let mut context = context();
+        context.tabs.push(tab(
+            13,
+            1,
+            "Inbox (3) - me@gmail.com - Gmail",
+            "https://mail.google.com/mail/u/0/#inbox",
+        ));
+        let top = |query: &str| -> Vec<Command> {
+            let items = results(CommandMode::NewTab, query, &context);
+            commands(&items[..items.len().min(2)])
+        };
+        let search = |query: &str| Command::Open(query.into());
+        // The start of a title, a whole word of one, the start of a host.
+        assert_eq!(top("hacker"), [Command::SwitchToTab(10), search("hacker")]);
+        assert_eq!(top("Hacker  News")[0], Command::SwitchToTab(10));
+        assert_eq!(top("gmail"), [Command::SwitchToTab(13), search("gmail")]);
+        assert_eq!(top("mail")[0], Command::SwitchToTab(13));
+        assert_eq!(top("news")[0], Command::SwitchToTab(10));
+        assert_eq!(top("the rust")[0], Command::SwitchToTab(12));
+        // Another space by its name.
+        assert_eq!(top("work"), [Command::SwitchToSpace(2), search("work")]);
+        // Searches: phrases inside titles, parts of words inside them,
+        // single letters, the tab on screen, the active space, and actions'
+        // words.
+        for query in [
+            "rust lang",
+            "rust gpui",
+            "ews",
+            "google",
+            "h",
+            "arc",
+            "wikipedia",
+            "personal",
+            "go",
+            "space",
+            "switch",
+            "create",
+        ] {
+            assert_eq!(top(query)[0], search(query), "{query}");
+        }
+        // Addresses open, unless an open tab is at that address or, for a
+        // bare host, on that host.
+        assert_eq!(
+            top("github.com"),
+            [Command::SwitchToTab(20), search("github.com")]
+        );
+        assert_eq!(top("https://www.GitHub.com/")[0], Command::SwitchToTab(20));
+        assert_eq!(top("docs.rs/gpui/latest/gpui")[0], Command::SwitchToTab(21));
+        for query in ["github.com/rust-lang", "example.com", "en.wikipedia.org"] {
+            assert_eq!(top(query)[0], search(query), "{query}");
+        }
+        // ⌘L loads what is typed in the tab.
+        assert_eq!(
+            results(CommandMode::EditAddress, "hacker", &context)[0].command,
+            Command::Navigate("hacker".into())
+        );
+        // The row isn't repeated below, and says what Return does.
+        let work = results(CommandMode::NewTab, "work", &context);
+        assert_eq!(work[0].hint, "Switch to Space");
+        let rows = |items: &[CommandItem], command: Command| {
+            items.iter().filter(|item| item.command == command).count()
+        };
+        assert_eq!(rows(&work, Command::SwitchToSpace(2)), 1);
+        let gmail = results(CommandMode::NewTab, "gmail", &context);
+        assert_eq!(gmail[0].hint, "Switch to Tab");
+        assert_eq!(rows(&gmail, Command::SwitchToTab(13)), 1);
     }
 
     #[test]

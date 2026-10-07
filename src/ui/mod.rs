@@ -13,6 +13,7 @@ pub mod redraw;
 mod sidebar;
 pub mod swipe;
 pub mod theme;
+pub mod toast_window;
 pub mod window_frame;
 
 use crate::{Dismiss, app::BrowserApp};
@@ -132,6 +133,7 @@ impl Render for BrowserApp {
         };
         let card = self.card_bounds(viewport);
         self.sync_find_bar(card, window, cx);
+        self.sync_toast_window(card, window, cx);
         let sidebar = self
             .sidebar_width()
             .map(|width| self.render_sidebar(width, &theme, frame, cx));

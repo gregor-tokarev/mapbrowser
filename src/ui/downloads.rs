@@ -1,6 +1,7 @@
 //! This session's downloads (kept in memory only): the progress ring on the
-//! library button, the library's Downloads section and the "Downloaded"
-//! toast. The ring moves only when the engine reports progress.
+//! library button, the library's Downloads section, the "Downloaded"
+//! toast, and the question before quitting cancels unfinished ones. The
+//! ring moves only when the engine reports progress.
 
 use super::{
     icons::{Icon, icon},
@@ -13,8 +14,8 @@ use crate::{
     native,
 };
 use gpui::{
-    Bounds, Context, Div, Hsla, ParentElement, PathBuilder, Pixels, SharedString, Styled, Window,
-    canvas, div, point, px,
+    App, Bounds, Context, Div, Hsla, ParentElement, PathBuilder, Pixels, PromptLevel, SharedString,
+    Styled, Window, WindowHandle, canvas, div, point, px,
 };
 use std::{f32::consts::TAU, path::PathBuf};
 
@@ -65,6 +66,8 @@ impl Download {
 pub struct Downloads {
     /// Newest first.
     items: Vec<Download>,
+    /// Whether the question before quitting is on screen.
+    asking_to_quit: bool,
 }
 
 /// The ring: `start` and `length` in turns, clockwise from 12 o'clock.
@@ -162,6 +165,16 @@ impl Downloads {
     }
 }
 
+/// ⌘Q, Map > Quit Map and the window's close button: quits, but asks first
+/// while files are downloading, as quitting cancels them. Quitting from
+/// outside the app (the Dock's Quit, logging out) doesn't ask.
+pub fn request_quit(window: WindowHandle<BrowserApp>, cx: &mut App) {
+    let asking = window.update(cx, |app, window, cx| app.ask_before_quitting(window, cx));
+    if !asking.unwrap_or(false) {
+        cx.quit();
+    }
+}
+
 /// Sizes as Finder shows them, in decimal units.
 fn file_size(bytes: u64) -> String {
     match bytes {
@@ -181,10 +194,15 @@ impl BrowserApp {
         blank_tab: bool,
         cx: &mut Context<Self>,
     ) {
+        // Without the sidebar's ring, nothing would show it started.
+        if self.sidebar_width().is_none() {
+            self.show_toast(format!("Downloading {name}"), cx);
+        }
         self.downloads.start(id, tab_id, name, path);
         // A link that opened a new tab for a file leaves it blank: close it
-        // (it isn't worth reopening) and go back to the page with the link.
-        // Its browser stays until the download ends.
+        // (it isn't worth reopening) and go back to the page with the link,
+        // in its own space: the window stays in the space on screen. Its
+        // browser stays until the download ends.
         if blank_tab
             && let Some(space) = self
                 .state
@@ -200,10 +218,10 @@ impl BrowserApp {
                 && selected
                 && self.state.space_of_tab(opener) == Some(space_id)
             {
-                self.state.select_tab(space_id, opener);
+                self.state.select_tab_in_space(space_id, opener);
             }
             self.remove_tab(tab_id, cx);
-            self.closed.retain(|closed| closed.tab.id != tab_id);
+            self.state.forget_closed(tab_id);
         }
         if self.downloads_shown() {
             cx.notify();
@@ -244,6 +262,43 @@ impl BrowserApp {
         } else if self.downloads_shown() {
             cx.notify();
         }
+    }
+
+    /// Asks whether to quit while downloads run (a sheet on macOS), and
+    /// quits if so. Returns false when there is nothing to ask.
+    fn ask_before_quitting(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let running = self.downloads.running().count();
+        if running == 0 {
+            return false;
+        }
+        // Asked once: quitting again while it shows does nothing more.
+        if std::mem::replace(&mut self.downloads.asking_to_quit, true) {
+            return true;
+        }
+        let detail = if running == 1 {
+            "Quitting cancels the download that hasn't finished.".to_owned()
+        } else {
+            format!("Quitting cancels the {running} downloads that haven't finished.")
+        };
+        window.activate_window();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Downloads in progress — Quit anyway?",
+            Some(&detail),
+            &["Quit", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            let quit = answer.await == Ok(0);
+            let _ = this.update(cx, |this, cx| {
+                this.downloads.asking_to_quit = false;
+                if quit {
+                    cx.quit();
+                }
+            });
+        })
+        .detach();
+        true
     }
 
     /// Shows a download in Finder, selected.
