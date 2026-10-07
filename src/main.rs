@@ -1,3 +1,4 @@
+mod blocker;
 mod engine;
 mod favicons;
 mod input;
@@ -14,6 +15,7 @@ mod native {
     }
 }
 
+use blocker::ContentBlocker;
 use engine::{Engine, EngineEvent, Shortcut};
 use gpui::http_client::Url;
 use gpui::{prelude::*, *};
@@ -591,7 +593,9 @@ impl BrowserApp {
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let state = BrowserState::load()?;
-    let (engine, events) = Engine::initialize(state.root_dir())?;
+    let blocker = ContentBlocker::load_in_background(state.root_dir().join("blocker"));
+    let (mut engine, events) = Engine::initialize(state.root_dir())?;
+    engine.set_blocker(blocker);
     let engine = Rc::new(RefCell::new(engine));
     let retained_engine = engine.clone();
     let (external_urls_tx, external_urls_rx) = async_channel::unbounded();

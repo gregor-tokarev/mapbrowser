@@ -1,0 +1,32 @@
+EasyList and EasyPrivacy
+========================
+
+Map Browser's built-in content blocker uses two filter lists by
+The EasyList authors (https://easylist.to/):
+
+  EasyList      https://easylist.to/easylist/easylist.txt
+  EasyPrivacy   https://easylist.to/easylist/easyprivacy.txt
+
+They ship unmodified as resources/filters/easylist.txt and
+resources/filters/easyprivacy.txt in the source repository, and as
+Contents/Resources/filters/ in the app bundle.
+
+Fetched: 2026-10-07 02:53 UTC
+List version: 202610070240 (last modified 07 Oct 2026 02:40 UTC,
+commit 5826a01119b8769f86ed191181537914362f000c)
+
+Licence
+-------
+
+The EasyList authors dual-license these lists under the GNU General Public
+License version 3 or later and the Creative Commons Attribution-ShareAlike 3.0
+Unported licence or later (https://easylist.to/pages/licence.html).
+Map Browser uses them under CC BY-SA 3.0:
+
+  https://creativecommons.org/licenses/by-sa/3.0/
+  https://creativecommons.org/licenses/by-sa/3.0/legalcode
+
+The lists are separate data files that the app reads at run time; they are not
+part of Map Browser's program code. The app compiles them into a rule cache on
+the user's computer (blocker/engine-*.dat in the app's data directory). That compiled form is an adaptation of the lists and is likewise
+available under CC BY-SA 3.0.

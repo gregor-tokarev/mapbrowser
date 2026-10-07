@@ -1,7 +1,10 @@
 //! Chromium runs in native child NSViews. Pages keep their own compositor and
 //! process lifetime; GPUI only draws the browser controls.
 
+mod blocking;
+
 use super::{EngineEvent, Modifiers, merge_features, progress_worth_reporting, shortcut_for_key};
+use crate::blocker::ContentBlocker;
 use crate::native::CornerCaps;
 use anyhow::{Context, Result, bail, ensure};
 use async_channel::{Receiver, Sender};
@@ -495,6 +498,7 @@ pub struct Engine {
     fullscreen_layout: bool,
     width: f64,
     height: f64,
+    blocker: ContentBlocker,
 }
 
 impl Engine {
@@ -606,6 +610,7 @@ impl Engine {
                 fullscreen_layout: false,
                 width: 800.,
                 height: 600.,
+                blocker: ContentBlocker::default(),
             },
             receiver,
         ))
@@ -725,10 +730,22 @@ impl Engine {
             persist_session_cookies: 1,
             ..Default::default()
         };
-        let context = request_context_create_context(Some(&settings), None)
+        let mut blocking = blocking::request_context_handler(self.blocker.clone());
+        let context = request_context_create_context(Some(&settings), Some(&mut blocking))
             .context("Could not create the space's Chromium profile")?;
         self.contexts.insert(space_id, context.clone());
         Ok(context)
+    }
+
+    /// Spaces opened before this call browse without blocking.
+    pub fn set_blocker(&mut self, blocker: ContentBlocker) {
+        self.blocker = blocker;
+    }
+
+    /// Takes page hosts as persisted; subdomains are covered too.
+    #[allow(dead_code)] // Wired up by the per-site toggle.
+    pub fn set_blocking_exceptions(&self, hosts: HashSet<String>) {
+        self.blocker.set_exceptions(hosts);
     }
 
     pub fn register_pending(&mut self) {

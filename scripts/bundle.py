@@ -178,6 +178,18 @@ def run(*args):
     subprocess.run(args, cwd=ROOT, check=True)
 
 
+def copy_filter_lists(resources):
+    """Bundle the content-blocking lists, replacing any from earlier builds."""
+    lists = sorted((ROOT / "resources" / "filters").glob("*.txt"))
+    if not lists:
+        raise SystemExit("Missing content-blocking lists in resources/filters.")
+    destination = resources / "filters"
+    shutil.rmtree(destination, ignore_errors=True)
+    destination.mkdir()
+    for path in lists:
+        shutil.copy2(path, destination / path.name)
+
+
 def write_plist(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as f:
@@ -230,6 +242,7 @@ def main():
     shutil.copy2(credits, contents / "Resources" / "CREDITS.html")
     if (ROOT / "licenses").is_dir():
         shutil.copytree(ROOT / "licenses", contents / "Resources" / "licenses", dirs_exist_ok=True)
+    copy_filter_lists(contents / "Resources")
     shutil.copy2(profile / "mapbrowser", macos / "mapbrowser")
     destination = frameworks / FRAMEWORK
     # rsync updates binaries and preserves framework symlinks on repeat builds.

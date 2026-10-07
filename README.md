@@ -29,6 +29,10 @@ Switching spaces keeps opened pages alive. Chromium can apply its normal backgro
 
 State lives in `~/Library/Application Support/MapBrowser` unless `MAPBROWSER_DATA_DIR` is set. Spaces, tab URLs, and selections restore on launch. Cookies and site storage persist in separate profile directories. In-page navigation history is not restored across application restarts.
 
+## Ad and tracker blocking
+
+Map Browser blocks ads and trackers by default, so ad-heavy sites use less battery, CPU, and data. A page you open is never blocked itself; only the ads and trackers it loads are. Blocking uses the EasyList and EasyPrivacy filter lists by [The EasyList authors](https://easylist.to/), included under [CC BY-SA 3.0](licenses/EasyList-CC-BY-SA-3.0.txt), and Brave's [adblock-rust](licenses/adblock-rust-MPL-2.0.txt). The lists update with the app; this version does not download list updates.
+
 ## macOS Keychain
 
 The bundled CEF 152 runtime may ask to access the existing **Chromium Safe Storage** Keychain item. Chromium uses its secret to encrypt stored browser data. Each space has a separate profile, but the runtime uses the same encryption key name across profiles and other applications using that default.

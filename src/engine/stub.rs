@@ -4,10 +4,16 @@
 //! progress, navigation buttons, closing) behave as they do on macOS.
 
 use super::EngineEvent;
+use crate::blocker::ContentBlocker;
 use anyhow::Result;
 use async_channel::{Receiver, Sender};
 use gpui::http_client::Url;
-use std::{cell::RefCell, collections::HashMap, ffi::c_void, path::Path};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    ffi::c_void,
+    path::Path,
+};
 
 /// Methods mirror the macOS engine; `allow(dead_code)` marks those this
 /// platform's shell never calls.
@@ -74,6 +80,9 @@ impl Engine {
         Ok(())
     }
 
+    pub fn set_blocker(&mut self, _blocker: ContentBlocker) {}
+    #[allow(dead_code)]
+    pub fn set_blocking_exceptions(&self, _hosts: HashSet<String>) {}
     pub fn register_pending(&mut self) {}
     pub fn activate_tab(&mut self, _tab_id: u64) {}
     pub fn set_bounds(&mut self, _x: f64, _y: f64, _width: f64, _height: f64) {}

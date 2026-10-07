@@ -5,6 +5,9 @@ edition = "2024"
 default-run = "mapbrowser"
 
 [dependencies]
+# Pinned because the cached engine format is keyed by this version (src/blocker.rs).
+# Without `single-thread` the engine is Send + Sync for Chromium's IO thread.
+adblock = { version = "=0.13.3", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
 anyhow = "1"
 async-channel = "2"
 dirs = "6"
@@ -37,3 +40,9 @@ gpui = { path = "vendor/gpui" }
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+# Debug adblock re-checks its whole rule index on every lookup (milliseconds per
+# request). Debug bundles match on Chromium's IO thread, so build it optimized.
+[profile.dev.package.adblock]
+opt-level = 3
+debug-assertions = false
