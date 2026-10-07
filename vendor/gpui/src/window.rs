@@ -1773,7 +1773,8 @@ impl Window {
     /// Returns whether this window is considered to be the window
     /// that currently owns the mouse cursor.
     /// On mac, this is `is_window_active`, unless the pointer is over a
-    /// native subview, which sets its own cursor.
+    /// native subview, which sets its own cursor. Outside the window it
+    /// is, so leaving it resets the cursor to the arrow.
     pub fn is_window_hovered(&self) -> bool {
         if cfg!(any(
             target_os = "windows",

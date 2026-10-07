@@ -1,4 +1,4 @@
-//! View menu commands for a tab's page: zoom and developer tools.
+//! Menu commands for a tab's page: zoom, printing and developer tools.
 
 use super::{BrowserLink, Engine, popups};
 use crate::engine::{ZoomStep, zoom_percent};
@@ -15,6 +15,14 @@ impl Engine {
             ZoomStep::Reset => ZoomCommand::RESET,
         });
         Some(zoom_percent(host.zoom_level()))
+    }
+
+    /// Opens the system print panel for the page, as File > Print… or a
+    /// page's `window.print()` does.
+    pub fn print(&self, tab_id: u64) {
+        if let Some(host) = self.live_browser(tab_id).and_then(|browser| browser.host()) {
+            host.print();
+        }
     }
 
     /// Opens the page's developer tools in a window of their own, or closes

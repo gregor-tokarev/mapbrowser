@@ -8,13 +8,15 @@
 //! loads away from the opener's tab, and quitting waits for them to close.
 //! DevTools windows are tracked the same way.
 
-use super::{BrowserLink, TabMenu, TabRequests, browser_view, page_keys::PageKeys, request_tab};
+use super::{
+    BrowserLink, TabRequests, browser_view, context_menu::TabMenu, page_keys::PageKeys, request_tab,
+};
 use crate::engine::{NewWindow, ScreenRect, WindowRequest, new_window_for, popup_rect};
 use cef::*;
 use objc2::{MainThreadMarker, rc::Retained};
 use objc2_app_kit::{NSScreen, NSView, NSWindow};
 use objc2_foundation::NSString;
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, atomic::Ordering};
 
 /// Decides `on_before_popup` for the tab `link` stands for, or for one of
 /// its popups: true cancels the popup.
@@ -134,8 +136,9 @@ fn popup_client(link: BrowserLink) -> Client {
         PopupLife::new(link.clone()),
         PageKeys::new(link.clone(), true),
         Some(PopupDisplay::new()),
-        Some(TabRequests::new(link.clone())),
-        Some(TabMenu::new(link)),
+        // Their loads show nowhere: the tab's page state isn't theirs.
+        Some(TabRequests::new(link.clone(), Arc::default())),
+        Some(TabMenu::new(link, true)),
     )
 }
 

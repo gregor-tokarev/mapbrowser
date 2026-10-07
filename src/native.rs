@@ -467,6 +467,26 @@ pub fn detach_child_window(parent: &NSView, child: &NSView) {
     }
 }
 
+/// Shows the GPUI pop-up window holding `child` as an overlay of `parent`'s
+/// window: attached as by `attach_child_window`, directly above it, and
+/// transparent to the pointer, which reaches the page beneath. Hidden, it is
+/// detached and ordered out, so it costs nothing until shown again.
+pub fn show_overlay_window(parent: &NSView, child: &NSView, shown: bool) {
+    let (Some(parent_window), Some(window)) = (parent.window(), child.window()) else {
+        return;
+    };
+    if shown {
+        window.setIgnoresMouseEvents(true);
+        attach_child_window(parent, child);
+        // Only above the browser window: windows in front of it (a sign-in
+        // popup) stay in front.
+        window.orderWindow_relativeTo(NSWindowOrderingMode::Above, parent_window.windowNumber());
+    } else {
+        detach_child_window(parent, child);
+        window.orderOut(None);
+    }
+}
+
 /// Moves the child window holding `child` so its top-left corner is at
 /// `point` in `parent` (top-left origin, as GPUI measures).
 pub fn place_child_window(parent: &NSView, child: &NSView, point: NSPoint) {

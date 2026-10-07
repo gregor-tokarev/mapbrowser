@@ -4,6 +4,7 @@
 
 #[cfg(target_os = "macos")]
 mod mac;
+pub mod page;
 #[cfg(target_os = "macos")]
 pub use mac::Engine;
 
@@ -46,9 +47,9 @@ pub enum Shortcut {
     NextSpace,
     /// ⌘R
     Reload,
-    /// ⌘[
+    /// ⌘[ or ⌘←
     Back,
-    /// ⌘]
+    /// ⌘] or ⌘→
     Forward,
     /// ⌘S
     ToggleSidebar,
@@ -74,6 +75,8 @@ pub enum Shortcut {
     FindNext,
     /// ⇧⌘G
     FindPrevious,
+    /// ⌘P: print the page.
+    Print,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -237,6 +240,12 @@ pub enum EngineEvent {
     /// just before that document's `Address`.
     NewDocument {
         tab_id: u64,
+    },
+    /// The address of the link under the pointer (or keyboard focus) in
+    /// the tab's page, shortened in the middle; empty once there is none.
+    Status {
+        tab_id: u64,
+        text: String,
     },
 }
 
@@ -466,6 +475,7 @@ pub fn shortcut_for_key(
         (true, false, false, true, Some('g')) => Some(Shortcut::FindPrevious),
         (true, false, true, false, Some('i')) => Some(Shortcut::DevTools),
         (true, false, false, false, Some('.')) => Some(Shortcut::Stop),
+        (true, false, false, false, Some('p')) => Some(Shortcut::Print),
         // "+" needs ⇧ on many layouts, where ⌘= means the same.
         (true, false, false, _, Some('=' | '+')) => Some(Shortcut::ZoomIn),
         (true, false, false, false, Some('-')) => Some(Shortcut::ZoomOut),
@@ -482,8 +492,10 @@ pub fn shortcut_for_key(
         (true, false, true, false, 126) => Shortcut::PreviousTabInList,
         (true, false, true, false, 123) => Shortcut::PreviousSpace,
         (true, false, true, false, 124) => Shortcut::NextSpace,
-        (true, false, false, false, 33) => Shortcut::Back,
-        (true, false, false, false, 30) => Shortcut::Forward,
+        // ⌘← and ⌘→ as in Chrome and Arc. Pages get them first, so text
+        // fields keep moving the caret to the line's start or end.
+        (true, false, false, false, 33 | 123) => Shortcut::Back,
+        (true, false, false, false, 30 | 124) => Shortcut::Forward,
         // kVK_ANSI_0, like the digits for layouts that type no "0" there.
         (true, false, false, false, 29) => Shortcut::ZoomReset,
         (true, false, false, false, _) => Shortcut::SelectTab(digit?),
@@ -763,6 +775,9 @@ mod tests {
             (us('r'), COMMAND, Shortcut::Reload),
             ((33, Some('[')), COMMAND, Shortcut::Back),
             ((30, Some(']')), COMMAND, Shortcut::Forward),
+            ((123, None), COMMAND, Shortcut::Back),
+            ((124, None), COMMAND, Shortcut::Forward),
+            (us('p'), COMMAND, Shortcut::Print),
             (us('s'), COMMAND, Shortcut::ToggleSidebar),
             (us('d'), COMMAND, Shortcut::TogglePin),
             (us('c'), SHIFT_COMMAND, Shortcut::CopyUrl),
@@ -902,6 +917,7 @@ mod tests {
             ('g', COMMAND),
             ('g', SHIFT_COMMAND),
             ('i', OPTION_COMMAND),
+            ('p', COMMAND),
         ] {
             assert_eq!(reserved(letter, modifiers), Some(false), "{letter}");
         }
@@ -917,6 +933,37 @@ mod tests {
                 shortcut_for_key(key, Some(character), COMMAND).map(Shortcut::reserved),
                 Some(false),
                 "{character}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_command_arrows_go_back_and_forward() {
+        // ⇧⌘← selects to the line's start; ⌃⌘← and ⌘↑ are the system's.
+        for (key, modifiers) in [
+            (123, SHIFT_COMMAND),
+            (124, SHIFT_COMMAND),
+            (
+                123,
+                Modifiers {
+                    control: true,
+                    ..COMMAND
+                },
+            ),
+            (126, COMMAND),
+            (125, COMMAND),
+        ] {
+            assert_eq!(shortcut_for_key(key, None, modifiers), None, "{key}");
+        }
+        assert_eq!(
+            shortcut_for_key(123, None, OPTION_COMMAND),
+            Some(Shortcut::PreviousSpace)
+        );
+        // Pages get them first, as the caret moves with them in text fields.
+        for key in [123, 124] {
+            assert_eq!(
+                shortcut_for_key(key, None, COMMAND).map(Shortcut::reserved),
+                Some(false)
             );
         }
     }

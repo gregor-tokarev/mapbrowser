@@ -1539,8 +1539,10 @@ impl PlatformWindow for MacWindow {
     }
 
     /// Whether the pointer is over this view itself rather than a native
-    /// subview (an embedded web view), which sets its own cursor. See
-    /// Window::is_window_hovered.
+    /// subview (an embedded web view), which sets its own cursor. Outside
+    /// the view (`hitTest:` finds nothing) the cursor is GPUI's to reset, as
+    /// upstream does, so a hand or I-beam doesn't stay once the pointer
+    /// leaves. See Window::is_window_hovered.
     fn is_hovered(&self) -> bool {
         let lock = self.0.lock();
         unsafe {
@@ -1549,7 +1551,7 @@ impl PlatformWindow for MacWindow {
             let location = lock.native_window.mouseLocationOutsideOfEventStream();
             let location: NSPoint = msg_send![superview, convertPoint: location fromView: nil];
             let hit: id = msg_send![view, hitTest: location];
-            hit == view
+            hit.is_null() || hit == view
         }
     }
 

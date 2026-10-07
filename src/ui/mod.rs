@@ -7,6 +7,7 @@ pub mod downloads;
 pub mod drag;
 pub mod find_bar;
 pub mod icons;
+pub mod link_status;
 pub mod menu;
 pub mod permissions;
 pub mod redraw;
@@ -134,6 +135,7 @@ impl Render for BrowserApp {
         let card = self.card_bounds(viewport);
         self.sync_find_bar(card, window, cx);
         self.sync_toast_window(card, window, cx);
+        self.sync_link_status(card, window, cx);
         let sidebar = self
             .sidebar_width()
             .map(|width| self.render_sidebar(width, &theme, frame, cx));

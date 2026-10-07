@@ -40,12 +40,15 @@ Your tabs live in a sidebar instead of across the top. Group them into spaces, o
 | `⌃Tab` | Back to the tab you were on. Hold `⌃` and press `Tab` again to go further back; the sidebar outlines the tab you'll get |
 | `⌥⌘↑` / `⌥⌘↓` | Previous or next tab in the sidebar |
 | `⌘R` | Reload |
-| `⌘[` / `⌘]` | Back and forward |
+| `⌘[` / `⌘]` or `⌘←` / `⌘→` | Back and forward |
 | `⇧⌘C` | Copy the address |
 | `⌘F` | Find on the page |
 | `⌘+` / `⌘−` / `⌘0` | Zoom in, out, or back to actual size |
+| `⌘P` | Print the page |
 
-Web apps keep their own shortcuts: in an editor such as VS Code for the web or Google Docs, keys like `⇧⌘K`, `⌘[` or `⌘F` do what the app says. Opening, closing and switching tabs and spaces always works.
+Web apps keep their own shortcuts: in an editor such as Figma, VS Code for the web or Google Docs, keys like `⌘Z`, `⌘A`, `⇧⌘K`, `⌘[` or `⌘F` do what the app says. Opening, closing and switching tabs and spaces always works.
+
+Point at a link to see where it goes, at the bottom left of the page. Right-click a link or an image to open it in a new tab, save it to Downloads or copy its address, or selected text to search Google for it.
 
 Drag the sidebar's edge to resize it; double-click the edge to reset it. With the sidebar hidden, short messages such as "Copied URL" or the zoom level appear briefly at the bottom left of the page. The shield beside the address turns ad and tracker blocking off for that site.
 

@@ -6,7 +6,8 @@
 //! Addresses containing "download-demo" download a file instead (one with
 //! "fail" fails halfway), and pages whose address contains
 //! "permission-demo" ask to use the camera and microphone ("location" or
-//! "notifications" in the address ask for those).
+//! "notifications" in the address ask for those). On pages whose address
+//! contains "status-demo" the pointer rests on a long link.
 
 use super::{EngineEvent, Permission, PermissionDecision, ZoomStep, step_zoom};
 use crate::blocker::ContentBlocker;
@@ -222,6 +223,9 @@ impl Engine {
 
     pub fn toggle_dev_tools(&self, _tab_id: u64) {}
 
+    /// Previews have no print panel.
+    pub fn print(&self, _tab_id: u64) {}
+
     /// Previews have no page text: matches are counted in the page's
     /// stand-in title and address, so the find bar shows real numbers.
     pub fn find(&self, tab_id: u64, text: &str, forward: bool, find_next: bool) {
@@ -329,6 +333,9 @@ impl Engine {
         };
         let title = page_title(&url);
         let asks = url.contains("permission-demo").then(|| url.clone());
+        let hovered = url.contains("status-demo").then(|| {
+            format!("{url}/2026/10/the-quick-brown-fox-jumps-over-the-lazy-dog?utm_source=newsletter&utm_medium=email")
+        });
         self.send(loading(true));
         self.send(EngineEvent::NewDocument { tab_id });
         self.send(EngineEvent::Address { tab_id, url });
@@ -337,6 +344,9 @@ impl Engine {
             self.send(EngineEvent::Progress { tab_id, progress });
         }
         self.send(loading(false));
+        if let Some(text) = hovered {
+            self.send(EngineEvent::Status { tab_id, text });
+        }
         if let Some(url) = asks {
             self.request_permissions(tab_id, &url);
         }
@@ -442,6 +452,8 @@ impl Engine {
     pub fn detach_child_window(&self, _child_view: *mut c_void) {}
     #[allow(dead_code)]
     pub fn place_child_window(&self, _child_view: *mut c_void, _x: f64, _y: f64) {}
+    #[allow(dead_code)]
+    pub fn show_overlay_window(&self, _child_view: *mut c_void, _shown: bool) {}
 }
 
 #[cfg(test)]

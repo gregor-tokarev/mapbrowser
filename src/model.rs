@@ -978,12 +978,16 @@ fn newer_schema() -> io::Error {
     )
 }
 
+/// Unique within this process even when two threads ask in the same
+/// nanosecond, and across processes through the pid.
 fn unique_suffix() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("{}-{timestamp}", std::process::id())
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{timestamp}-{count}", std::process::id())
 }
 
 fn quarantine(path: &Path) -> io::Result<()> {
@@ -1167,7 +1171,8 @@ fn web_address(input: &str) -> Option<String> {
     None
 }
 
-fn search_url(input: &str) -> String {
+/// A Google search for `input`.
+pub fn search_url(input: &str) -> String {
     let mut query = String::new();
     for byte in input.bytes() {
         match byte {

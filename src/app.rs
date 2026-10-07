@@ -16,6 +16,7 @@ use crate::{
         downloads::Downloads,
         drag::{self, DropZones, TabDrag},
         find_bar::Find,
+        link_status::LinkStatus,
         menu::{MenuKind, OpenMenu},
         permissions::PermissionPrompts,
         redraw::{self, Drawn},
@@ -126,6 +127,7 @@ pub struct BrowserApp {
     pub find: Find,
     /// The toast over the card while the sidebar is hidden.
     pub(crate) toast_window: Option<ToastWindow>,
+    pub link_status: LinkStatus,
 }
 
 /// OS open-URL events are web addresses, never address-bar search queries.
@@ -230,6 +232,7 @@ impl BrowserApp {
             window_frame: WindowFrame::default(),
             find: Find::default(),
             toast_window: None,
+            link_status: LinkStatus::default(),
         };
         this._subscriptions.extend([
             cx.subscribe_in(
@@ -1374,6 +1377,11 @@ impl BrowserApp {
             Shortcut::Find => self.find_in_page(window, cx),
             Shortcut::FindNext => self.find_again(true, window, cx),
             Shortcut::FindPrevious => self.find_again(false, window, cx),
+            Shortcut::Print => {
+                if let Some(id) = active {
+                    self.engine.borrow().print(id);
+                }
+            }
         }
     }
 
@@ -1467,13 +1475,15 @@ impl BrowserApp {
                     return;
                 }
                 let page = self.pages.entry(tab_id).or_default();
+                let changed = (page.loading, page.can_go_back, page.can_go_forward)
+                    != (loading, can_go_back, can_go_forward);
                 if loading && !page.loading {
                     page.progress = 0.;
                 }
                 page.loading = loading;
                 page.can_go_back = can_go_back;
                 page.can_go_forward = can_go_forward;
-                if self.drawn(tab_id).status {
+                if changed && self.drawn(tab_id).status {
                     cx.notify();
                 }
             }
@@ -1481,8 +1491,10 @@ impl BrowserApp {
                 if !self.loaded.contains(&tab_id) {
                     return;
                 }
-                self.pages.entry(tab_id).or_default().progress = progress;
-                if self.drawn(tab_id).status {
+                let page = self.pages.entry(tab_id).or_default();
+                page.progress = progress;
+                // The bar shows only while the page loads.
+                if page.loading && self.drawn(tab_id).status {
                     cx.notify();
                 }
             }
@@ -1493,7 +1505,9 @@ impl BrowserApp {
                     .tabs
                     .iter()
                     .any(|tab| host_of(&tab.url).as_deref() == Some(&host));
-                if self.favicons.store(&host, png) && shown && self.sidebar_width().is_some() {
+                let changed = self.favicons.store(&host, png);
+                self.favicons.release_replaced(cx);
+                if changed && shown && self.sidebar_width().is_some() {
                     cx.notify();
                 }
             }
@@ -1595,6 +1609,7 @@ impl BrowserApp {
             } => self.permission_requested(id, tab_id, origin, permissions, window, cx),
             EngineEvent::PermissionDismissed { id } => self.permission_dismissed(id, cx),
             EngineEvent::NewDocument { tab_id } => self.page_replaced(tab_id, cx),
+            EngineEvent::Status { tab_id, text } => self.show_link_status(tab_id, text, window, cx),
         }
     }
 
