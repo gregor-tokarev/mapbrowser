@@ -952,13 +952,36 @@ fn web_address(input: &str) -> Option<String> {
             .to_ascii_lowercase();
         let local = host == "localhost"
             || host.ends_with(".localhost")
+            || host.ends_with(".local")
             || host == "127.0.0.1"
             || host == "0.0.0.0"
             || server.starts_with("[::1]");
         if local {
             return Some(format!("http://{schemeless}"));
         }
-        if host.contains('.') || server.starts_with('[') {
+        let has_path = schemeless[authority.len()..].starts_with('/');
+        // "me@example.com" is an email address to search for; a login
+        // has a password or comes with a path.
+        if authority
+            .rsplit_once('@')
+            .is_some_and(|(userinfo, _)| !userinfo.contains(':'))
+            && !has_path
+        {
+            return None;
+        }
+        let has_port = server
+            .split_once(':')
+            .is_some_and(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()));
+        // Dotted words ("node.js", "e.g.") are searched unless they end in
+        // a real domain suffix or come with a path or port.
+        let known_suffix = || {
+            psl::suffix(host.trim_end_matches('.').as_bytes())
+                .is_some_and(|suffix| suffix.is_known())
+        };
+        if server.starts_with('[')
+            || host.parse::<std::net::Ipv4Addr>().is_ok()
+            || (host.contains('.') && (has_path || has_port || known_suffix()))
+        {
             return Some(format!("https://{schemeless}"));
         }
     }
@@ -1711,6 +1734,25 @@ mod tests {
             ("rust gpui", "https://www.google.com/search?q=rust+gpui"),
             ("a&b c?", "https://www.google.com/search?q=a%26b+c%3F"),
             ("café", "https://www.google.com/search?q=caf%C3%A9"),
+            // Real domain suffixes, addresses, ports and paths open.
+            ("foo.dev", "https://foo.dev"),
+            ("Docs.RS/gpui", "https://Docs.RS/gpui"),
+            ("bücher.de", "https://bücher.de"),
+            ("user.github.io", "https://user.github.io"),
+            ("example.com.", "https://example.com."),
+            ("localhost:8000", "http://localhost:8000"),
+            ("raspberrypi.local", "http://raspberrypi.local"),
+            ("192.168.1.1", "https://192.168.1.1"),
+            ("intranet.corp/wiki", "https://intranet.corp/wiki"),
+            ("build.internal:8080", "https://build.internal:8080"),
+            // Dotted words and email addresses are searched.
+            ("node.js", "https://www.google.com/search?q=node.js"),
+            ("next.js", "https://www.google.com/search?q=next.js"),
+            ("e.g.", "https://www.google.com/search?q=e.g."),
+            (
+                "me@gmail.com",
+                "https://www.google.com/search?q=me%40gmail.com",
+            ),
         ] {
             assert_eq!(normalize_address(input), expected, "input: {input}");
             assert_eq!(
