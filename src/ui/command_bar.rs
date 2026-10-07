@@ -765,9 +765,9 @@ impl Render for CommandBar {
             .when(TRANSPARENT, |panel| {
                 panel.shadow(vec![shadow(16., 48., 0.2), shadow(0., 1., 0.12)])
             })
-            .when(!TRANSPARENT, |panel| {
-                panel.border_1().border_color(theme.ink(0.12))
-            })
+            // A hairline keeps the panel apart from a page of the same tone.
+            .border_1()
+            .border_color(theme.ink(0.12))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 div()

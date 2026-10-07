@@ -192,9 +192,9 @@ impl Render for FindBar {
             .when(TRANSPARENT, |panel| {
                 panel.shadow(vec![shadow(4., 14., 0.16), shadow(0., 1., 0.12)])
             })
-            .when(!TRANSPARENT, |panel| {
-                panel.border_1().border_color(theme.ink(0.12))
-            })
+            // A hairline keeps the panel apart from a page of the same tone.
+            .border_1()
+            .border_color(theme.ink(0.12))
             .child(icon(Icon::Search, 14., theme.ink(0.45)))
             .child(
                 div()

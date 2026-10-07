@@ -426,15 +426,22 @@ pub fn set_traffic_lights_hidden(view: &NSView, hidden: bool) {
 /// of `parent`'s window. It then stays directly above the browser window at
 /// normal level, moves with it, and lives only on its Space, instead of
 /// floating above every application on every Space.
-pub fn attach_child_window(parent: &NSView, child: &NSView) {
-    let (Some(parent), Some(child)) = (parent.window(), child.window()) else {
+pub fn attach_child_window(parent: &NSView, child_view: &NSView) {
+    let (Some(parent), Some(child)) = (parent.window(), child_view.window()) else {
         return;
     };
     if child.parentWindow().is_some() {
         return;
     }
+    let was_key = child.isKeyWindow();
     // GPUI's panel class can still become key, which the text field needs.
     child.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
+    // Leaving the titled style swaps the window's frame view, and with it the
+    // first responder: keys went to the window itself and typing did nothing.
+    child.makeFirstResponder(Some(child_view));
+    // GPUI draws the panel's shadow in the window's transparent margin; a
+    // window shadow would trace a hard outline around that margin.
+    child.setHasShadow(false);
     for kind in [
         NSWindowButton::CloseButton,
         NSWindowButton::MiniaturizeButton,
@@ -451,6 +458,9 @@ pub fn attach_child_window(parent: &NSView, child: &NSView) {
     // SAFETY: Both windows are alive (retained above) and distinct; AppKit
     // keeps its own reference to the child until it is removed.
     unsafe { parent.addChildWindow_ordered(&child, NSWindowOrderingMode::Above) };
+    if was_key {
+        child.makeKeyWindow();
+    }
 }
 
 /// Detaches a window attached with `attach_child_window`. Call before the
