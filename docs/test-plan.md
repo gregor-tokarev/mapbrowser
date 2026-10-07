@@ -54,3 +54,47 @@ Use identical numbers of profiles and tabs when the browser supports them. A sin
 Warm each workload for two minutes, sample it for at least five minutes, and repeat each run three times in a different order. Use the same sampling tool for every browser. The heartbeat fixture deliberately creates ongoing network and timer activity, so report it separately from the quiet baseline.
 
 For battery comparison, run a fixed workload for a longer period with the machine unplugged and the same starting charge range. Record elapsed time, battery percentage, and the operating system's energy observations. Longer repeated runs reduce the effect of coarse battery percentage readings. Where available, use Instruments energy profiling to investigate wakeups and CPU or GPU activity. Never describe short CPU/RSS samples as proof that Mapbrowser drains less battery than Arc or matches Chrome. A result remains provisional until repeated battery or energy measurements support it.
+
+## Arc redesign checks on a Mac
+
+The redesign was built on a machine without macOS: it type-checks for macOS and its interface was exercised in the Linux preview, but none of the native behaviour below has run yet. Check each item on a release build with a fresh data directory, then with a copy of an existing one (schema 1 sessions migrate to schema 2).
+
+### Window and sidebar
+
+1. Traffic lights sit at the top left, centred on the navigation row, fully visible and clickable. ⌘S hides the sidebar and the traffic lights together, and brings both back.
+2. The sidebar toggle, back, forward and reload buttons respond to clicks even though they overlap the native titlebar strip. Back and forward dim when unavailable.
+3. Dragging empty sidebar space moves the window. Double-clicking empty sidebar space opens the command bar.
+4. Hover highlights, close buttons, Clear and tooltips appear in the sidebar while a web page has keyboard focus.
+5. The page card's corners are rounded with no light or dark notches, in light and dark appearance, mid-way through a space switch, and after a theme change. Clicks and scrolls in the card's corners reach the page.
+6. During a space switch the sliding pages stay inside the card and never cover the sidebar.
+7. Dragging the sidebar edge resizes it smoothly and the page follows; double-clicking the edge resets it; the width survives a restart.
+8. A two-finger sideways swipe on the sidebar switches space once per gesture, in the expected direction with natural scrolling on. Vertical scrolling of a long tab list still works.
+9. Drag and drop moves tabs within and between favorites, pinned and Today. Dropping over the page cancels.
+
+### Command bar
+
+1. ⌘T opens the command bar over the page, focused and accepting typing. ⌘T or Esc closes it; so does a click on the page or sidebar. It moves with the window and appears on the right display.
+2. ⌘L opens it with the full address selected. Return on the unchanged address reloads; an edited address navigates.
+3. Results: typing a domain opens it, a phrase searches, an open tab in another space switches to that space and tab, and actions run.
+
+### Pages and tabs
+
+1. Only the visible tab loads at launch; selecting another tab loads it with its saved title and favicon shown meanwhile.
+2. ⌘-click, middle-click and ⇧-click on links open background or foreground tabs and leave the current page alone. `target=_blank` links open tabs. A link's context menu offers Open Link in New Tab and Copy Link Address.
+3. Favicons appear after a page loads and on unloaded tabs after a restart.
+4. The loading bar above the card moves during loads and disappears afterwards.
+5. ⌘W on a pinned tab or favorite unloads it and keeps it in the sidebar. ⌘W on a Today tab removes it; ⇧⌘T restores it in the same space.
+6. HTML fullscreen video fills the screen without the sidebar or card corners, and Esc returns to the normal layout. Leaving window fullscreen by other means also restores it.
+7. Keyboard shortcuts work both with the page focused and with the sidebar focused, including on AZERTY, Dvorak and Russian layouts: ⌘Z undoes in a web form, ⌘W closes the tab, ⌘Q quits, ⌘A selects all.
+8. Closing the window with the red button saves the latest tab changes, like ⌘Q.
+
+### Blocking and Chromium switches
+
+1. With `MAPBROWSER_TRACE_CEF=1 make dev`, the log reports the content blocker as ready.
+2. With `MAPBROWSER_DEBUG_PORT` set, a news site's ad and tracker requests fail in DevTools, ad slots stay empty rather than showing error pages, and typing an ad domain in the address still opens it.
+3. The shield beside the address turns blocking off for the site and its subdomains after a reload, and back on.
+4. `chrome://version` shows `--disable-background-networking`, `disable-features` with CEF's own entries (GlicActorUi, AutofillActorMode, LensOverlay, KillOnInvalidNavigationHeaders) plus CPUMeasurementInFreezingPolicy, MemoryMeasurementInFreezingPolicy, MediaRouter, NetworkTimeServiceQuerying and AutofillServerCommunication, and `enable-features` with BatterySaverModeAlignWakeUps.
+
+### Energy
+
+Follow the measuring section of [energy design](energy.md). The first check is the idle one: with one quiet page visible, the main process should show no periodic wakeups.
