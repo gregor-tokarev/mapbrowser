@@ -134,7 +134,7 @@ impl BrowserApp {
                     .overflow_y_scroll()
                     .children(space.tabs.iter().map(|tab| {
                         let id = tab.id;
-                        let selected = id == space.selected_tab_id;
+                        let selected = Some(id) == space.selected_tab_id;
                         let blank = tab.url == "about:blank";
                         let loading = self.loading.contains(&id);
                         div()
@@ -334,7 +334,7 @@ impl BrowserApp {
 impl Render for BrowserApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.state.active_space().clone();
-        let tab = self.state.active_tab().clone();
+        let tab = self.state.active_tab().cloned();
         let accent = self.accent(active.id);
         let mut outgoing = None;
         let mut incoming_offset = 0.;
@@ -351,8 +351,8 @@ impl Render for BrowserApp {
             direction = if slide.direction < 0 { -1. } else { 1. };
             if linear < 1. {
                 native_transition = Some((
-                    slide.from.selected_tab_id,
-                    active.selected_tab_id,
+                    slide.from.selected_tab_id.unwrap_or(0),
+                    active.selected_tab_id.unwrap_or(0),
                     progress,
                     slide.direction,
                 ));
@@ -378,8 +378,12 @@ impl Render for BrowserApp {
         }
         let content_width = (f32::from(window.viewport_size().width) - SIDEBAR - 8.).max(0.);
         let engine = self.engine.clone();
-        let selected_tab_id = active.selected_tab_id;
-        let is_blank = tab.url == "about:blank";
+        // The engine hides every page for an unknown id; 0 is never a tab id.
+        let selected_tab_id = active.selected_tab_id.unwrap_or(0);
+        let is_blank = tab.as_ref().is_none_or(|tab| tab.url == "about:blank");
+        let loading = tab
+            .as_ref()
+            .is_some_and(|tab| self.loading.contains(&tab.id));
         let has_outgoing = outgoing.is_some();
         let incoming_welcome = is_blank.then(|| {
             self.welcome(
@@ -394,11 +398,9 @@ impl Render for BrowserApp {
         });
         let outgoing_welcome = outgoing.as_ref().and_then(|space| {
             space
-                .tabs
-                .iter()
-                .find(|tab| tab.id == space.selected_tab_id)
-                .filter(|tab| tab.url == "about:blank")
-                .map(|_| self.welcome(space, -content_width * direction * progress, cx))
+                .selected_tab()
+                .is_none_or(|tab| tab.url == "about:blank")
+                .then(|| self.welcome(space, -content_width * direction * progress, cx))
         });
 
         div()
@@ -634,13 +636,12 @@ impl Render for BrowserApp {
                                     .border_1()
                                     .border_color(rgb(0x2c3138))
                                     .bg(rgb(0x20242a))
-                                    .child(div().text_color(rgb(accent)).text_size(px(12.)).child(
-                                        if self.loading.contains(&tab.id) {
-                                            "◌"
-                                        } else {
-                                            "⌕"
-                                        },
-                                    ))
+                                    .child(
+                                        div()
+                                            .text_color(rgb(accent))
+                                            .text_size(px(12.))
+                                            .child(if loading { "◌" } else { "⌕" }),
+                                    )
                                     .child(self.address.clone()),
                             ),
                     )
@@ -680,9 +681,10 @@ impl Render for BrowserApp {
                             )
                             .children(outgoing_welcome)
                             .children(incoming_welcome)
-                            .when(cfg!(not(target_os = "macos")) && !is_blank, |content| {
-                                content.child(page_placeholder(&tab.url))
-                            })
+                            .when_some(
+                                tab.filter(|_| cfg!(not(target_os = "macos")) && !is_blank),
+                                |content, tab| content.child(page_placeholder(&tab.url)),
+                            )
                             .when_some(
                                 self.error.clone().filter(|_| is_blank),
                                 |content, error| {

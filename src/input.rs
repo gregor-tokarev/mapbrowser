@@ -2,16 +2,16 @@
 // Copyright 2022 - 2025 Zed Industries, Inc. Licensed under Apache-2.0.
 // See licenses/GPUI-Apache-2.0.txt.
 // Modified for Mapbrowser: reusable field API, navigation events, scoped shortcuts,
-// mouse focus, horizontal scrolling, dark styling, and corrected IME selection.
+// mouse focus, horizontal scrolling, themable styling, and corrected IME selection.
 
 use std::ops::Range;
 
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Global, GlobalElementId,
-    KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
-    Window, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
+    Hsla, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PaintQuad, Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection,
+    UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use unicode_segmentation::*;
 
@@ -55,12 +55,39 @@ pub struct TextInput {
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
     scroll_x: Pixels,
+    style: InputStyle,
+}
+
+/// Colours and metrics of the field; the defaults are the original dark style.
+#[derive(Clone, Debug)]
+pub struct InputStyle {
+    pub text: Hsla,
+    pub placeholder: Hsla,
+    pub cursor: Hsla,
+    pub selection: Hsla,
+    pub font_size: Pixels,
+    pub line_height: Pixels,
+}
+
+impl Default for InputStyle {
+    fn default() -> Self {
+        Self {
+            text: rgb(0xe7e7ed).into(),
+            placeholder: rgb(0x858593).into(),
+            cursor: rgb(0xcacaf0).into(),
+            selection: rgba(0x8681e860).into(),
+            font_size: px(13.),
+            line_height: px(22.),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub enum InputEvent {
     Submit(String),
     Cancel,
+    /// The user edited the text; programmatic `set_text` doesn't emit this.
+    Changed(String),
 }
 
 impl EventEmitter<InputEvent> for TextInput {}
@@ -119,7 +146,13 @@ impl TextInput {
             last_bounds: None,
             is_selecting: false,
             scroll_x: px(0.),
+            style: InputStyle::default(),
         }
+    }
+
+    pub fn set_style(&mut self, style: InputStyle, cx: &mut Context<Self>) {
+        self.style = style;
+        cx.notify();
     }
 
     pub fn text(&self) -> &str {
@@ -149,6 +182,23 @@ impl TextInput {
         self.selected_range = 0..self.content.len();
         self.selection_reversed = false;
         cx.notify();
+    }
+
+    /// Prefills the field so typing replaces the whole text.
+    pub fn set_text_and_select_all(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_text(text, cx);
+        self.select_all_focus(window, cx);
+    }
+
+    fn emit_changed_since(&self, previous: &SharedString, cx: &mut Context<Self>) {
+        if self.content != *previous {
+            cx.emit(InputEvent::Changed(self.content.to_string()));
+        }
     }
 
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
@@ -503,12 +553,14 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        let previous = self.content.clone();
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.selection_reversed = false;
         self.marked_range.take();
+        self.emit_changed_since(&previous, cx);
         cx.notify();
     }
 
@@ -526,6 +578,7 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        let previous = self.content.clone();
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();
@@ -553,7 +606,7 @@ impl EntityInputHandler for TextInput {
             })
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
         self.selection_reversed = false;
-
+        self.emit_changed_since(&previous, cx);
         cx.notify();
     }
 
@@ -655,7 +708,7 @@ impl Element for TextElement {
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), rgb(0x858593).into())
+            (input.placeholder.clone(), input.style.placeholder)
         } else {
             (content, style.color)
         };
@@ -721,7 +774,7 @@ impl Element for TextElement {
                         point(bounds.left() + cursor_pos - scroll_x, bounds.top()),
                         size(px(1.5), bounds.bottom() - bounds.top()),
                     ),
-                    rgb(0xcacaf0),
+                    input.style.cursor,
                 )),
             )
         } else {
@@ -737,7 +790,7 @@ impl Element for TextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    rgba(0x8681e860),
+                    input.style.selection,
                 )),
                 None,
             )
@@ -827,9 +880,9 @@ impl Render for TextInput {
             .w_full()
             .min_w_0()
             .overflow_hidden()
-            .text_color(rgb(0xe7e7ed))
-            .line_height(px(22.))
-            .text_size(px(13.))
+            .text_color(self.style.text)
+            .line_height(self.style.line_height)
+            .text_size(self.style.font_size)
             .child(TextElement { input: cx.entity() })
     }
 }
