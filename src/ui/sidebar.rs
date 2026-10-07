@@ -566,6 +566,11 @@ impl BrowserApp {
                     .min_w_0()
                     .ml(px(12.))
                     .font_weight(FontWeight::SEMIBOLD)
+                    // A press on the field takes keyboard focus back from the
+                    // page; AppKit doesn't move it to the shell on a click.
+                    .capture_any_mouse_down(
+                        cx.listener(|this, _, _, _| this.engine.borrow().focus_shell()),
+                    )
                     .child(self.rename_input.clone())
             } else {
                 truncated(space.name.clone())

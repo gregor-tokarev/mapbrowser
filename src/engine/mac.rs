@@ -571,7 +571,7 @@ pub struct Engine {
     container: Option<Retained<NSView>>,
     caps: Option<CornerCaps>,
     parent: *mut NSView,
-    monitor: Option<Retained<AnyObject>>,
+    monitors: Vec<Retained<AnyObject>>,
     keys: Arc<Mutex<KeyRouting>>,
     root_cache: PathBuf,
     events: Sender<EngineEvent>,
@@ -648,7 +648,13 @@ impl Engine {
         crate::native::enable_cef_message_loop();
         let (events, receiver) = async_channel::unbounded();
         let keys = Arc::new(Mutex::new(KeyRouting::default()));
-        let monitor = install_key_monitor(events.clone(), keys.clone());
+        let monitors = [
+            install_key_monitor(events.clone(), keys.clone()),
+            install_mouse_monitor(events.clone(), keys.clone()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         let pending = Arc::new(Mutex::new(PendingBrowsers::default()));
         let quit_pending = pending.clone();
         crate::native::set_quit_handler(move || {
@@ -683,7 +689,7 @@ impl Engine {
                 container: None,
                 caps: None,
                 parent: std::ptr::null_mut(),
-                monitor,
+                monitors,
                 keys,
                 root_cache,
                 events,
@@ -1104,7 +1110,7 @@ impl Engine {
                 view.removeFromSuperview();
             }
         }
-        if let Some(monitor) = self.monitor.take() {
+        for monitor in std::mem::take(&mut self.monitors) {
             // SAFETY: `monitor` is the token returned when the monitor was
             // added, and it is removed exactly once.
             unsafe {
@@ -1430,4 +1436,51 @@ fn handle_in_page(
         EditCommand::Redo => frame.redo(),
     }
     true
+}
+
+/// Reports presses on the page (`PagePressed`). The page handles them as
+/// usual; GPUI never sees them, since the page's views are native.
+fn install_mouse_monitor(
+    events: Sender<EngineEvent>,
+    keys: Arc<Mutex<KeyRouting>>,
+) -> Option<Retained<AnyObject>> {
+    let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+        // SAFETY: AppKit passes a valid event that outlives this handler.
+        let e = unsafe { event.as_ref() };
+        let mtm = MainThreadMarker::new().expect("native event on main thread");
+        let container = keys.lock().expect("key routing state").container;
+        if e.window(mtm)
+            .is_some_and(|window| is_browser_window(&window, container))
+            && hits_page(e, container)
+        {
+            let _ = events.try_send(EngineEvent::PagePressed);
+        }
+        event.as_ptr()
+    });
+    // SAFETY: The handler always returns the event, so AppKit delivers it
+    // unchanged; AppKit copies the block.
+    unsafe {
+        NSEvent::addLocalMonitorForEventsMatchingMask_handler(
+            NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown | NSEventMask::OtherMouseDown,
+            &block,
+        )
+    }
+}
+
+/// Whether a mouse event in the browser window lands on a page view inside
+/// the web container at address `container` (or 0 before `attach`).
+fn hits_page(event: &NSEvent, container: usize) -> bool {
+    // SAFETY: As in `is_browser_window`: the container is alive until
+    // `shutdown` removes the monitors, and this runs on the main thread.
+    let Some(container) = (unsafe { (container as *const NSView).as_ref() }) else {
+        return false;
+    };
+    // SAFETY: A view's superview getter, on the main thread.
+    let Some(parent) = (unsafe { container.superview() }) else {
+        return false;
+    };
+    // hitTest: takes the point in the superview's coordinates and returns
+    // nothing for points outside the container or while it is hidden.
+    let point = parent.convertPoint_fromView(event.locationInWindow(), None);
+    container.hitTest(point).is_some()
 }

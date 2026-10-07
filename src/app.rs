@@ -225,10 +225,7 @@ impl BrowserApp {
             cx.on_blur(
                 &rename_input.focus_handle(cx),
                 window,
-                |this, window, cx| {
-                    let name = this.rename_input.read(cx).text().to_owned();
-                    this.finish_rename(Some(&name), window, cx);
-                },
+                |this, window, cx| this.end_rename(window, cx),
             ),
             cx.observe_window_appearance(window, |this, window, cx| {
                 let dark = is_dark(window.appearance());
@@ -392,6 +389,7 @@ impl BrowserApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.end_rename(window, cx);
         self.finish_slide();
         self.exit_page_fullscreen();
         self.menu = None;
@@ -690,6 +688,7 @@ impl BrowserApp {
 
     /// Creates an empty space, switches to it and starts naming it.
     pub fn new_space(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.end_rename(window, cx);
         self.finish_slide();
         self.exit_page_fullscreen();
         let from = self.state.active_space().clone();
@@ -698,6 +697,7 @@ impl BrowserApp {
         self.begin_slide(from, window);
         self.start_rename(id, window, cx);
         self.persist_later(cx);
+        cx.notify();
     }
 
     /// Closes every browser of the space but keeps its tabs. In the active
@@ -741,8 +741,12 @@ impl BrowserApp {
         }
     }
 
-    /// Edits the space's name in place, in its title row.
+    /// Edits the space's name in place, in its title row. Only the active
+    /// space's title row is drawn, and only with the sidebar shown.
     pub fn start_rename(&mut self, space_id: SpaceId, window: &mut Window, cx: &mut Context<Self>) {
+        if space_id != self.state.selected_space_id || self.sidebar_width().is_none() {
+            return;
+        }
         let Some(name) = self.state.space(space_id).map(|space| space.name.clone()) else {
             return;
         };
@@ -779,8 +783,21 @@ impl BrowserApp {
             self.persist_later(cx);
         }
         window.focus(&self.focus_handle);
-        self.focus_page();
+        // A menu opening ended the rename; it keeps keyboard focus.
+        if self.menu.is_none() {
+            self.focus_page();
+        }
         cx.notify();
+    }
+
+    /// Ends a rename, keeping the name typed so far. Shortcuts and presses
+    /// on the page move keyboard focus to the page without GPUI noticing,
+    /// so they end it here.
+    fn end_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.renaming.is_some() {
+            let name = self.rename_input.read(cx).text().to_owned();
+            self.finish_rename(Some(&name), window, cx);
+        }
     }
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -1148,6 +1165,7 @@ impl BrowserApp {
     }
 
     pub fn shortcut(&mut self, shortcut: Shortcut, window: &mut Window, cx: &mut Context<Self>) {
+        self.end_rename(window, cx);
         let active = self.active_tab_id();
         let tabs = &self.state.active_space().tabs;
         match shortcut {
@@ -1223,7 +1241,14 @@ impl BrowserApp {
     /// active space's sidebar or the active tab's toolbar and progress.
     fn engine_event(&mut self, event: EngineEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
-            EngineEvent::Created { .. } => self.engine.borrow_mut().register_pending(),
+            EngineEvent::Created { .. } => {
+                self.engine.borrow_mut().register_pending();
+                // The active tab's page takes keyboard focus once it is
+                // ready; a rename or menu in progress keeps it.
+                if self.renaming.is_some() || self.menu.is_some() {
+                    self.engine.borrow().focus_shell();
+                }
+            }
             EngineEvent::Title { tab_id, title } => {
                 let Some(tab) = self.state.tab(tab_id) else {
                     return;
@@ -1351,6 +1376,13 @@ impl BrowserApp {
             EngineEvent::CopyText(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 self.show_toast("Copied Link", cx);
+            }
+            // The page takes keyboard focus from the press itself.
+            EngineEvent::PagePressed => {
+                self.end_rename(window, cx);
+                if self.menu.take().is_some() {
+                    cx.notify();
+                }
             }
         }
     }

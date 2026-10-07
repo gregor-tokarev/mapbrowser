@@ -153,9 +153,16 @@ impl BrowserApp {
                 let Some(space) = self.state.space(id) else {
                     return Vec::new();
                 };
-                vec![
-                    Entry::item("Rename Space", "", Action::Rename(id)),
-                    Entry::Separator,
+                let mut entries = Vec::new();
+                // Names are edited in the title row, which only the active
+                // space has on screen.
+                if id == self.state.selected_space_id {
+                    entries.extend([
+                        Entry::item("Rename Space", "", Action::Rename(id)),
+                        Entry::Separator,
+                    ]);
+                }
+                entries.extend([
                     Entry::Header("Theme"),
                     Entry::Swatches(id, space.theme()),
                     Entry::Header("Icon"),
@@ -163,7 +170,8 @@ impl BrowserApp {
                     Entry::Separator,
                     Entry::item("New Space", "", Action::NewSpace),
                     Entry::item("Unload Space", "", Action::UnloadSpace(id)),
-                ]
+                ]);
+                entries
             }
             MenuKind::Plus => vec![
                 Entry::item("New Tab", "⌘T", Action::NewTab),

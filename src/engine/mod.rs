@@ -115,6 +115,10 @@ pub enum EngineEvent {
     },
     /// Text to put on the clipboard ("Copy Link Address").
     CopyText(String),
+    /// A mouse button went down on the page. It takes keyboard focus, and
+    /// the shell's popovers close as they would on any press outside them.
+    /// Only macOS reports it; elsewhere the shell draws the whole window.
+    PagePressed,
     /// The tab's browser is gone; the tab is unloaded. Closing takes a while,
     /// so this can arrive after `create_tab` made a new browser for the tab:
     /// ignore it while `Engine::has_tab` is true.
