@@ -6,6 +6,7 @@ import io
 import json
 from pathlib import Path
 import plistlib
+import re
 import subprocess
 import tempfile
 import unittest
@@ -259,6 +260,25 @@ class FilterListTests(unittest.TestCase):
             root = Path(directory)
             with patch.object(bundle, "ROOT", root), self.assertRaisesRegex(SystemExit, "content-blocking lists"):
                 bundle.copy_filter_lists(root / "Resources")
+
+    def test_every_list_the_app_loads_is_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            filters = root / "resources" / "filters"
+            filters.mkdir(parents=True)
+            (filters / "easylist.txt").write_text("||ads.example^\n")
+            # A renamed download must not pass for the real list.
+            (filters / "easyprivacy-2026.txt").write_text("||tracker.example^\n")
+            with patch.object(bundle, "ROOT", root), self.assertRaises(SystemExit) as stopped:
+                bundle.copy_filter_lists(root / "Resources")
+            self.assertIn("easyprivacy.txt", str(stopped.exception))
+            self.assertNotIn("easylist.txt", str(stopped.exception))
+            self.assertFalse((root / "Resources" / "filters").exists())
+
+    def test_bundle_lists_match_the_app(self):
+        source = (Path(bundle.__file__).resolve().parent.parent / "src" / "blocker.rs").read_text()
+        lists = re.search(r"const LISTS: \[&str; \d+\] = \[(.*?)\];", source).group(1)
+        self.assertEqual(tuple(re.findall(r'"([^"]+)"', lists)), bundle.FILTER_LISTS)
 
     def test_repository_ships_easylist_and_easyprivacy(self):
         lists = Path(bundle.__file__).resolve().parent.parent / "resources" / "filters"

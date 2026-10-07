@@ -18,6 +18,8 @@ from xml.parsers.expat import ExpatError
 
 ROOT = Path(__file__).resolve().parent.parent
 FRAMEWORK = "Chromium Embedded Framework.framework"
+# Keep in step with LISTS in src/blocker.rs.
+FILTER_LISTS = ("easylist.txt", "easyprivacy.txt")
 BROWSER_PASSKEY_ENTITLEMENT = "com.apple.developer.web-browser.public-key-credential"
 APP_IDENTIFIER_ENTITLEMENT = "com.apple.application-identifier"
 TEAM_IDENTIFIER_ENTITLEMENT = "com.apple.developer.team-identifier"
@@ -179,15 +181,20 @@ def run(*args):
 
 
 def copy_filter_lists(resources):
-    """Bundle the content-blocking lists, replacing any from earlier builds."""
-    lists = sorted((ROOT / "resources" / "filters").glob("*.txt"))
-    if not lists:
-        raise SystemExit("Missing content-blocking lists in resources/filters.")
+    """Bundle the content-blocking lists, replacing any from earlier builds.
+
+    The app loads exactly these lists and turns blocking off if one is missing,
+    so a bundle without both must not be built.
+    """
+    source = ROOT / "resources" / "filters"
+    missing = [name for name in FILTER_LISTS if not (source / name).is_file()]
+    if missing:
+        raise SystemExit(f"Missing content-blocking lists in resources/filters: {', '.join(missing)}")
     destination = resources / "filters"
     shutil.rmtree(destination, ignore_errors=True)
     destination.mkdir()
-    for path in lists:
-        shutil.copy2(path, destination / path.name)
+    for name in FILTER_LISTS:
+        shutil.copy2(source / name, destination / name)
 
 
 def write_plist(path, value):
