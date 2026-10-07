@@ -11,7 +11,7 @@ use gpui::{
 
 pub const SIDEBAR: f32 = 248.;
 pub const TOPBAR: f32 = 56.;
-const BG: u32 = 0x141619;
+pub const BG: u32 = 0x141619;
 const PANEL: u32 = 0x1b1e22;
 const TEXT: u32 = 0xe9ecef;
 const MUTED: u32 = 0x8c929c;
@@ -300,7 +300,7 @@ impl BrowserApp {
                             .hover(|style| style.border_color(rgb(accent)).bg(rgb(0x272c32)))
                             .when(space.id == self.state.selected_space_id, |button| {
                                 button.on_click(cx.listener(|this, _, window, cx| {
-                                    this.shortcut(Shortcut::Address, window, cx);
+                                    this.shortcut(Shortcut::EditAddress, window, cx);
                                 }))
                             })
                             .child(div().text_size(px(20.)).text_color(rgb(accent)).child("⌕"))
@@ -410,10 +410,10 @@ impl Render for BrowserApp {
             .key_context("Browser")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &FocusAddress, window, cx| {
-                this.shortcut(Shortcut::Address, window, cx)
+                this.shortcut(Shortcut::EditAddress, window, cx)
             }))
             .on_action(cx.listener(|this, _: &NewTab, window, cx| {
-                this.shortcut(Shortcut::NewTab, window, cx)
+                this.shortcut(Shortcut::CommandBar, window, cx)
             }))
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
                 this.shortcut(Shortcut::CloseTab, window, cx)
@@ -617,7 +617,7 @@ impl Render for BrowserApp {
                                                     .focus_handle(cx)
                                                     .is_focused(window)
                                             {
-                                                this.shortcut(Shortcut::Address, window, cx);
+                                                this.shortcut(Shortcut::EditAddress, window, cx);
                                                 cx.stop_propagation();
                                             }
                                         },
