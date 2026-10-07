@@ -137,6 +137,14 @@ pub fn normalize_host(host: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_owned())
 }
 
+/// `host` and every domain above it, most specific first: a.example.com,
+/// example.com, com. A per-site setting for a domain covers its subdomains.
+pub fn host_and_parents(host: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors(Some(host), |host| {
+        host.split_once('.').map(|(_, parent)| parent)
+    })
+}
+
 fn is_png(bytes: &[u8]) -> bool {
     bytes.len() <= MAX_BYTES && bytes.starts_with(PNG_SIGNATURE)
 }
@@ -237,6 +245,18 @@ mod tests {
         );
         assert_eq!(normalize_host("www."), Some("www".into()));
         assert_eq!(normalize_host(" . "), None);
+    }
+
+    #[test]
+    fn hosts_list_their_parent_domains() {
+        assert_eq!(
+            host_and_parents("cooking.nytimes.com").collect::<Vec<_>>(),
+            ["cooking.nytimes.com", "nytimes.com", "com"]
+        );
+        assert_eq!(
+            host_and_parents("localhost").collect::<Vec<_>>(),
+            ["localhost"]
+        );
     }
 
     #[test]

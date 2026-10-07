@@ -1,6 +1,6 @@
 //! Persistent spaces and tabs. Each space owns a distinct Chromium profile.
 
-use crate::favicons::normalize_host;
+use crate::favicons::{host_and_parents, normalize_host};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -79,7 +79,8 @@ pub struct BrowserState {
     pub sidebar_hidden: bool,
     #[serde(default = "default_sidebar_width")]
     sidebar_width: f32,
-    /// Hosts, normalized like `favicons::host_of`, where content blocking is off.
+    /// Hosts, normalized like `favicons::host_of`, where content blocking is
+    /// off, subdomains included.
     #[serde(default)]
     blocking_exceptions: BTreeSet<String>,
     #[serde(skip, default = "data_dir")]
@@ -189,13 +190,36 @@ impl Space {
     }
 }
 
-/// Last sequence written per state directory. Holding the lock for the whole
-/// write serializes writers.
-static WRITTEN: LazyLock<Mutex<HashMap<PathBuf, u64>>> = LazyLock::new(Default::default);
+/// What this process wrote to each state directory. Holding the lock for the
+/// whole write serializes writers.
+static WRITTEN: LazyLock<Mutex<HashMap<PathBuf, Written>>> = LazyLock::new(Default::default);
 static NEXT_SNAPSHOT: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Default)]
+struct Written {
+    /// The newest snapshot written or found unchanged; older ones are stale.
+    seq: u64,
+    /// What state.json holds, if this process wrote it.
+    bytes: Vec<u8>,
+    /// Whether `bytes` are flushed to the drive, not just ordered.
+    flushed: bool,
+    /// Whether the backup holds the state this process found on disk.
+    backed_up: bool,
+}
+
+/// How far a write must reach before it returns.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Durability {
+    /// The new file is complete before it replaces the old one, so a crash
+    /// or power cut leaves a whole state.json, if maybe not the latest.
+    Ordered,
+    /// Also on the drive itself.
+    Flushed,
+}
+
 /// Serialized state, ordered by when it was taken. Serializing needs the
-/// state (main thread); writing it, which waits on fsync, can happen anywhere.
+/// state (main thread); writing it, which waits on the drive, can happen
+/// anywhere.
 pub struct StateSnapshot {
     root: PathBuf,
     bytes: Vec<u8>,
@@ -203,28 +227,72 @@ pub struct StateSnapshot {
 }
 
 impl StateSnapshot {
-    /// Atomically replace the saved state, keeping the previous valid save as
-    /// a backup. Returns `Ok(false)` without writing if a newer snapshot of
-    /// the same directory has already been written.
+    /// Atomically replace the saved state, after keeping the state found on
+    /// disk at launch as a backup. Returns `Ok(false)` without writing if a
+    /// newer snapshot of the same directory has already been written, or if
+    /// nothing changed since the last write.
+    ///
+    /// Drive flushes are the cost here: on macOS each one (F_FULLFSYNC)
+    /// wakes the SSD and empties its whole cache, and titles and addresses
+    /// change often. So these routine saves only order their data before the
+    /// rename (F_BARRIERFSYNC): a power cut can lose the last few seconds,
+    /// never damage the file. `BrowserState::save` flushes, once, on quit.
     pub fn write(&self) -> io::Result<bool> {
+        self.write_with(Durability::Ordered)
+    }
+
+    fn write_with(&self, durability: Durability) -> io::Result<bool> {
         let mut written = WRITTEN.lock().unwrap_or_else(PoisonError::into_inner);
-        if written.get(&self.root).is_some_and(|&seq| seq >= self.seq) {
+        let last = written.entry(self.root.clone()).or_default();
+        if last.seq >= self.seq {
+            return Ok(false);
+        }
+        let state_path = self.root.join(STATE_FILE);
+        if last.bytes == self.bytes {
+            if durability == Durability::Flushed && !last.flushed {
+                flush_drive(&self.root)?;
+                last.flushed = true;
+            }
+            last.seq = self.seq;
             return Ok(false);
         }
         fs::create_dir_all(&self.root)?;
-        let state_path = self.root.join(STATE_FILE);
-        match read_state(&state_path, &self.root) {
-            Ok(previous) => atomic_write(
-                &self.root.join(BACKUP_FILE),
-                &serde_json::to_vec_pretty(&previous).map_err(io::Error::other)?,
-            )?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => quarantine(&state_path)?,
-            Err(error) => return Err(error),
+        if !last.backed_up {
+            match read_state(&state_path, &self.root) {
+                Ok(previous) => {
+                    let previous =
+                        serde_json::to_vec_pretty(&previous).map_err(io::Error::other)?;
+                    atomic_write(&self.root.join(BACKUP_FILE), &previous, Durability::Ordered)?;
+                    last.backed_up = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    quarantine(&state_path)?
+                }
+                Err(error) => return Err(error),
+            }
         }
-        atomic_write(&state_path, &self.bytes)?;
-        written.insert(self.root.clone(), self.seq);
+        atomic_write(&state_path, &self.bytes, durability)?;
+        *last = Written {
+            seq: self.seq,
+            bytes: self.bytes.clone(),
+            flushed: durability == Durability::Flushed,
+            backed_up: last.backed_up,
+        };
         Ok(true)
+    }
+}
+
+/// After loading, the files may not hold what this process wrote (a damaged
+/// state.json was set aside, say): write the next snapshot in any case, and
+/// back up what is on disk now. Snapshot ordering stays.
+fn forget_written(root: &Path) {
+    let mut written = WRITTEN.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(last) = written.get_mut(root) {
+        *last = Written {
+            seq: last.seq,
+            ..Written::default()
+        };
     }
 }
 
@@ -238,6 +306,7 @@ impl BrowserState {
     pub fn load_from(root: impl AsRef<Path>) -> io::Result<Self> {
         let root = root.as_ref();
         fs::create_dir_all(root)?;
+        forget_written(root);
         let state_path = root.join(STATE_FILE);
         let backup_path = root.join(BACKUP_FILE);
         let state = match read_state(&state_path, root) {
@@ -307,10 +376,11 @@ impl BrowserState {
         })
     }
 
-    /// Write on the calling thread, e.g. while quitting. Ordered after every
-    /// earlier snapshot, so a pending background write can't replace it.
+    /// Write on the calling thread and flush it to the drive, for quitting.
+    /// Ordered after every earlier snapshot, so a pending background write
+    /// can't replace it.
     pub fn save(&self) -> io::Result<()> {
-        self.snapshot()?.write().map(drop)
+        self.snapshot()?.write_with(Durability::Flushed).map(drop)
     }
 
     pub fn active_space(&self) -> &Space {
@@ -365,19 +435,28 @@ impl BrowserState {
         self.blocking_exceptions.iter().cloned().collect()
     }
 
+    /// Whether blocking is off on `host`: an exception names it or a domain
+    /// above it, which is how the content blocker applies them.
     pub fn is_blocking_disabled(&self, host: &str) -> bool {
-        normalize_host(host).is_some_and(|host| self.blocking_exceptions.contains(&host))
+        normalize_host(host).is_some_and(|host| {
+            host_and_parents(&host).any(|host| self.blocking_exceptions.contains(host))
+        })
     }
 
-    /// Returns whether the setting changed.
+    /// Turns blocking off for `host` and its subdomains, or back on for
+    /// `host`. Turning it on lifts exceptions for the domains above `host`
+    /// too: they would keep it off. Returns whether the setting changed.
     pub fn set_blocking_disabled(&mut self, host: &str, disabled: bool) -> bool {
         let Some(host) = normalize_host(host) else {
             return false;
         };
         if disabled {
-            self.blocking_exceptions.insert(host)
+            !self.is_blocking_disabled(&host) && self.blocking_exceptions.insert(host)
         } else {
-            self.blocking_exceptions.remove(&host)
+            let before = self.blocking_exceptions.len();
+            self.blocking_exceptions
+                .retain(|exception| !host_and_parents(&host).any(|host| host == exception));
+            self.blocking_exceptions.len() != before
         }
     }
 
@@ -456,7 +535,9 @@ impl BrowserState {
         true
     }
 
-    /// Opens a tab at the top of Today, like Arc, and selects it.
+    /// Opens a tab at the top of Today, like Arc, and selects it. `url` is
+    /// stored as given: a URL from the engine or a saved tab, or address-bar
+    /// text already passed through `normalize_address`.
     pub fn new_tab(&mut self, space_id: SpaceId, url: impl AsRef<str>) -> Option<TabId> {
         self.insert_tab(space_id, url.as_ref(), true)
     }
@@ -469,7 +550,8 @@ impl BrowserState {
     fn insert_tab(&mut self, space_id: SpaceId, url: &str, select: bool) -> Option<TabId> {
         let index = self.spaces.iter().position(|space| space.id == space_id)?;
         let id = self.allocate_id();
-        let url = display_url(&normalize_address(url));
+        let url = url.trim();
+        let url = display_url(if url.is_empty() { BLANK_URL } else { url });
         let title = fallback_title(&url);
         let space = &mut self.spaces[index];
         let at = space.section_start(Pin::Today);
@@ -570,26 +652,30 @@ impl BrowserState {
     }
 
     /// Browser callbacks can update hidden tabs without selecting their space.
+    /// Returns whether the tab's URL or title changed, so unchanged reloads
+    /// and repeated titles need no save.
     pub fn update_tab(&mut self, id: TabId, url: impl AsRef<str>, title: impl AsRef<str>) -> bool {
         let Some((space, index)) = self.locate_tab_mut(id) else {
             return false;
         };
         let tab = &mut space.tabs[index];
-        tab.url = display_url(url.as_ref());
-        tab.title = if title.as_ref().trim().is_empty() || title.as_ref() == url.as_ref() {
-            fallback_title(&tab.url)
+        let url = url.as_ref();
+        let title = title.as_ref();
+        let new_url = display_url(url);
+        let new_title = if title.trim().is_empty() || title == url {
+            fallback_title(&new_url)
         } else {
-            title.as_ref().to_owned()
+            title.to_owned()
         };
-        true
+        let changed = tab.url != new_url || tab.title != new_title;
+        tab.url = new_url;
+        tab.title = new_title;
+        changed
     }
 
     fn validate_and_repair(&mut self) -> io::Result<()> {
         if self.schema_version > SCHEMA_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "this session was created by a newer version of MapBrowser",
-            ));
+            return Err(newer_schema());
         }
         let mut ids = HashSet::new();
         for id in self
@@ -626,8 +712,14 @@ impl BrowserState {
             if space.selected_tab().is_none() {
                 space.selected_tab_id = space.tabs.first().map(|tab| tab.id);
             }
-            // Arc has no blank tabs; drop them as if they were closed.
-            while let Some(blank) = space.tabs.iter().position(|tab| tab.url == BLANK_URL) {
+            // Arc has no blank tabs; drop unnavigated Today tabs as if they
+            // were closed. Pinned tabs and favorites are the user's own and
+            // keep their place even if a page went to about:blank.
+            while let Some(blank) = space
+                .tabs
+                .iter()
+                .position(|tab| tab.pin == Pin::Today && tab.url == BLANK_URL)
+            {
                 space.remove_at(blank);
             }
             for tab in &mut space.tabs {
@@ -681,12 +773,30 @@ fn sanitize_icon(icon: &str) -> Option<String> {
 }
 
 fn read_state(path: &Path, root: &Path) -> io::Result<BrowserState> {
+    /// Only the version: a newer schema may change any other field, and
+    /// must be refused rather than treated as damaged and replaced.
+    #[derive(Deserialize)]
+    struct Header {
+        #[serde(default = "schema_version")]
+        schema_version: u32,
+    }
     let bytes = fs::read(path)?;
-    let mut state: BrowserState = serde_json::from_slice(&bytes)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let invalid = |error| io::Error::new(io::ErrorKind::InvalidData, error);
+    let header: Header = serde_json::from_slice(&bytes).map_err(invalid)?;
+    if header.schema_version > SCHEMA_VERSION {
+        return Err(newer_schema());
+    }
+    let mut state: BrowserState = serde_json::from_slice(&bytes).map_err(invalid)?;
     state.storage_dir = root.to_path_buf();
     state.validate_and_repair()?;
     Ok(state)
+}
+
+fn newer_schema() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "this session was created by a newer version of MapBrowser",
+    )
 }
 
 fn unique_suffix() -> String {
@@ -705,7 +815,7 @@ fn quarantine(path: &Path) -> io::Result<()> {
     )
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+fn atomic_write(path: &Path, bytes: &[u8], durability: Durability) -> io::Result<()> {
     let temporary = path.with_extension(format!("tmp-{}", unique_suffix()));
     let result = (|| {
         let mut file = OpenOptions::new()
@@ -713,10 +823,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
             .create_new(true)
             .open(&temporary)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        write_barrier(&file)?;
         fs::rename(&temporary, path)?;
-        if let Some(parent) = path.parent() {
-            File::open(parent)?.sync_all()?;
+        if durability == Durability::Flushed
+            && let Some(parent) = path.parent()
+        {
+            flush_drive(parent)?;
         }
         Ok(())
     })();
@@ -724,6 +836,35 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+/// Gets `file`'s data to the drive ahead of any later write, the rename
+/// included, without waiting for the drive to empty its cache.
+#[cfg(target_os = "macos")]
+fn write_barrier(file: &File) -> io::Result<()> {
+    use std::{ffi::c_int, os::fd::AsRawFd};
+    unsafe extern "C" {
+        fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
+    }
+    /// From <sys/fcntl.h>.
+    const F_BARRIERFSYNC: c_int = 85;
+    // SAFETY: F_BARRIERFSYNC takes no argument, and `file` is open.
+    if unsafe { fcntl(file.as_raw_fd(), F_BARRIERFSYNC) } == -1 {
+        // File systems without barriers (network, FAT) get a full flush.
+        return file.sync_all();
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_barrier(file: &File) -> io::Result<()> {
+    file.sync_data()
+}
+
+/// Flushes the directory's entries and, on macOS (F_FULLFSYNC), everything
+/// written so far from the drive's cache to permanent storage.
+fn flush_drive(directory: &Path) -> io::Result<()> {
+    File::open(directory)?.sync_all()
 }
 
 /// Remove authority credentials from the URL kept in tabs, the address bar and disk.
@@ -1365,7 +1506,6 @@ mod tests {
         assert!(!state.set_blocking_disabled("example.com", true));
         assert!(state.is_blocking_disabled("example.com"));
         assert!(state.is_blocking_disabled("www.example.com"));
-        assert!(!state.is_blocking_disabled("sub.example.com"));
         assert_eq!(
             state.blocking_exceptions(),
             HashSet::from(["example.com".to_owned()])
@@ -1377,19 +1517,168 @@ mod tests {
     }
 
     #[test]
+    fn blocking_exceptions_cover_subdomains_like_the_blocker() {
+        let mut state = BrowserState::default();
+        assert!(state.set_blocking_disabled("www.nytimes.com", true));
+        // The content blocker lets ads through on every subdomain too, and
+        // the shield must say so.
+        assert!(state.is_blocking_disabled("cooking.nytimes.com"));
+        assert!(!state.is_blocking_disabled("notnytimes.com"));
+        assert!(!state.is_blocking_disabled("nytimes.com.evil.example"));
+        // Already off there: nothing to add.
+        assert!(!state.set_blocking_disabled("cooking.nytimes.com", true));
+        // Turning blocking back on from a subdomain works, and so lifts the
+        // parent's exception.
+        assert!(state.set_blocking_disabled("cooking.nytimes.com", false));
+        assert!(!state.is_blocking_disabled("cooking.nytimes.com"));
+        assert!(!state.is_blocking_disabled("nytimes.com"));
+        assert!(state.blocking_exceptions().is_empty());
+        // A subdomain's own exception leaves its parent blocked.
+        assert!(state.set_blocking_disabled("cooking.nytimes.com", true));
+        assert!(!state.is_blocking_disabled("nytimes.com"));
+        assert!(!state.set_blocking_disabled("nytimes.com", false));
+        assert!(state.is_blocking_disabled("cooking.nytimes.com"));
+    }
+
+    #[test]
     fn newer_schema_is_preserved_and_reported_instead_of_reset() {
         let root = TestDir::new();
         let state = BrowserState {
             schema_version: SCHEMA_VERSION + 1,
             ..BrowserState::default()
         };
-        let bytes = serde_json::to_vec(&state).unwrap();
-        fs::write(root.0.join(STATE_FILE), &bytes).unwrap();
+        let compatible = serde_json::to_vec(&state).unwrap();
+        // A newer version may add variants and change types; this one
+        // can't be read as version 2 at all.
+        let incompatible = serde_json::json!({
+            "schema_version": SCHEMA_VERSION + 1,
+            "spaces": [{ "id": 1, "name": "x", "tabs": [
+                { "id": 2, "url": "u", "title": "t", "pin": "archived" }
+            ]}],
+            "selected_space_id": "changed"
+        })
+        .to_string()
+        .into_bytes();
+        for bytes in [compatible, incompatible] {
+            fs::write(root.0.join(STATE_FILE), &bytes).unwrap();
+            assert_eq!(
+                BrowserState::load_from(&root.0).unwrap_err().kind(),
+                io::ErrorKind::Unsupported
+            );
+            assert_eq!(fs::read(root.0.join(STATE_FILE)).unwrap(), bytes);
+            // Writing over it is refused too.
+            let older = BrowserState::at_root(&root.0);
+            assert_eq!(older.save().unwrap_err().kind(), io::ErrorKind::Unsupported);
+            assert_eq!(fs::read(root.0.join(STATE_FILE)).unwrap(), bytes);
+            assert_eq!(
+                fs::read_dir(&root.0).unwrap().count(),
+                1,
+                "nothing set aside"
+            );
+        }
+    }
+
+    #[test]
+    fn unchanged_state_is_not_written_again() {
+        let root = TestDir::new();
+        let mut state = BrowserState::load_from(&root.0).unwrap();
+        state.rename_space(state.selected_space_id, "Saved");
+        assert!(state.snapshot().unwrap().write().unwrap());
+        // Mark the file: an unchanged snapshot must not touch it.
+        let path = root.0.join(STATE_FILE);
+        let marked = [fs::read(&path).unwrap(), b" ".to_vec()].concat();
+        fs::write(&path, &marked).unwrap();
+        assert!(!state.snapshot().unwrap().write().unwrap());
+        state.save().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), marked);
+        // A real change is written.
+        state.rename_space(state.selected_space_id, "Changed");
+        assert!(state.snapshot().unwrap().write().unwrap());
+        assert_ne!(fs::read(&path).unwrap(), marked);
+    }
+
+    #[test]
+    fn the_backup_keeps_the_state_found_at_launch() {
+        let root = TestDir::new();
+        let mut state = BrowserState::load_from(&root.0).unwrap();
+        let space = state.selected_space_id;
+        state.rename_space(space, "Last session");
+        state.save().unwrap();
+
+        let mut state = BrowserState::load_from(&root.0).unwrap();
+        for name in ["First edit", "Second edit", "Third edit"] {
+            state.rename_space(space, name);
+            assert!(state.snapshot().unwrap().write().unwrap());
+        }
+        let backup = read_state(&root.0.join(BACKUP_FILE), &root.0).unwrap();
+        assert_eq!(backup.active_space().name, "Last session");
         assert_eq!(
-            BrowserState::load_from(&root.0).unwrap_err().kind(),
-            io::ErrorKind::Unsupported
+            BrowserState::load_from(&root.0)
+                .unwrap()
+                .active_space()
+                .name,
+            "Third edit"
         );
-        assert_eq!(fs::read(root.0.join(STATE_FILE)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn update_tab_reports_whether_anything_changed() {
+        let mut state = BrowserState::default();
+        let space = state.selected_space_id;
+        let tab = state.new_tab(space, "https://example.com/").unwrap();
+        assert!(state.update_tab(tab, "https://example.com/", "Example"));
+        assert!(!state.update_tab(tab, "https://example.com/", "Example"));
+        // Credentials are never kept, so they are no change either.
+        assert!(!state.update_tab(tab, "https://user:pw@example.com/", "Example"));
+        assert!(state.update_tab(tab, "https://example.com/next", "Example"));
+        // A blank title falls back to the URL, as before.
+        assert!(state.update_tab(tab, "https://example.com/next", ""));
+        assert!(!state.update_tab(tab, "https://example.com/next", " "));
+        assert!(!state.update_tab(12345, "https://example.com/", "Example"));
+    }
+
+    #[test]
+    fn pages_open_tabs_with_their_urls_as_they_are() {
+        let mut state = BrowserState::default();
+        let space = state.selected_space_id;
+        for url in [
+            "blob:https://site.example/6d2c-41f7",
+            "https://example.com/a b",
+            "file:///tmp/page.html",
+        ] {
+            let tab = state.new_background_tab(space, url).unwrap();
+            assert_eq!(state.tab(tab).unwrap().url, url);
+        }
+        // Address-bar text is the caller's to normalize first.
+        let typed = state
+            .new_tab(space, normalize_address("rust gpui"))
+            .unwrap();
+        assert_eq!(
+            state.tab(typed).unwrap().url,
+            "https://www.google.com/search?q=rust+gpui"
+        );
+        let blank = state.new_tab(space, "  ").unwrap();
+        assert_eq!(state.tab(blank).unwrap().url, BLANK_URL);
+        assert_eq!(state.tab(blank).unwrap().title, "New tab");
+    }
+
+    #[test]
+    fn blank_pinned_tabs_and_favorites_survive_loading() {
+        let root = TestDir::new();
+        let mut state = BrowserState::load_from(&root.0).unwrap();
+        let space = state.selected_space_id;
+        let favorite = state.new_tab(space, "https://a.example/").unwrap();
+        let pinned = state.new_tab(space, "https://b.example/").unwrap();
+        let today = state.new_tab(space, "https://c.example/").unwrap();
+        state.set_pin(favorite, Pin::Favorite);
+        state.set_pin(pinned, Pin::Pinned);
+        // Pages can leave for about:blank, e.g. on logging out.
+        for tab in [favorite, pinned, today] {
+            state.update_tab(tab, BLANK_URL, "");
+        }
+        state.save().unwrap();
+        let loaded = BrowserState::load_from(&root.0).unwrap();
+        assert_eq!(sidebar(&loaded, space), [favorite, pinned]);
     }
 
     #[test]

@@ -6,6 +6,7 @@
 // Only the Chromium engine matches requests; Linux previews just load the lists.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
+use crate::favicons::{host_and_parents, normalize_host};
 use adblock::{
     lists::{FilterSet, ParseOptions, RuleTypes},
     request::Request,
@@ -159,8 +160,7 @@ impl ContentBlocker {
     pub fn set_exceptions(&self, hosts: impl IntoIterator<Item = String>) {
         let hosts = hosts
             .into_iter()
-            .map(|host| normalize_host(&host))
-            .filter(|host| !host.is_empty())
+            .filter_map(|host| normalize_host(&host))
             .collect();
         *self
             .exceptions
@@ -193,14 +193,10 @@ impl ContentBlocker {
         }
         let page_url = page_url();
         let page_host = adblock::url_parser::parse_url(page_url.as_deref().unwrap_or(initiator))
-            .map(|page| normalize_host(page.hostname()));
-        // An exception for a domain also covers its subdomains.
-        !page_host.is_some_and(|host| {
-            std::iter::successors(Some(host.as_str()), |host| {
-                host.split_once('.').map(|(_, parent)| parent)
-            })
-            .any(|host| exceptions.contains(host))
-        })
+            .and_then(|page| normalize_host(page.hostname()));
+        // An exception for a domain also covers its subdomains, as
+        // `BrowserState::is_blocking_disabled` shows it.
+        !page_host.is_some_and(|host| host_and_parents(&host).any(|host| exceptions.contains(host)))
     }
 }
 
@@ -221,14 +217,6 @@ fn lists_dir() -> Result<PathBuf> {
             env!("CARGO_MANIFEST_DIR"),
             "/resources/filters"
         )))
-    }
-}
-
-fn normalize_host(host: &str) -> String {
-    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    match host.strip_prefix("www.") {
-        Some(rest) => rest.to_owned(),
-        None => host,
     }
 }
 
