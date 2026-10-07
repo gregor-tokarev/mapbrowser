@@ -106,3 +106,9 @@ reset to an arrow while the shell redraws; flicking the pointer out of the
 window from the URL pill (hand) or a rename field (I-beam), or out of the
 command bar from a row, leaves the arrow; idle wakeups stay at zero after
 pressing a command-bar row, moving slightly and releasing.
+
+The application delegate's callbacks (`src/platform/mac/platform.rs`) return
+early instead of asserting once `MacPlatform::run` has returned and cleared the
+platform pointer. Map Browser runs Chromium's shutdown after GPUI's loop ends,
+and that shutdown can spin the AppKit loop again; a menu validation, Dock click,
+opened URL or keyboard-layout change arriving then used to abort the process.

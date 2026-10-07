@@ -87,8 +87,18 @@ impl KeyPress {
     }
 }
 
+/// Decoded from UTF-16 directly: a dead key or an input method can leave a
+/// lone surrogate, for which `-UTF8String` (behind `to_string`) gives NULL.
+/// Key events carry a character or two, so reading them one by one is cheap.
 fn text(string: Option<Retained<NSString>>) -> String {
-    string.map(|string| string.to_string()).unwrap_or_default()
+    string
+        .map(|string| {
+            let units = (0..string.length()).map(|index| string.characterAtIndex(index));
+            char::decode_utf16(units)
+                .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Hands a ⌘ key to the focused view of `window`, a page's, as AppKit would

@@ -1372,11 +1372,14 @@ unsafe fn path_from_objc(path: id) -> PathBuf {
     PathBuf::from(path)
 }
 
-unsafe fn get_mac_platform(object: &mut Object) -> &MacPlatform {
+/// `None` once `MacPlatform::run` has returned and cleared the ivar. CEF's
+/// shutdown can still run the AppKit loop then (Map Browser), and a menu
+/// validation, Dock click or keyboard-layout change must not abort the
+/// process from inside these `extern "C"` callbacks.
+unsafe fn get_mac_platform(object: &mut Object) -> Option<&MacPlatform> {
     unsafe {
         let platform_ptr: *mut c_void = *object.get_ivar(MAC_PLATFORM_IVAR);
-        assert!(!platform_ptr.is_null());
-        &*(platform_ptr as *const MacPlatform)
+        (platform_ptr as *const MacPlatform).as_ref()
     }
 }
 
@@ -1430,7 +1433,9 @@ extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
             object: nil
         ];
 
-        let platform = get_mac_platform(this);
+        let Some(platform) = get_mac_platform(this) else {
+            return;
+        };
         let callback = platform.0.lock().finish_launching.take();
         if let Some(callback) = callback {
             callback();
@@ -1440,7 +1445,9 @@ extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
 
 extern "C" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_windows: bool) {
     if !has_open_windows {
-        let platform = unsafe { get_mac_platform(this) };
+        let Some(platform) = (unsafe { get_mac_platform(this) }) else {
+            return;
+        };
         let mut lock = platform.0.lock();
         if let Some(mut callback) = lock.reopen.take() {
             drop(lock);
@@ -1451,7 +1458,9 @@ extern "C" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_wi
 }
 
 extern "C" fn will_terminate(this: &mut Object, _: Sel, _: id) {
-    let platform = unsafe { get_mac_platform(this) };
+    let Some(platform) = (unsafe { get_mac_platform(this) }) else {
+        return;
+    };
     let mut lock = platform.0.lock();
     if let Some(mut callback) = lock.quit.take() {
         drop(lock);
@@ -1461,7 +1470,9 @@ extern "C" fn will_terminate(this: &mut Object, _: Sel, _: id) {
 }
 
 extern "C" fn on_keyboard_layout_change(this: &mut Object, _: Sel, _: id) {
-    let platform = unsafe { get_mac_platform(this) };
+    let Some(platform) = (unsafe { get_mac_platform(this) }) else {
+        return;
+    };
     let mut lock = platform.0.lock();
     let keyboard_layout = MacKeyboardLayout::new();
     lock.keyboard_mapper = Rc::new(MacKeyboardMapper::new(keyboard_layout.id()));
@@ -1503,7 +1514,9 @@ extern "C" fn open_urls(this: &mut Object, _: Sel, _: id, urls: id) {
             })
             .collect::<Vec<_>>()
     };
-    let platform = unsafe { get_mac_platform(this) };
+    let Some(platform) = (unsafe { get_mac_platform(this) }) else {
+        return;
+    };
     let mut lock = platform.0.lock();
     if let Some(mut callback) = lock.open_urls.take() {
         drop(lock);
@@ -1514,7 +1527,9 @@ extern "C" fn open_urls(this: &mut Object, _: Sel, _: id, urls: id) {
 
 extern "C" fn handle_menu_item(this: &mut Object, _: Sel, item: id) {
     unsafe {
-        let platform = get_mac_platform(this);
+        let Some(platform) = get_mac_platform(this) else {
+            return;
+        };
         let mut lock = platform.0.lock();
         if let Some(mut callback) = lock.menu_command.take() {
             let tag: NSInteger = msg_send![item, tag];
@@ -1532,7 +1547,9 @@ extern "C" fn handle_menu_item(this: &mut Object, _: Sel, item: id) {
 extern "C" fn validate_menu_item(this: &mut Object, _: Sel, item: id) -> bool {
     unsafe {
         let mut result = false;
-        let platform = get_mac_platform(this);
+        let Some(platform) = get_mac_platform(this) else {
+            return false;
+        };
         let mut lock = platform.0.lock();
         if let Some(mut callback) = lock.validate_menu_command.take() {
             let tag: NSInteger = msg_send![item, tag];
@@ -1554,7 +1571,9 @@ extern "C" fn validate_menu_item(this: &mut Object, _: Sel, item: id) -> bool {
 
 extern "C" fn menu_will_open(this: &mut Object, _: Sel, _: id) {
     unsafe {
-        let platform = get_mac_platform(this);
+        let Some(platform) = get_mac_platform(this) else {
+            return;
+        };
         let mut lock = platform.0.lock();
         if let Some(mut callback) = lock.will_open_menu.take() {
             drop(lock);
@@ -1566,7 +1585,9 @@ extern "C" fn menu_will_open(this: &mut Object, _: Sel, _: id) {
 
 extern "C" fn handle_dock_menu(this: &mut Object, _: Sel, _: id) -> id {
     unsafe {
-        let platform = get_mac_platform(this);
+        let Some(platform) = get_mac_platform(this) else {
+            return nil;
+        };
         let mut state = platform.0.lock();
         if let Some(id) = state.dock_menu {
             id
