@@ -482,15 +482,18 @@ impl BrowserApp {
             return;
         }
         let url = model::normalize_address(input);
-        self.state.update_tab(tab_id, &url, "");
         self.error = None;
         if self.loaded.contains(&tab_id) {
+            // The tab follows the page: `Address` reports the new page once
+            // it loads, `LoadError` an address that failed. Downloads and
+            // empty responses leave the page, and so the tab, as they were.
             self.engine.borrow().navigate(tab_id, &url);
             self.engine.borrow().focus_tab(tab_id);
         } else {
+            self.state.update_tab(tab_id, &url, "");
             self.show_selected();
+            self.persist_later(cx);
         }
-        self.persist_later(cx);
         cx.notify();
     }
 
@@ -1235,6 +1238,11 @@ impl BrowserApp {
                 }
             }
             EngineEvent::Address { tab_id, url } => {
+                // Only pages that loaded report their address: any load
+                // error shown is over (Back, a link on the error page).
+                if self.is_active(tab_id) && self.error.take().is_some() {
+                    cx.notify();
+                }
                 let Some(tab) = self.state.tab(tab_id) else {
                     return;
                 };
@@ -1294,9 +1302,27 @@ impl BrowserApp {
                     cx.notify();
                 }
             }
-            EngineEvent::LoadError { tab_id, message } => {
+            EngineEvent::LoadError {
+                tab_id,
+                url,
+                message,
+            } => {
                 if let Some(page) = self.pages.get_mut(&tab_id) {
                     page.loading = false;
+                }
+                // The tab shows the address that failed, as Chrome's address
+                // bar does, so ⌘L can fix a typo and Reload tries it again.
+                if !url.is_empty()
+                    && self
+                        .state
+                        .tab(tab_id)
+                        .is_some_and(|tab| tab.url != model::display_url(&url))
+                {
+                    self.state.update_tab(tab_id, &url, "");
+                    self.persist_page_later(cx);
+                    if self.is_visible(tab_id) {
+                        cx.notify();
+                    }
                 }
                 if self.is_active(tab_id) {
                     self.error = Some(message);

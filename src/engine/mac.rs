@@ -340,9 +340,10 @@ wrap_load_handler! {
         fn on_loading_state_change(&self, _browser: Option<&mut Browser>, is_loading: i32, can_go_back: i32, can_go_forward: i32) {
             self.link.send(EngineEvent::Loading { tab_id: self.link.tab_id, loading: is_loading != 0, can_go_back: can_go_back != 0, can_go_forward: can_go_forward != 0 });
         }
-        fn on_load_error(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, error_code: Errorcode, error_text: Option<&CefString>, _failed_url: Option<&CefString>) {
+        fn on_load_error(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, error_code: Errorcode, error_text: Option<&CefString>, failed_url: Option<&CefString>) {
+            // ABORTED: downloads, 204s and superseded loads, which leave the page as it was.
             if error_code != Errorcode::ABORTED && frame.is_some_and(|frame| frame.is_main() != 0) {
-                self.link.send(EngineEvent::LoadError { tab_id: self.link.tab_id, message: error_text.map(ToString::to_string).unwrap_or_else(|| "Page could not be loaded".into()) });
+                self.link.send(EngineEvent::LoadError { tab_id: self.link.tab_id, url: failed_url.map(ToString::to_string).unwrap_or_default(), message: error_text.map(ToString::to_string).unwrap_or_else(|| "Page could not be loaded".into()) });
             }
         }
         fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _http_status_code: i32) {

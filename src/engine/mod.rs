@@ -90,8 +90,11 @@ pub enum EngineEvent {
         tab_id: u64,
         png: Vec<u8>,
     },
+    /// A main-frame load failed. `url` is the address that failed: failed
+    /// loads never report it as `Address`.
     LoadError {
         tab_id: u64,
+        url: String,
         message: String,
     },
     /// A page asked for a new tab: a popup, a ⌘-, ⇧- or middle-click, or the
