@@ -277,9 +277,10 @@ const TOOLTIP_HEIGHT: f32 = 26.;
 const TOOLTIP_EDGE: f32 = 6.;
 const TOOLTIP_MAX_WIDTH: f32 = 180.;
 const TOOLTIP_TEXT_SIZE: f32 = 12.;
-/// Wrapping tooltips: the line height, and the most lines shown.
+/// Wrapping tooltips: the line height, and the most lines shown, enough
+/// for a whole address: its end, the domain that owns it, matters most.
 const TOOLTIP_LINE: f32 = 16.;
-const TOOLTIP_MAX_LINES: usize = 4;
+const TOOLTIP_MAX_LINES: usize = 10;
 /// A tooltip's padding and border on each side, and the gap before its
 /// shortcut.
 const TOOLTIP_PADDING: f32 = 8. + 1.;
