@@ -11,7 +11,7 @@ pub mod link_status;
 pub mod menu;
 pub mod permissions;
 pub mod redraw;
-mod sidebar;
+pub mod sidebar;
 pub mod swipe;
 pub mod theme;
 pub mod toast_window;
@@ -49,9 +49,10 @@ pub struct SlideFrame {
 impl BrowserApp {
     /// The sidebar's width, unless it is hidden or a page is fullscreen. A
     /// hidden sidebar shows while the page on screen asks for a permission:
-    /// the question is in it.
+    /// the question is in it. It also peeks out from the window's edge.
     pub fn sidebar_width(&self) -> Option<f32> {
-        let shown = !self.state.sidebar_hidden || self.permission_shown().is_some();
+        let shown =
+            !self.state.sidebar_hidden || self.sidebar_peek || self.permission_shown().is_some();
         (shown && !self.fullscreen).then(|| self.state.sidebar_width())
     }
 
@@ -124,6 +125,7 @@ impl Render for BrowserApp {
         if !cx.has_active_drag() {
             self.tab_drag = None;
         }
+        self.prepare_sidebar(window, cx);
         let viewport = window.viewport_size();
         let (frame, slide_finished) = self.slide_frame(window);
         let theme = match (frame, &self.slide) {
@@ -170,6 +172,7 @@ impl Render for BrowserApp {
             .child(self.render_card(card, &theme, frame, slide_finished, viewport))
             .children(self.render_progress(card, &theme))
             .children(sidebar)
+            .children(self.render_peek_edge(cx))
             .children(menu)
     }
 }

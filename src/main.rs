@@ -83,6 +83,8 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-shift-t", Browse(ReopenClosedTab), None),
         KeyBinding::new("ctrl-tab", Browse(NextTab), None),
         KeyBinding::new("ctrl-shift-tab", Browse(PreviousTab), None),
+        KeyBinding::new("ctrl-escape", Browse(CancelTabSwitch), None),
+        KeyBinding::new("ctrl-shift-escape", Browse(CancelTabSwitch), None),
         KeyBinding::new("cmd-alt-down", Browse(NextTabInList), None),
         KeyBinding::new("cmd-alt-up", Browse(PreviousTabInList), None),
         KeyBinding::new("cmd-alt-left", Browse(PreviousSpace), None),
