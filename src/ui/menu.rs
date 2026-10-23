@@ -501,6 +501,8 @@ impl BrowserApp {
         {
             menu.anchor.y = title.bottom() + px(ROW_GAP);
             menu.above = title.top() - px(ROW_GAP);
+            // The title doesn't move with the window's bottom edge.
+            menu.bottom_bar = None;
         }
     }
 
