@@ -108,6 +108,11 @@ pub enum Command {
     ClearToday,
     NewSpace,
     DuplicateTab,
+    RenameTab,
+    /// The active space's other Today tabs, closed together.
+    CloseOtherTabs,
+    /// The Today tabs below the active tab, closed together.
+    CloseTabsBelow,
     MoveTab(SpaceId),
     RenameSpace,
     UnloadSpace,
@@ -154,6 +159,10 @@ pub struct ActiveTab {
     pub pin: Pin,
     pub host: Option<String>,
     pub blocking_disabled: bool,
+    /// For a Today tab: whether other Today tabs, or ones below it, would
+    /// close.
+    pub today_others: bool,
+    pub today_below: bool,
 }
 
 /// A recently closed tab.
@@ -214,6 +223,8 @@ pub struct CommandContext {
     pub spaces: Vec<(SpaceId, String)>,
     /// Recently closed tabs, the most recent first.
     pub closed: Vec<ClosedEntry>,
+    /// How many tabs ⇧⌘T reopens: all those a Clear closed together.
+    pub reopen_count: usize,
     /// Visited pages, the most recent first.
     pub history: Vec<HistoryEntry>,
     /// Seconds since the Unix epoch, for how long ago pages were visited.
@@ -670,27 +681,49 @@ fn actions(context: &CommandContext) -> Vec<(CommandItem, &'static str)> {
             .filter(|(id, _)| *id != context.space_id)
     };
     if let Some(active) = &context.active {
-        // ⌘D returns pinned tabs and favorites to Today.
-        actions.push(if active.pin == Pin::Today {
-            (action(Command::TogglePin, "Pin Tab", Icon::Pin, "⌘D"), "")
-        } else {
-            (
-                action(Command::TogglePin, "Unpin Tab", Icon::PinOff, "⌘D"),
-                "",
-            )
-        });
-        actions.push(if active.pin == Pin::Favorite {
-            let item = action(
-                Command::ToggleFavorite,
-                "Remove from Favorites",
-                Icon::Star,
-                "",
-            );
-            (item, "unfavorite")
-        } else {
-            let item = action(Command::ToggleFavorite, "Add to Favorites", Icon::Star, "");
-            (item, "favorite")
-        });
+        // ⌘D returns pinned tabs and favorites to Today; a favorite can
+        // also step down to Pinned. The words are the tab menu's.
+        match active.pin {
+            Pin::Today => actions.extend([
+                (action(Command::TogglePin, "Pin Tab", Icon::Pin, "⌘D"), ""),
+                (
+                    action(Command::ToggleFavorite, "Add to Favorites", Icon::Star, ""),
+                    "favorite",
+                ),
+            ]),
+            Pin::Pinned => actions.extend([
+                (
+                    action(Command::TogglePin, "Unpin Tab", Icon::PinOff, "⌘D"),
+                    "",
+                ),
+                (
+                    action(Command::ToggleFavorite, "Add to Favorites", Icon::Star, ""),
+                    "favorite",
+                ),
+            ]),
+            Pin::Favorite => actions.extend([
+                (
+                    action(
+                        Command::TogglePin,
+                        "Remove from Favorites",
+                        Icon::PinOff,
+                        "⌘D",
+                    ),
+                    "unpin unfavorite today",
+                ),
+                (
+                    action(Command::ToggleFavorite, "Move to Pinned", Icon::Pin, ""),
+                    "unfavorite",
+                ),
+            ]),
+        }
+        // Favorite tiles show no name to edit.
+        if active.pin != Pin::Favorite {
+            actions.push((
+                action(Command::RenameTab, "Rename Tab", Icon::Pencil, ""),
+                "name title",
+            ));
+        }
         actions.push((
             action(Command::DuplicateTab, "Duplicate Tab", Icon::Duplicate, ""),
             "copy clone",
@@ -704,6 +737,18 @@ fn actions(context: &CommandContext) -> Vec<(CommandItem, &'static str)> {
             ),
             "",
         ));
+        if active.today_others {
+            actions.push((
+                action(Command::CloseOtherTabs, "Close Other Tabs", Icon::Close, ""),
+                "today",
+            ));
+        }
+        if active.today_below {
+            actions.push((
+                action(Command::CloseTabsBelow, "Close Tabs Below", Icon::Close, ""),
+                "today",
+            ));
+        }
         for (id, name) in other_spaces() {
             let item = action(
                 Command::MoveTab(*id),
@@ -1080,13 +1125,20 @@ fn empty_results(context: &CommandContext) -> Vec<CommandItem> {
         .map(|tab| switch_item(tab, context))
         .collect();
     if let Some(closed) = context.closed.first() {
+        // ⇧⌘T brings back all the tabs a Clear closed, not just this one.
+        let together = context.reopen_count > 1;
         let detail = match context.space_name(closed.space_id) {
             Some(space) if closed.space_id != context.space_id => Some(space.to_owned()),
+            _ if together => None,
             _ => site(&closed.url),
         };
         items.push(CommandItem {
             command: Command::ReopenClosedTab,
-            title: format!("Reopen {}", closed.title),
+            title: if together {
+                format!("Reopen {} Closed Tabs", context.reopen_count)
+            } else {
+                format!("Reopen {}", closed.title)
+            },
             detail,
             hint: "⇧⌘T".into(),
             icon: ItemIcon::Glyph(Icon::Reopen),
@@ -1708,6 +1760,8 @@ mod tests {
                 pin: Pin::Today,
                 host: Some("en.wikipedia.org".into()),
                 blocking_disabled: false,
+                today_others: true,
+                today_below: true,
             }),
             spaces: vec![(1, "Personal".into()), (2, "Work".into())],
             closed: vec![ClosedEntry {
@@ -1716,6 +1770,7 @@ mod tests {
                 title: "Lobsters".into(),
                 url: "https://lobste.rs/".into(),
             }],
+            reopen_count: 1,
             history: Vec::new(),
             now: 0,
             sidebar_hidden: false,
@@ -1896,7 +1951,7 @@ mod tests {
         for (pin, title) in [
             (Pin::Today, "Pin Tab"),
             (Pin::Pinned, "Unpin Tab"),
-            (Pin::Favorite, "Unpin Tab"),
+            (Pin::Favorite, "Remove from Favorites"),
         ] {
             let mut context = context();
             context.active.as_mut().unwrap().pin = pin;

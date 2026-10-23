@@ -1696,6 +1696,8 @@ impl BrowserApp {
             .collect();
         let active = self.state.active_tab().map(|tab| {
             let host = host_of(&tab.url);
+            let today: Vec<TabId> = active_space.section(Pin::Today).map(|tab| tab.id).collect();
+            let at = today.iter().position(|&id| id == tab.id);
             ActiveTab {
                 id: tab.id,
                 url: tab.url.clone(),
@@ -1704,6 +1706,8 @@ impl BrowserApp {
                     .as_deref()
                     .is_some_and(|host| self.state.is_blocking_disabled(host)),
                 host,
+                today_others: at.is_some() && today.len() > 1,
+                today_below: at.is_some_and(|at| at + 1 < today.len()),
             }
         });
         let closed = self
@@ -1714,7 +1718,7 @@ impl BrowserApp {
             .map(|closed| ClosedEntry {
                 id: closed.tab.id,
                 space_id: closed.space_id,
-                title: closed.tab.title.clone(),
+                title: closed.tab.shown_title().to_owned(),
                 url: closed.tab.url.clone(),
             })
             .collect();
@@ -1730,6 +1734,7 @@ impl BrowserApp {
                 .map(|space| (space.id, space.name.clone()))
                 .collect(),
             closed,
+            reopen_count: self.state.last_closed_count(),
             history: self
                 .history
                 .pages()
@@ -1780,6 +1785,9 @@ impl BrowserApp {
             | Command::ToggleFavorite
             | Command::CopyUrl
             | Command::DuplicateTab
+            | Command::RenameTab
+            | Command::CloseOtherTabs
+            | Command::CloseTabsBelow
             | Command::MoveTab(_) => {
                 let Some(id) = active else {
                     return;
@@ -1789,6 +1797,13 @@ impl BrowserApp {
                     Command::TogglePin => self.toggle_pin(id, cx),
                     Command::ToggleFavorite => self.toggle_favorite(id, cx),
                     Command::DuplicateTab => self.duplicate_tab(id, window, cx),
+                    Command::RenameTab => {
+                        // The name is edited in the tab's row.
+                        self.set_sidebar_hidden(false, cx);
+                        self.start_tab_rename(id, window, cx);
+                    }
+                    Command::CloseOtherTabs => self.close_today_tabs_around(id, false, cx),
+                    Command::CloseTabsBelow => self.close_today_tabs_around(id, true, cx),
                     Command::MoveTab(space_id) => self.move_tab_to_space(id, space_id, cx),
                     _ => self.copy_url(id, cx),
                 }

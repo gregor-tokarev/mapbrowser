@@ -1088,20 +1088,27 @@ impl BrowserState {
         (index < self.closed.len()).then(|| self.closed.remove(index))
     }
 
-    /// Takes the most recent close off the list: one tab, or all the tabs
-    /// closed together with it.
-    pub fn take_last_closed(&mut self) -> Vec<ClosedTab> {
+    /// How many tabs the most recent close took: one, or all the tabs closed
+    /// together with it.
+    pub fn last_closed_count(&self) -> usize {
         let Some(last) = self.closed.last() else {
-            return Vec::new();
+            return 0;
         };
-        let start = match last.batch {
+        match last.batch {
             Some(batch) => self
                 .closed
                 .iter()
-                .rposition(|closed| closed.batch != Some(batch))
-                .map_or(0, |index| index + 1),
-            None => self.closed.len() - 1,
-        };
+                .rev()
+                .take_while(|closed| closed.batch == Some(batch))
+                .count(),
+            None => 1,
+        }
+    }
+
+    /// Takes the most recent close off the list: one tab, or all the tabs
+    /// closed together with it.
+    pub fn take_last_closed(&mut self) -> Vec<ClosedTab> {
+        let start = self.closed.len() - self.last_closed_count();
         self.closed.split_off(start)
     }
 
