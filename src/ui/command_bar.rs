@@ -764,8 +764,8 @@ fn actions(context: &CommandContext) -> Vec<(CommandItem, &'static str)> {
     actions.push((sidebar_action(context), "toggle"));
     if context.has_today {
         actions.push((
-            action(Command::ClearToday, "Clear Today Tabs", Icon::Broom, "⇧⌘K"),
-            "archive",
+            action(Command::ClearToday, "Clear Today", Icon::Broom, "⇧⌘K"),
+            "tabs archive",
         ));
     }
     if !context.closed.is_empty() {
@@ -794,11 +794,11 @@ fn actions(context: &CommandContext) -> Vec<(CommandItem, &'static str)> {
     for (id, name) in other_spaces() {
         let item = action(
             Command::SwitchToSpace(*id),
-            format!("Switch to Space {name}"),
+            format!("Switch to {name}"),
             Icon::ArrowRight,
             "",
         );
-        actions.push((item, "go"));
+        actions.push((item, "go space"));
     }
     actions.push((
         action(Command::ShowHistory, "Show History", Icon::History, "⌘Y"),
