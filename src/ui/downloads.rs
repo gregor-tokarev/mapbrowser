@@ -7,6 +7,7 @@
 
 use super::{
     icons::{Icon, icon},
+    menu::MenuKind,
     shadow,
     theme::Theme,
     toast_window::ToastKind,
@@ -423,6 +424,14 @@ impl BrowserApp {
             && self.engine.borrow().has_tab(tab_id)
         {
             self.engine.borrow_mut().close_tab(tab_id);
+        }
+        // The open library shows a failure as it happens: it is no news.
+        if self
+            .menu
+            .as_ref()
+            .is_some_and(|menu| menu.kind == MenuKind::Library)
+        {
+            self.downloads.failure_unseen = false;
         }
         self.save_downloads(cx);
         match end {
