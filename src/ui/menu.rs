@@ -399,8 +399,9 @@ impl Entry {
 }
 
 /// A space's icon, or a dot in its colour as the switcher shows it, in a
-/// 16 pt slot.
-fn space_mark(icon: Option<String>, theme: u8, dark: bool) -> gpui::Div {
+/// 16 pt slot. On a highlighted row the dot has a white ring: the
+/// highlight may be the very same colour.
+fn space_mark(icon: Option<String>, theme: u8, dark: bool, lit: bool) -> gpui::Div {
     let dot = Theme::new(theme, dark).focus();
     div()
         .flex()
@@ -410,7 +411,13 @@ fn space_mark(icon: Option<String>, theme: u8, dark: bool) -> gpui::Div {
         .size(px(16.))
         .map(|slot| match icon {
             Some(emoji) => slot.text_size(px(13.)).child(emoji),
-            None => slot.child(div().size(px(7.)).rounded_full().bg(dot)),
+            None => slot.child(
+                div()
+                    .size(px(if lit { 9. } else { 7. }))
+                    .rounded_full()
+                    .bg(dot)
+                    .when(lit, |dot| dot.border_1().border_color(gpui::white())),
+            ),
         })
 }
 
@@ -929,7 +936,7 @@ impl BrowserApp {
                 .text_size(px(13.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.title())
-                .child(space_mark(space_icon, space_theme, theme.dark))
+                .child(space_mark(space_icon, space_theme, theme.dark, false))
                 .child(truncated(name).flex_1().min_w_0())
                 .into_any_element(),
             Entry::Empty(text) => div()
@@ -1115,7 +1122,12 @@ impl BrowserApp {
             } => {
                 let row = item(3000 + index, true)
                     .gap(px(8.))
-                    .child(space_mark(space_icon, space_theme, theme.dark))
+                    .child(space_mark(
+                        space_icon,
+                        space_theme,
+                        theme.dark,
+                        lit.is_some(),
+                    ))
                     .child(
                         truncated(name)
                             .flex_1()
