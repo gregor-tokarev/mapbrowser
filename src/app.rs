@@ -2437,7 +2437,9 @@ impl BrowserApp {
                 cx.write_to_clipboard(ClipboardItem::new_image(&image));
                 self.show_toast("Copied Image", cx);
             }
-            EngineEvent::CopyImage(None) => self.show_toast("Couldn't copy the image", cx),
+            EngineEvent::CopyImage(None) => {
+                self.show_toast_kind(ToastKind::Failed, "Couldn't copy the image", cx)
+            }
             // The page takes keyboard focus from the press itself.
             EngineEvent::PagePressed => {
                 self.end_rename(window, cx);

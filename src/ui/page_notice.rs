@@ -16,6 +16,7 @@ use super::{
     icons::{Icon, icon},
     press_only,
     theme::Theme,
+    toast_window::ToastKind,
 };
 use crate::{
     app::BrowserApp,
@@ -1042,7 +1043,8 @@ impl BrowserApp {
     /// Reports a blocked pop-up once per page, for the tab on screen.
     pub(crate) fn popup_blocked(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
         if self.active_tab_id() == Some(tab_id) && self.notices.popups_reported.insert(tab_id) {
-            self.show_toast("Pop-up blocked", cx);
+            // News, not a failure: the page went on without it.
+            self.show_toast_kind(ToastKind::Info, "Pop-up blocked", cx);
         }
     }
 
