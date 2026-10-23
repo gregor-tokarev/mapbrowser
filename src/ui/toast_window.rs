@@ -24,8 +24,8 @@ use crate::app::BrowserApp;
 use gpui::{
     AnyElement, AppContext, Bounds, Context, Div, Font, FontWeight, InteractiveElement,
     IntoElement, ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement,
-    Styled, Task, TextRun, Window, WindowHandle, WindowOptions, div, font, point,
-    prelude::FluentBuilder, px, size,
+    Styled, Task, Window, WindowHandle, WindowOptions, div, font, point, prelude::FluentBuilder,
+    px, size,
 };
 use std::time::Duration;
 
@@ -108,23 +108,11 @@ fn mark(kind: ToastKind, theme: &Theme) -> AnyElement {
 
 /// The width of `text` as toasts draw it.
 fn text_width(text: &str, window: &Window) -> f32 {
-    let run = TextRun {
-        len: text.len(),
-        font: Font {
-            weight: FontWeight::MEDIUM,
-            ..font(UI_FONT)
-        },
-        color: gpui::black(),
-        background_color: None,
-        underline: None,
-        strikethrough: None,
+    let medium = Font {
+        weight: FontWeight::MEDIUM,
+        ..font(UI_FONT)
     };
-    f32::from(
-        window
-            .text_system()
-            .layout_line(text, px(FONT_SIZE), &[run], None)
-            .width,
-    )
+    super::text_width(text, medium, FONT_SIZE, window)
 }
 
 /// `text`, elided in the middle to fit `room` points.

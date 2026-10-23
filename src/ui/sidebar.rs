@@ -4,14 +4,15 @@
 //! under the fixed navigation row and bottom bar.
 
 use super::{
-    CARD_INSET, MaybeTooltip, SlideFrame, TOOLTIP_EDGE, TOOLTIP_GAP, Tooltip, UI_FONT,
+    CARD_INSET, MaybeTooltip, SlideFrame, TOOLTIP_EDGE, TOOLTIP_PADDING, Tooltip, UI_FONT,
+    beside_pointer,
     command_bar::CommandMode,
     drag::{DraggedEdge, DraggedTab, EDGE_HANDLE, TabDrag, TabPreview},
     icons::{Icon, icon},
     menu::MenuKind,
-    placeholder_favicon, press_only, shadow,
+    placeholder_favicon, press_only, shadow, text_width,
     theme::Theme,
-    truncated, wrapped_lines,
+    tooltip_bubble, truncated, wrapped_lines,
 };
 use crate::{
     app::BrowserApp,
@@ -24,8 +25,8 @@ use gpui::{
     AnyElement, AnyView, App, AppContext, Bounds, BoxShadow, ClickEvent, Context, Div,
     DragMoveEvent, EmptyView, Font, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, Pixels, Point, Render, ScrollHandle, ScrollWheelEvent,
-    SharedString, Size, Stateful, StatefulInteractiveElement, Styled, TextRun, Window, div, font,
-    img, point, prelude::FluentBuilder, px, size,
+    SharedString, Size, Stateful, StatefulInteractiveElement, Styled, Window, div, font, img,
+    point, prelude::FluentBuilder, px, size,
 };
 use std::{cell::Cell, collections::HashMap, rc::Rc, time::Instant};
 
@@ -1850,8 +1851,9 @@ struct TabTooltip {
     width: f32,
     /// The pointer's x when the tooltip opened.
     pointer: f32,
-    /// The lines the title takes, for the tooltip's height.
+    /// The lines the title takes, and the width it wraps at.
     lines: usize,
+    room: f32,
 }
 
 impl TabTooltip {
@@ -1868,28 +1870,12 @@ impl TabTooltip {
             return cx.new(|_| EmptyView).into();
         };
         let title = tab.shown_title().to_owned();
-        let run = TextRun {
-            len: title.len(),
-            font: font(UI_FONT),
-            color: gpui::black(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let title_width = f32::from(
-            window
-                .text_system()
-                .layout_line(&title, px(14.), &[run], None)
-                .width,
-        );
-        if title_width <= width - ROW_TITLE_CHROME {
+        if text_width(&title, font(UI_FONT), 14., window) <= width - ROW_TITLE_CHROME {
             return cx.new(|_| EmptyView).into();
         }
         // At the tooltip's 12 pt, in the bubble less its padding.
-        let bubble = TAB_TOOLTIP_MAX_WIDTH.min(width - 2. * TOOLTIP_EDGE) - 16.;
-        let lines = (title_width * 12. / 14. / bubble.max(1.))
-            .ceil()
-            .clamp(1., TAB_TOOLTIP_LINES as f32) as usize;
+        let room = TAB_TOOLTIP_MAX_WIDTH.min(width - 2. * TOOLTIP_EDGE) - 2. * TOOLTIP_PADDING;
+        let lines = wrapped_lines(&title, font(UI_FONT), 12., room, cx).min(TAB_TOOLTIP_LINES);
         let host = host_of(&tab.url).unwrap_or(tab.url);
         let (theme, pointer) = (*theme, f32::from(window.mouse_position().x));
         cx.new(|_| Self {
@@ -1899,6 +1885,7 @@ impl TabTooltip {
             width,
             pointer,
             lines,
+            room,
         })
         .into()
     }
@@ -1907,24 +1894,16 @@ impl TabTooltip {
 impl Render for TabTooltip {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &self.theme;
-        let span = (self.width - 2. * TOOLTIP_EDGE).max(0.);
         // Padding and border, the title's lines and the host's.
         let height = 2. * 5. + 2. + 16. * self.lines as f32 + 15.;
-        let bubble = div()
-            .font_family(UI_FONT)
-            .flex()
+        let bubble = tooltip_bubble(theme)
             .flex_col()
-            .flex_none()
-            .max_w(px(TAB_TOOLTIP_MAX_WIDTH.min(span)))
-            .px(px(8.))
+            .max_w(px(TAB_TOOLTIP_MAX_WIDTH.min(self.width - 2. * TOOLTIP_EDGE)))
             .py(px(5.))
-            .rounded(px(6.))
-            .bg(theme.surface())
-            .border_1()
-            .border_color(gpui::black().opacity(0.1))
-            .shadow(vec![shadow(2., 8., 0.12)])
             .child(
                 div()
+                    // A title that wraps does so where it was measured.
+                    .when(self.lines > 1, |title| title.w(px(self.room)))
                     .line_clamp(TAB_TOOLTIP_LINES)
                     .text_ellipsis()
                     .text_size(px(12.))
@@ -1938,23 +1917,6 @@ impl Render for TabTooltip {
                     .line_height(px(15.))
                     .text_color(theme.tertiary()),
             );
-        // Beside the pointer in a row across the sidebar, like `Tooltip`.
-        let origin = self.pointer + 1.;
-        let spacer = |width: f32| div().min_w_0().w(px(width.max(0.)));
-        let row = div()
-            .absolute()
-            .top(px(TOOLTIP_GAP))
-            .left(px(TOOLTIP_EDGE - origin))
-            .w(px(span))
-            .flex()
-            .items_start();
-        let row = if self.pointer > self.width / 2. {
-            row.justify_end()
-                .child(bubble)
-                .child(spacer(self.width - TOOLTIP_EDGE - self.pointer))
-        } else {
-            row.child(spacer(origin - TOOLTIP_EDGE)).child(bubble)
-        };
-        div().w_0().h(px(TOOLTIP_GAP + height)).child(row)
+        beside_pointer(bubble, self.pointer, self.width, height)
     }
 }

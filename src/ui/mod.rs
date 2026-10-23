@@ -330,8 +330,9 @@ impl Tooltip {
                 .then(|| {
                     let mut room = Self::max_width(width) - 2. * TOOLTIP_PADDING;
                     if !shortcut.is_empty() {
-                        room -=
-                            text_width(shortcut, TOOLTIP_TEXT_SIZE, window) + TOOLTIP_SHORTCUT_GAP;
+                        let shortcut =
+                            text_width(shortcut, font(UI_FONT), TOOLTIP_TEXT_SIZE, window);
+                        room -= shortcut.ceil() + TOOLTIP_SHORTCUT_GAP;
                     }
                     let lines = wrapped_lines(&text, font(UI_FONT), TOOLTIP_TEXT_SIZE, room, cx);
                     (lines.min(TOOLTIP_MAX_LINES), room)
@@ -356,11 +357,11 @@ impl Tooltip {
     }
 }
 
-/// The width of one line of `text` in the UI font at `size`.
-fn text_width(text: &str, size: f32, window: &Window) -> f32 {
+/// The width of one line of `text` in `font` at `size`.
+pub fn text_width(text: &str, font: Font, size: f32, window: &Window) -> f32 {
     let run = TextRun {
         len: text.len(),
-        font: font(UI_FONT),
+        font,
         color: gpui::black(),
         background_color: None,
         underline: None,
@@ -370,29 +371,59 @@ fn text_width(text: &str, size: f32, window: &Window) -> f32 {
         .text_system()
         .layout_line(text, px(size), &[run], None)
         .width;
-    f32::from(width).ceil()
+    f32::from(width)
+}
+
+/// A tooltip's bubble, for `Tooltip` and the tab rows' own.
+fn tooltip_bubble(theme: &Theme) -> Div {
+    div()
+        .font_family(UI_FONT)
+        .flex()
+        .flex_none()
+        .px(px(8.))
+        .rounded(px(6.))
+        .bg(theme.surface())
+        .border_1()
+        .border_color(gpui::black().opacity(0.1))
+        .shadow(vec![shadow(2., 8., 0.12)])
+}
+
+/// Places a tooltip's `bubble`, `height` tall, beside the pointer at x
+/// `pointer` in a sidebar `width` wide. GPUI puts a tooltip's top-left 1 pt
+/// right of the pointer. With no width of its own GPUI never flips it; the
+/// bubble sits in a row across the sidebar instead, beside the pointer,
+/// where a spacer that shrinks first keeps it from running past either edge.
+fn beside_pointer(bubble: Div, pointer: f32, width: f32, height: f32) -> Div {
+    let span = (width - 2. * TOOLTIP_EDGE).max(0.);
+    let origin = pointer + 1.;
+    let spacer = |width: f32| div().min_w_0().w(px(width.max(0.)));
+    let row = div()
+        .absolute()
+        .top(px(TOOLTIP_GAP))
+        .left(px(TOOLTIP_EDGE - origin))
+        .w(px(span))
+        .flex()
+        .items_start();
+    let row = if pointer > width / 2. {
+        row.justify_end()
+            .child(bubble)
+            .child(spacer(width - TOOLTIP_EDGE - pointer))
+    } else {
+        row.child(spacer(origin - TOOLTIP_EDGE)).child(bubble)
+    };
+    div().w_0().h(px(TOOLTIP_GAP + height)).child(row)
 }
 
 impl Render for Tooltip {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &self.theme;
-        let span = (self.width - 2. * TOOLTIP_EDGE).max(0.);
         let height = match self.wrapped {
             Some((lines, _)) => lines as f32 * TOOLTIP_LINE + 2. * 5. + 2.,
             None => TOOLTIP_HEIGHT,
         };
-        let bubble = div()
-            .font_family(UI_FONT)
-            .flex()
+        let bubble = tooltip_bubble(theme)
             .gap(px(TOOLTIP_SHORTCUT_GAP))
             .h(px(height))
-            .px(px(8.))
-            .rounded(px(6.))
-            .bg(theme.surface())
-            .border_1()
-            .border_color(gpui::black().opacity(0.1))
-            .shadow(vec![shadow(2., 8., 0.12)])
-            .flex_none()
             .max_w(px(Self::max_width(self.width)))
             .text_size(px(TOOLTIP_TEXT_SIZE))
             .text_color(theme.title())
@@ -420,25 +451,6 @@ impl Render for Tooltip {
                         .child(self.shortcut),
                 )
             });
-        // GPUI puts a tooltip's top-left 1 pt right of the pointer. With no
-        // width of its own GPUI never flips it; the bubble sits in a row
-        // across the sidebar instead, beside the pointer, where a spacer
-        // that shrinks first keeps it from running past either edge.
-        let origin = self.pointer + 1.;
-        let spacer = |width: f32| div().min_w_0().w(px(width.max(0.)));
-        let row = div()
-            .absolute()
-            .top(px(TOOLTIP_GAP))
-            .left(px(TOOLTIP_EDGE - origin))
-            .w(px(span))
-            .flex();
-        let row = if self.pointer > self.width / 2. {
-            row.justify_end()
-                .child(bubble)
-                .child(spacer(self.width - TOOLTIP_EDGE - self.pointer))
-        } else {
-            row.child(spacer(origin - TOOLTIP_EDGE)).child(bubble)
-        };
-        div().w_0().h(px(TOOLTIP_GAP + height)).child(row)
+        beside_pointer(bubble, self.pointer, self.width, height)
     }
 }
