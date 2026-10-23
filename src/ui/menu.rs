@@ -12,6 +12,7 @@ use super::{
 use crate::{
     app::BrowserApp,
     model::{Pin, SpaceId, THEME_COUNT, TabId},
+    ui::page_notice::Leaving,
 };
 use gpui::{
     AnyElement, Bounds, Context, FontWeight, InteractiveElement, IntoElement, MouseButton,
@@ -65,6 +66,7 @@ enum Action {
     CopyLink(TabId),
     Duplicate(TabId),
     Reload(TabId),
+    ToggleMute(TabId),
     Close(TabId),
     Delete(TabId),
     Rename(SpaceId),
@@ -243,8 +245,17 @@ impl BrowserApp {
                 if self.state.spaces.len() > 1 {
                     entries.push(Entry::item("Move to Space", "›", Action::AskMoveTab(id)));
                 }
+                entries.push(Entry::item("Reload", "⌘R", Action::Reload(id)));
+                // Only a page that is open can play sound.
+                if self.is_loaded(id) {
+                    let label = if self.page(id).muted {
+                        "Unmute Tab"
+                    } else {
+                        "Mute Tab"
+                    };
+                    entries.push(Entry::item(label, "", Action::ToggleMute(id)));
+                }
                 entries.extend([
-                    Entry::item("Reload", "⌘R", Action::Reload(id)),
                     Entry::Separator,
                     Entry::item("Close Tab", "⌘W", Action::Close(id)),
                 ]);
@@ -715,8 +726,10 @@ impl BrowserApp {
             Action::CopyLink(id) => self.copy_url(id, cx),
             Action::Duplicate(id) => self.duplicate_tab(id, window, cx),
             Action::Reload(id) => self.reload(id, cx),
+            Action::ToggleMute(id) => self.toggle_mute(id, cx),
             Action::Close(id) => self.close_tab(id, cx),
-            Action::Delete(id) => self.remove_tab(id, cx),
+            // A page with unsaved changes asks first.
+            Action::Delete(id) => self.leave_tab(id, Leaving::Close, cx),
             Action::Rename(id) => self.start_rename(id, window, cx),
             Action::Theme(id, theme) => self.set_space_theme(id, theme, cx),
             Action::SpaceIcon(id, icon) => self.set_space_icon(id, icon, cx),
@@ -729,7 +742,7 @@ impl BrowserApp {
             Action::AskDeleteSpace(_) | Action::AskMoveTab(_) => {}
             Action::DeleteSpace(id) => self.delete_space(id, window, cx),
             Action::RevealDownload(id) => self.reveal_download(id),
-            Action::MoveTab(id, space_id) => self.move_tab_to_space(id, space_id, cx),
+            Action::MoveTab(id, space_id) => self.leave_tab(id, Leaving::Move(space_id), cx),
         }
     }
 }

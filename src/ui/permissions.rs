@@ -224,12 +224,15 @@ impl BrowserApp {
         self.permissions.shown(self.active_tab_id())
     }
 
-    /// Esc: closes the open menu, else dismisses the permission card.
+    /// Esc: closes the open menu, else dismisses the permission card, else
+    /// leaves page fullscreen (on macOS the key monitor sees Esc first).
     pub fn dismiss(&mut self, cx: &mut Context<Self>) {
         if self.menu.is_some() {
             self.close_menu(cx);
         } else if let Some(id) = self.permission_shown().map(|request| request.id) {
             self.answer_permission(id, PermissionDecision::Dismiss, cx);
+        } else if self.fullscreen {
+            self.exit_page_fullscreen();
         }
     }
 

@@ -535,6 +535,10 @@ impl BrowserApp {
                     })
                     .when(self.is_dragged(id), |tile| tile.opacity(DRAGGED_OPACITY))
                     .child(self.favicon(tab, 20., theme))
+                    .children(
+                        self.render_tab_badges(id, 11., width, theme, cx)
+                            .map(|badges| badges.absolute().top(px(3.)).right(px(4.))),
+                    )
                     .when(interactive, |tile| {
                         // Its title when it opens: a favorite isn't redrawn
                         // when only its title changes.
@@ -760,6 +764,10 @@ impl BrowserApp {
     }
 
     pub(super) fn favicon(&self, tab: &Tab, size: f32, theme: &Theme) -> AnyElement {
+        // A crashed page shows on its tab, as Chrome's sad tab does.
+        if self.notices.crashed(tab.id) {
+            return icon(Icon::Warning, size, theme.muted()).into_any_element();
+        }
         let host = host_of(&tab.url);
         match host.as_deref().and_then(|host| self.favicons.get(host)) {
             Some(image) => img(image).size(px(size)).flex_none().into_any_element(),
@@ -829,6 +837,8 @@ impl BrowserApp {
         } else {
             Icon::Minus
         };
+        let badges = self.render_tab_badges(id, 14., width, theme, cx);
+        let title_margin = title_room && badges.is_none();
         div()
             .id(("tab", id))
             .group("tab-row")
@@ -857,10 +867,15 @@ impl BrowserApp {
                     .flex_1()
                     .min_w_0()
                     .ml(px(11.5))
-                    .when(title_room, |title| title.mr(px(24.)))
+                    .when(title_margin, |title| title.mr(px(24.)))
                     .text_size(px(14.))
                     .text_color(theme.title()),
             )
+            .children(badges.map(|badges| {
+                badges
+                    .ml(px(6.))
+                    .when(title_room, |badges| badges.mr(px(24.)))
+            }))
             .when(interactive && self.is_switch_target(id), |row| {
                 row.child(switch_outline(theme))
             })

@@ -1,6 +1,7 @@
 //! Chromium runs in native child NSViews. Pages keep their own compositor and
 //! process lifetime; GPUI only draws the browser controls.
 
+mod audio;
 mod blocking;
 mod commands;
 mod context_menu;
@@ -8,12 +9,14 @@ mod downloads;
 mod find;
 mod modifiers;
 mod page_keys;
+mod page_requests;
 mod permissions;
 mod popups;
 mod protocols;
 
 use super::{
-    EditCommand, EngineEvent, PermissionDecision, edit_command, merge_features, opens_in_tab,
+    CrashReason, EditCommand, EngineEvent, PermissionDecision, edit_command, merge_features,
+    opens_in_tab,
     page::{LoadState, PageLoad, elide_middle, favicon_wait},
 };
 use crate::blocker::ContentBlocker;
@@ -33,6 +36,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use page_keys::KeyPress;
+use page_requests::Answer;
 use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
@@ -68,6 +72,13 @@ const ENABLE_FEATURES: &[&str] = &[
     // Aligns wake-ups to 32 ms, only while Battery Saver is active.
     "BatterySaverModeAlignWakeUps",
 ];
+/// Browser-process switches the shell's own page UI needs.
+const SHELL_SWITCHES: &[&str] = &[
+    // Sign-ins (HTTP authentication) go to RequestHandler::GetAuthCredentials,
+    // and the page card asks for them; Chrome's own login dialog has no
+    // window to show in beside Alloy pages in native views.
+    "disable-chrome-login-prompt",
+];
 
 /// Opaque white (0xAARRGGBB), Chromium's default page colour, shown until a
 /// page paints so new and reloading views never flash another colour.
@@ -97,6 +108,11 @@ struct PendingBrowsers {
     initialized_surface: HashSet<u64>,
     /// Popup and DevTools windows by browser identifier; see `popups`.
     popups: HashMap<i32, Browser>,
+    /// Instances the user asked to close (`Engine::close_tab_asking`):
+    /// their page may still ask to stay.
+    asking: HashSet<u64>,
+    /// Instances whose close went ahead: CEF called DoClose.
+    closing: HashSet<u64>,
 }
 
 impl PendingBrowsers {
@@ -145,6 +161,8 @@ struct PageState {
     load: PageLoad,
     /// The hovered link's address as last sent; empty for none.
     status: String,
+    /// The page's frames that play sound, by the token `audio` gives them.
+    audible_frames: HashSet<String>,
 }
 
 /// Identity and shared state the handlers of one browser report through.
@@ -158,6 +176,7 @@ struct BrowserLink {
     live_browsers: Arc<AtomicUsize>,
     downloads: downloads::Downloads,
     permissions: permissions::PermissionRequests,
+    requests: page_requests::PageRequests,
 }
 
 impl BrowserLink {
@@ -189,7 +208,7 @@ wrap_app! {
             // Browser process only; helpers inherit its feature state.
             if process_type.is_some_and(|kind| !kind.to_string().is_empty()) { return; }
             if let Some(command_line) = command_line.filter(|command_line| command_line.is_read_only() == 0) {
-                apply_energy_switches(command_line);
+                apply_switches(command_line);
             }
         }
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
@@ -198,8 +217,8 @@ wrap_app! {
     }
 }
 
-fn apply_energy_switches(command_line: &CommandLine) {
-    for switch in ENERGY_SWITCHES {
+fn apply_switches(command_line: &CommandLine) {
+    for switch in ENERGY_SWITCHES.iter().chain(SHELL_SWITCHES) {
         let switch = CefString::from(*switch);
         if command_line.has_switch(Some(&switch)) == 0 {
             command_line.append_switch(Some(&switch));
@@ -250,6 +269,8 @@ mod client {
             find: FindHandler,
             downloads: DownloadHandler,
             permissions: PermissionHandler,
+            focus: FocusHandler,
+            dialogs: JsdialogHandler,
         }
         impl Client {
             fn display_handler(&self) -> Option<DisplayHandler> {
@@ -279,6 +300,12 @@ mod client {
             fn permission_handler(&self) -> Option<PermissionHandler> {
                 Some(self.permissions.clone())
             }
+            fn focus_handler(&self) -> Option<FocusHandler> {
+                Some(self.focus.clone())
+            }
+            fn jsdialog_handler(&self) -> Option<JsdialogHandler> {
+                Some(self.dialogs.clone())
+            }
         }
     }
 }
@@ -291,12 +318,14 @@ fn tab_client(link: BrowserLink) -> Client {
         TabDisplay::new(link.clone(), page.clone()),
         TabLoad::new(link.clone(), page.clone()),
         TabLife::new(link.clone()),
-        context_menu::TabMenu::new(link.clone(), false),
-        TabRequests::new(link.clone(), page),
+        context_menu::TabMenu::new(link.clone()),
+        TabRequests::new(link.clone(), page, false),
         page_keys::PageKeys::new(link.clone(), false),
         find::TabFind::new(link.clone()),
-        downloads::TabDownloads::new(link.clone()),
-        permissions::TabPermissions::new(link),
+        downloads::TabDownloads::new(link.clone(), false),
+        permissions::TabPermissions::new(link.clone()),
+        TabFocus::new(),
+        TabDialogs::new(link),
     )
 }
 
@@ -372,6 +401,41 @@ wrap_display_handler! {
             }
             self.link.send(EngineEvent::Fullscreen { tab_id: self.link.tab_id, fullscreen });
         }
+        fn on_media_access_change(&self, _browser: Option<&mut Browser>, has_video_access: i32, has_audio_access: i32) {
+            self.link.send(EngineEvent::MediaAccess { tab_id: self.link.tab_id, video: has_video_access != 0, audio: has_audio_access != 0 });
+        }
+        fn on_console_message(&self, _browser: Option<&mut Browser>, _level: LogSeverity, message: Option<&CefString>, _source: Option<&CefString>, _line: i32) -> i32 {
+            // The audio script's reports; the page's own messages pass.
+            let Some((frame, audible)) = message.and_then(audio::report) else { return 0; };
+            let changed = {
+                let mut page = self.page.lock().expect("page state");
+                let before = !page.audible_frames.is_empty();
+                if audible {
+                    page.audible_frames.insert(frame);
+                } else {
+                    page.audible_frames.remove(&frame);
+                }
+                before != !page.audible_frames.is_empty()
+            };
+            if changed {
+                self.link.send(EngineEvent::Audible { tab_id: self.link.tab_id, audible });
+            }
+            1
+        }
+    }
+}
+
+/// A page's frames stopped playing: its document went, or its renderer.
+fn page_silent(link: &BrowserLink, page: &Mutex<PageState>) {
+    let was_audible = {
+        let mut page = page.lock().expect("page state");
+        !std::mem::take(&mut page.audible_frames).is_empty()
+    };
+    if was_audible {
+        link.send(EngineEvent::Audible {
+            tab_id: link.tab_id,
+            audible: false,
+        });
     }
 }
 
@@ -474,12 +538,14 @@ wrap_load_handler! {
         fn on_load_error(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, error_code: Errorcode, error_text: Option<&CefString>, failed_url: Option<&CefString>) {
             // ABORTED: downloads, 204s and superseded loads, which leave the page as it was.
             if error_code != Errorcode::ABORTED && frame.is_some_and(|frame| frame.is_main() != 0) {
-                self.link.send(EngineEvent::LoadError { tab_id: self.link.tab_id, url: failed_url.map(ToString::to_string).unwrap_or_default(), message: error_text.map(ToString::to_string).unwrap_or_else(|| "Page could not be loaded".into()) });
+                self.link.send(EngineEvent::LoadError { tab_id: self.link.tab_id, url: failed_url.map(ToString::to_string).unwrap_or_default(), code: error_code.get_raw(), message: error_text.map(ToString::to_string).unwrap_or_else(|| "Page could not be loaded".into()) });
             }
         }
         fn on_load_start(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, _transition_type: TransitionType) {
             if frame.is_some_and(|frame| frame.is_main() != 0) {
                 self.link.permissions.drop_page(&self.link);
+                self.link.requests.drop_page(&self.link, false);
+                page_silent(&self.link, &self.page);
                 // CEF calls this as a navigation to another document commits,
                 // never for same-document ones, then reports the address.
                 if self.link.navigation_started() {
@@ -488,6 +554,10 @@ wrap_load_handler! {
             }
         }
         fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _http_status_code: i32) {
+            // Every frame's media may play sound.
+            if let Some(frame) = frame.as_deref() {
+                audio::watch(frame);
+            }
             if !frame.is_some_and(|frame| frame.is_main() != 0 && CefString::from(&frame.url()).to_string() != "about:blank") { return; }
             if !self.link.pending().initialized_surface.insert(self.link.instance) { return; }
             if let Some(view) = browser.and_then(|browser| browser_view(browser)) {
@@ -539,6 +609,8 @@ wrap_life_span_handler! {
             i32::from(popups::before_popup(&self.link, frame.as_deref(), url, target_disposition, user_gesture != 0, popup_features, window_info, client))
         }
         fn do_close(&self, browser: Option<&mut Browser>) -> i32 {
+            // The close goes ahead: the page let go (`close_tab_asking`).
+            self.link.pending().closing.insert(self.link.instance);
             // Closing a tab must destroy its child NSView, never its GPUI window.
             // Defer destruction until CEF has returned from this callback.
             if let Some(host) = browser.and_then(|browser| browser.host()) {
@@ -564,11 +636,15 @@ wrap_life_span_handler! {
             let link = &self.link;
             link.live_browsers.fetch_sub(1, Ordering::SeqCst);
             link.permissions.drop_page(link);
+            link.requests.drop_page(link, true);
+            link.requests.set_unresponsive(link.instance, None);
             let (ready_to_quit, report) = {
                 let mut pending = link.pending();
                 pending.live.remove(&link.instance);
                 pending.started_navigation.remove(&link.instance);
                 pending.initialized_surface.remove(&link.instance);
+                pending.asking.remove(&link.instance);
+                pending.closing.remove(&link.instance);
                 // A newer browser already represents this tab when it was
                 // closed and created again before this one finished closing.
                 let superseded = pending.current.get(&link.tab_id).is_some_and(|&current| current != link.instance);
@@ -618,8 +694,12 @@ fn request_tab(link: &BrowserLink, opener: Option<&Frame>, url: String, backgrou
     }
 }
 
+// `popup`: a popup window's. Its sign-ins show on its opener tab's card;
+// certificate errors keep Chromium's own interstitial in the popup, and
+// crashes and hangs Chromium's defaults, as the tab's card isn't the
+// popup's.
 wrap_request_handler! {
-    struct TabRequests { link: BrowserLink, page: Arc<Mutex<PageState>> }
+    struct TabRequests { link: BrowserLink, page: Arc<Mutex<PageState>>, popup: bool }
     impl RequestHandler {
         fn on_open_urlfrom_tab(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, target_url: Option<&CefString>, target_disposition: WindowOpenDisposition, user_gesture: i32) -> i32 {
             // ⌘-, ⇧- and middle-clicks on links without a target arrive here,
@@ -630,9 +710,11 @@ wrap_request_handler! {
             if !new_tab { return 0; }
             // Never navigate this tab instead. Like popups, requests without
             // a user gesture (clicks dispatched by scripts) are dropped.
+            let url = target_url.map(ToString::to_string).unwrap_or_default();
             if user_gesture != 0 {
-                let url = target_url.map(ToString::to_string).unwrap_or_default();
                 request_tab(&self.link, frame.as_deref(), url, background);
+            } else {
+                self.link.send(EngineEvent::PopupBlocked { tab_id: self.link.tab_id, url });
             }
             1
         }
@@ -640,6 +722,9 @@ wrap_request_handler! {
             let url = request.map(|request| CefString::from(&request.url()).to_string()).unwrap_or_default();
             if protocols::handled_outside(&url, user_gesture != 0) { return 1; }
             if frame.is_some_and(|frame| frame.is_main() != 0) {
+                // A new navigation: the last one's sign-in or certificate
+                // question is moot.
+                self.link.requests.drop_page(&self.link, false);
                 // Another document: it shows as loading, and the old one's
                 // hovered link is gone.
                 let (report, hovered) = {
@@ -654,6 +739,109 @@ wrap_request_handler! {
                 }
             }
             0
+        }
+        fn auth_credentials(&self, _browser: Option<&mut Browser>, origin_url: Option<&CefString>, is_proxy: i32, host: Option<&CefString>, port: i32, realm: Option<&CefString>, _scheme: Option<&CefString>, callback: Option<&mut AuthCallback>) -> i32 {
+            // On the IO thread: only the shared requests and the event
+            // channel are used here. The card asks; Chromium keeps the
+            // answer for the rest of the session.
+            let Some(callback) = callback else { return 0; };
+            let origin = origin_url.map(ToString::to_string).unwrap_or_default();
+            let proxy = is_proxy != 0;
+            let host = host.map(ToString::to_string).unwrap_or_default();
+            let usual_port = (origin.starts_with("https:") && port == 443) || (origin.starts_with("http:") && port == 80);
+            let host = if proxy || (port > 0 && !usual_port) { format!("{host}:{port}") } else { host };
+            let id = self.link.requests.add(&self.link, Answer::SignIn(callback.clone()));
+            self.link.send(EngineEvent::SignInRequest {
+                id,
+                tab_id: self.link.tab_id,
+                host,
+                realm: realm.map(ToString::to_string).unwrap_or_default(),
+                proxy,
+                secure: origin.starts_with("https:"),
+            });
+            1
+        }
+        fn on_certificate_error(&self, _browser: Option<&mut Browser>, cert_error: Errorcode, request_url: Option<&CefString>, _ssl_info: Option<&mut Sslinfo>, callback: Option<&mut Callback>) -> i32 {
+            // Main-frame loads only; Chromium refuses subresources itself.
+            let Some(callback) = callback.filter(|_| !self.popup) else { return 0; };
+            let id = self.link.requests.add(&self.link, Answer::Certificate(callback.clone()));
+            self.link.send(EngineEvent::CertificateError {
+                id,
+                tab_id: self.link.tab_id,
+                url: request_url.map(ToString::to_string).unwrap_or_default(),
+                code: cert_error.get_raw(),
+            });
+            1
+        }
+        fn on_render_process_terminated(&self, _browser: Option<&mut Browser>, status: TerminationStatus, _error_code: i32, _error_string: Option<&CefString>) {
+            // A browser closing or replaced for its tab has no card to show.
+            if self.popup || self.link.pending().current.get(&self.link.tab_id) != Some(&self.link.instance) { return; }
+            self.link.permissions.drop_page(&self.link);
+            self.link.requests.drop_page(&self.link, false);
+            self.link.requests.set_unresponsive(self.link.instance, None);
+            page_silent(&self.link, &self.page);
+            let hovered = !std::mem::take(&mut self.page.lock().expect("page state").status).is_empty();
+            if hovered {
+                self.link.send(EngineEvent::Status { tab_id: self.link.tab_id, text: String::new() });
+            }
+            let reason = if status == TerminationStatus::PROCESS_OOM { CrashReason::OutOfMemory } else { CrashReason::Crashed };
+            self.link.send(EngineEvent::Crashed { tab_id: self.link.tab_id, reason });
+        }
+        fn on_render_process_unresponsive(&self, _browser: Option<&mut Browser>, callback: Option<&mut UnresponsiveProcessCallback>) -> i32 {
+            // Alloy's default is to wait silently; the card offers Wait or Reload.
+            let Some(callback) = callback.filter(|_| !self.popup) else { return 0; };
+            self.link.requests.set_unresponsive(self.link.instance, Some(callback.clone()));
+            self.link.send(EngineEvent::Unresponsive { tab_id: self.link.tab_id });
+            1
+        }
+        fn on_render_process_responsive(&self, _browser: Option<&mut Browser>) {
+            if self.link.requests.set_unresponsive(self.link.instance, None) {
+                self.link.send(EngineEvent::Responsive { tab_id: self.link.tab_id });
+            }
+        }
+    }
+}
+
+wrap_focus_handler! {
+    struct TabFocus;
+    impl FocusHandler {
+        fn on_set_focus(&self, browser: Option<&mut Browser>, source: FocusSource) -> i32 {
+            // Loads ask for keyboard focus for their page. A page that isn't
+            // on screen (opened behind the current tab, in another space, or
+            // hidden behind the card's notice) must not take it from the page
+            // or field being typed in; selecting its tab focuses it.
+            let hidden = browser
+                .and_then(|browser| browser_view(browser))
+                .is_none_or(|view| view.isHiddenOrHasHiddenAncestor());
+            i32::from(source == FocusSource::NAVIGATION && hidden)
+        }
+    }
+}
+
+wrap_jsdialog_handler! {
+    struct TabDialogs { link: BrowserLink }
+    impl JsdialogHandler {
+        fn on_before_unload_dialog(&self, _browser: Option<&mut Browser>, _message_text: Option<&CefString>, is_reload: i32, callback: Option<&mut JsdialogCallback>) -> i32 {
+            let Some(callback) = callback else { return 0; };
+            let (ask, closing) = {
+                let pending = self.link.pending();
+                let current = pending.current.get(&self.link.tab_id) == Some(&self.link.instance);
+                // Once the page was let go (DoClose ran), it isn't asked again.
+                let closing = pending.closing.contains(&self.link.instance);
+                (current && !closing && !pending.shutting_down, pending.asking.contains(&self.link.instance))
+            };
+            if !ask {
+                // Closing anyway (Clear, Unload Space, quitting): the page
+                // goes without a question nobody could answer in time.
+                callback.cont(1, None);
+                return 1;
+            }
+            let id = self.link.requests.add(&self.link, Answer::Leave(callback.clone()));
+            self.link.send(EngineEvent::LeavePage { id, tab_id: self.link.tab_id, closing, reload: is_reload != 0 });
+            1
+        }
+        fn on_reset_dialog_state(&self, _browser: Option<&mut Browser>) {
+            self.link.requests.drop_leave(&self.link);
         }
     }
 }
@@ -691,6 +879,9 @@ pub struct Engine {
     blocker: ContentBlocker,
     downloads: downloads::Downloads,
     permissions: permissions::PermissionRequests,
+    requests: page_requests::PageRequests,
+    /// Tabs whose page the card covers with a notice (`set_page_covered`).
+    covered: HashSet<u64>,
 }
 
 impl Engine {
@@ -769,6 +960,8 @@ impl Engine {
         let quit_pending = pending.clone();
         let downloads = downloads::Downloads::default();
         let quit_downloads = downloads.clone();
+        let requests = page_requests::PageRequests::default();
+        let quit_requests = requests.clone();
         crate::native::set_quit_handler(move || {
             quit_downloads.cancel_all();
             let (browsers, can_quit) = {
@@ -778,6 +971,8 @@ impl Engine {
                 let browsers = pending.live.values().chain(pending.popups.values());
                 (browsers.cloned().collect::<Vec<_>>(), pending.all_closed())
             };
+            // Pages asking "Leave site?" go: quitting never waits on them.
+            quit_requests.leave_all();
             if can_quit {
                 quit_message_loop();
                 return;
@@ -814,6 +1009,8 @@ impl Engine {
                 blocker: ContentBlocker::default(),
                 downloads,
                 permissions: permissions::PermissionRequests::default(),
+                requests,
+                covered: HashSet::new(),
             },
             receiver,
         ))
@@ -892,6 +1089,7 @@ impl Engine {
             live_browsers: self.live_browsers.clone(),
             downloads: self.downloads.clone(),
             permissions: self.permissions.clone(),
+            requests: self.requests.clone(),
         });
         {
             let mut pending = self.pending.lock().expect("pending browser state");
@@ -984,13 +1182,14 @@ impl Engine {
                 continue;
             }
             let active = self.active_tab == Some(tab_id);
-            if active {
+            let shown = active && !self.covered.contains(&tab_id);
+            if shown {
                 self.set_container_hidden(false);
             }
             if let Some(view) = browser_view(&browser) {
                 view.setAutoresizingMask(NSAutoresizingMaskOptions::empty());
                 view.setFrame(rect(0., 0., self.width, self.height));
-                view.setHidden(!active);
+                view.setHidden(!shown);
             }
             if !url.is_empty() {
                 // Suppress address/title callbacks from the internal empty
@@ -1006,9 +1205,11 @@ impl Engine {
             }
             self.browsers.insert(tab_id, browser);
             if active {
+                self.update_key_routing();
+            }
+            if shown {
                 self.set_container_hidden(false);
                 self.focus_tab(tab_id);
-                self.update_key_routing();
             }
         }
     }
@@ -1016,16 +1217,19 @@ impl Engine {
     pub fn activate_tab(&mut self, tab_id: u64) {
         self.active_tab = Some(tab_id);
         self.update_key_routing();
+        let covered = self.covered.contains(&tab_id);
         for (&id, browser) in &self.browsers {
             if let Some(view) = browser_view(browser) {
                 view.setFrameOrigin(NSPoint::new(0., 0.));
-                if id == tab_id {
+                if id == tab_id && !covered {
                     fit_view(view, self.width, self.height);
                 }
-                view.setHidden(id != tab_id);
+                view.setHidden(id != tab_id || covered);
             }
         }
-        let live = self.live_browser(tab_id).is_some();
+        // A page the card covers is hidden like an unloaded one, and the
+        // shell keeps keyboard focus for the card.
+        let live = self.live_browser(tab_id).is_some() && !covered;
         self.set_container_hidden(!live);
         if live {
             self.focus_tab(tab_id);
@@ -1072,12 +1276,12 @@ impl Engine {
     pub fn set_transition(&mut self, from_tab: u64, to_tab: u64, progress: f32, direction: i32) {
         let p = progress.clamp(0., 1.) as f64;
         let distance = self.width * if direction < 0 { -1. } else { 1. };
-        self.set_container_hidden(
-            !self.browsers.contains_key(&from_tab) && !self.browsers.contains_key(&to_tab),
-        );
+        let shows = |id: &u64| self.browsers.contains_key(id) && !self.covered.contains(id);
+        let hidden = !shows(&from_tab) && !shows(&to_tab);
+        self.set_container_hidden(hidden);
         for (&id, browser) in &self.browsers {
             if let Some(view) = browser_view(browser) {
-                let visible = id == from_tab || id == to_tab;
+                let visible = (id == from_tab || id == to_tab) && !self.covered.contains(&id);
                 if visible {
                     fit_view(view, self.width, self.height);
                 }
@@ -1204,15 +1408,18 @@ impl Engine {
     /// (pinned tabs, "Unload Space") while the shell keeps its entry;
     /// `create_tab` loads it again. `Closed` follows once Chromium is done.
     pub fn close_tab(&mut self, tab_id: u64) {
-        {
+        self.covered.remove(&tab_id);
+        let instance = {
             let mut pending = self.pending.lock().expect("pending browser state");
-            if let Some(instance) = pending.current.remove(&tab_id)
+            let instance = pending.current.remove(&tab_id);
+            if let Some(instance) = instance
                 && (pending.requested.contains_key(&instance)
                     || pending.ready.iter().any(|ready| ready.instance == instance))
             {
                 pending.canceled.insert(instance);
             }
-        }
+            instance
+        };
         if let Some(browser) = self
             .browsers
             .remove(&tab_id)
@@ -1227,7 +1434,138 @@ impl Engine {
                 host.close_browser(1);
             }
         }
+        // A "Leave site?" still open lets the page go; it closes anyway.
+        if let Some(instance) = instance {
+            let link = self.link(tab_id, instance);
+            self.requests.drop_page(&link, true);
+        }
         self.update_key_routing();
+    }
+
+    /// Closes the tab's page the way a user closes it: a page with unsaved
+    /// changes may ask to stay (`LeavePage`). True if the page closes now,
+    /// as most do; `Closed` follows, and the shell treats the tab as
+    /// closed. False while the page decides: `Closed` follows if it lets
+    /// go, and nothing more if the user stays.
+    pub fn close_tab_asking(&mut self, tab_id: u64) -> bool {
+        let instance = self
+            .pending
+            .lock()
+            .expect("pending browser state")
+            .current
+            .get(&tab_id)
+            .copied();
+        let (Some(instance), Some(host)) = (
+            instance,
+            self.live_browser(tab_id).and_then(|browser| browser.host()),
+        ) else {
+            // A browser still being created has no page to ask.
+            self.close_tab(tab_id);
+            return true;
+        };
+        self.pending
+            .lock()
+            .expect("pending browser state")
+            .asking
+            .insert(instance);
+        // Without unload handlers Chromium closes at once (DoClose runs
+        // within this call); otherwise the page's handlers run first.
+        host.close_browser(0);
+        let closing = {
+            let mut pending = self.pending.lock().expect("pending browser state");
+            let closing = pending.closing.contains(&instance);
+            if closing {
+                // The tab lets go of it, as `close_tab` would; asking
+                // Chromium to close it again would run DoClose twice.
+                pending.current.remove(&tab_id);
+            }
+            closing
+        };
+        if closing {
+            self.covered.remove(&tab_id);
+            if let Some(browser) = self.browsers.remove(&tab_id)
+                && let Some(view) = browser_view(&browser)
+            {
+                view.setHidden(true);
+            }
+            self.update_key_routing();
+        }
+        closing
+    }
+
+    /// Identity for answering a browser instance's requests outside its
+    /// handlers.
+    fn link(&self, tab_id: u64, instance: u64) -> BrowserLink {
+        BrowserLink {
+            tab_id,
+            instance,
+            events: self.events.clone(),
+            pending: self.pending.clone(),
+            keys: self.keys.clone(),
+            live_browsers: self.live_browsers.clone(),
+            downloads: self.downloads.clone(),
+            permissions: self.permissions.clone(),
+            requests: self.requests.clone(),
+        }
+    }
+
+    /// Answers a `SignInRequest`: signs in, or cancels without credentials.
+    pub fn respond_sign_in(&self, id: u64, credentials: Option<(&str, &str)>) {
+        self.requests.respond_sign_in(id, credentials);
+    }
+
+    /// Answers a `CertificateError`: the load goes on, or fails.
+    pub fn respond_certificate(&self, id: u64, proceed: bool) {
+        self.requests.respond_certificate(id, proceed);
+    }
+
+    /// Answers a `LeavePage`. Staying keeps a tab that was closing.
+    pub fn respond_leave(&self, id: u64, leave: bool) {
+        if let Some(instance) = self.requests.respond_leave(id, leave)
+            && !leave
+        {
+            self.pending
+                .lock()
+                .expect("pending browser state")
+                .asking
+                .remove(&instance);
+        }
+    }
+
+    /// Answers `Unresponsive`: wait for the page, or end it (`Crashed`
+    /// follows, and a reload starts it again).
+    pub fn respond_unresponsive(&self, tab_id: u64, wait: bool) {
+        let instance = self
+            .pending
+            .lock()
+            .expect("pending browser state")
+            .current
+            .get(&tab_id)
+            .copied();
+        if let Some(instance) = instance {
+            self.requests.respond_unresponsive(instance, wait);
+        }
+    }
+
+    /// Mutes or unmutes the tab's page.
+    pub fn set_muted(&self, tab_id: u64, muted: bool) {
+        if let Some(host) = self.live_browser(tab_id).and_then(|browser| browser.host()) {
+            host.set_audio_muted(i32::from(muted));
+        }
+    }
+
+    /// Hides the tab's page while the card shows something in its place (a
+    /// crash, a sign-in, a failed load), or shows it again. GPUI can't draw
+    /// over the page's native view.
+    pub fn set_page_covered(&mut self, tab_id: u64, covered: bool) {
+        let changed = if covered {
+            self.covered.insert(tab_id)
+        } else {
+            self.covered.remove(&tab_id)
+        };
+        if changed && self.active_tab == Some(tab_id) {
+            self.activate_tab(tab_id);
+        }
     }
 
     /// Answers a `PermissionRequest`.
@@ -1247,6 +1585,7 @@ impl Engine {
             keys.fullscreen = None;
         }
         self.permissions.clear();
+        self.requests.leave_all();
         let popups: Vec<Browser> = {
             let mut pending = self.pending.lock().expect("pending browser state");
             pending.shutting_down = true;

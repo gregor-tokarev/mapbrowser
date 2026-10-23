@@ -254,6 +254,7 @@ fn main() -> anyhow::Result<()> {
         input::init(cx);
         ui::command_bar::init(cx);
         ui::find_bar::init(cx);
+        ui::page_notice::init(cx);
         cx.on_action(|_: &About, _| native::show_about_panel());
         cx.on_action(|_: &Hide, cx| cx.hide());
         cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());

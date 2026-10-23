@@ -4,8 +4,8 @@
 use super::{CARD_RADIUS, SlideFrame, shadow, theme::Theme, theme::darkened_argb, truncated};
 use crate::app::BrowserApp;
 use gpui::{
-    Bounds, BoxShadow, Div, ParentElement, Pixels, SharedString, Size, Styled, canvas, div, point,
-    prelude::FluentBuilder, px,
+    Bounds, BoxShadow, Context, Div, ParentElement, Pixels, SharedString, Size, Styled, Window,
+    canvas, div, point, prelude::FluentBuilder, px,
 };
 
 /// How dark the card's shadow makes the window right outside its top and
@@ -20,34 +20,24 @@ fn card_shadow() -> Vec<BoxShadow> {
     vec![shadow(2., 10., 0.14), shadow(0., 1., 0.10)]
 }
 
-/// Chromium's network error codes in plain words.
-fn error_message(error: &str) -> String {
-    match error {
-        "net::ERR_NAME_NOT_RESOLVED" => "This address couldn't be found.".into(),
-        "net::ERR_INTERNET_DISCONNECTED" => "You're offline. Check your connection.".into(),
-        "net::ERR_CONNECTION_REFUSED" => "The site refused the connection.".into(),
-        "net::ERR_CONNECTION_TIMED_OUT" | "net::ERR_TIMED_OUT" => {
-            "The site took too long to respond.".into()
-        }
-        error if error.starts_with("net::ERR_CERT_") => {
-            "The site's certificate couldn't be verified.".into()
-        }
-        _ => error.to_owned(),
-    }
-}
-
 impl BrowserApp {
     /// Whether a native page view covers the card, hiding GPUI's drawing.
+    /// A page that crashed, failed to load or asks something is hidden
+    /// while the card says so (`ui::page_notice`).
     pub(super) fn page_covers_card(&self) -> bool {
-        cfg!(target_os = "macos") && self.active_tab_id().is_some_and(|id| self.is_loaded(id))
+        cfg!(target_os = "macos")
+            && self
+                .active_tab_id()
+                .is_some_and(|id| self.is_loaded(id) && !self.notices.covers(id))
     }
 
+    /// Why the active tab's page couldn't be opened at all. Failed loads
+    /// show on the card instead (`ui::page_notice`).
     pub(super) fn error_text(&self) -> Option<SharedString> {
-        self.error
-            .as_deref()
-            .map(|error| error_message(error).into())
+        self.error.clone().map(SharedString::from)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn render_card(
         &mut self,
         card: Bounds<Pixels>,
@@ -55,6 +45,8 @@ impl BrowserApp {
         frame: Option<SlideFrame>,
         slide_finished: bool,
         viewport: Size<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
     ) -> Div {
         let radius = if self.fullscreen { 0. } else { CARD_RADIUS };
         let active = self.state.active_tab();
@@ -97,6 +89,7 @@ impl BrowserApp {
         .size_full();
 
         let error = self.error_text().filter(|_| !self.page_covers_card());
+        let notice = self.render_page_notice(theme, window, cx);
         div()
             .absolute()
             .left(card.origin.x)
@@ -105,13 +98,14 @@ impl BrowserApp {
             .h(card.size.height)
             .rounded(px(radius))
             .overflow_hidden()
-            .bg(if loaded {
+            .bg(if loaded && notice.is_none() {
                 theme.card()
             } else {
                 theme.empty_card()
             })
             .child(native_frame)
             .child(match active {
+                _ if notice.is_some() => div(),
                 None => hint(theme, "Press ⌘T to open a tab", None),
                 Some(tab) if !loaded => hint(theme, "Select the tab to load it", Some(&tab.title)),
                 // Without Chromium (Linux previews) say so instead of a page.
@@ -122,6 +116,7 @@ impl BrowserApp {
                 ),
                 Some(_) => div(),
             })
+            .children(notice)
             .when_some(error, |card, error| {
                 card.child(
                     div()

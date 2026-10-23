@@ -8,8 +8,24 @@
 //! "permission-demo" ask to use the camera and microphone ("location" or
 //! "notifications" in the address ask for those). On pages whose address
 //! contains "status-demo" the pointer rests on a long link.
+//!
+//! Page states have demos too, by a word in the address:
+//! - "auth-demo" asks for a username and password ("proxy" as a proxy,
+//!   http: addresses unencrypted) and loads once signed in;
+//! - "crash-demo" crashes once loaded ("oom" out of memory), "hang-demo"
+//!   stops responding; either loads normally again after that;
+//! - "cert-demo" has a certificate that doesn't verify ("expired",
+//!   "revoked" or "name" for other errors than an unknown issuer);
+//! - "error-demo" fails to load: "offline", "refused", "timeout", "reset",
+//!   "ssl", "redirects" or "empty" pick the error, else the address isn't
+//!   found; with "once" only the first try fails;
+//! - "audio-demo" plays sound, "camera-demo" uses the camera and
+//!   microphone ("mic" only the microphone);
+//! - "popup-demo" tries to open a pop-up without a click;
+//! - "fullscreen-demo" goes fullscreen, as a video player would;
+//! - "unsaved-demo" asks before it is closed, reloaded or left.
 
-use super::{EngineEvent, Permission, PermissionDecision, ZoomStep, step_zoom};
+use super::{CrashReason, EngineEvent, Permission, PermissionDecision, ZoomStep, step_zoom};
 use crate::blocker::ContentBlocker;
 use anyhow::Result;
 use async_channel::{Receiver, Sender};
@@ -35,6 +51,8 @@ pub struct Engine {
     next_id: Cell<u64>,
     /// Unanswered permission requests and their tabs.
     permission_requests: RefCell<HashMap<u64, u64>>,
+    /// Unanswered sign-in, certificate and leave requests.
+    page_requests: RefCell<HashMap<u64, PageRequest>>,
 }
 
 struct History {
@@ -44,6 +62,44 @@ struct History {
     zoom: u32,
     /// The selected find match, 1-based; 0 without one.
     find_active: u32,
+    /// What the tab's demo pages did already, so that they load next time.
+    demo: Demo,
+}
+
+#[derive(Default)]
+struct Demo {
+    signed_in: bool,
+    /// Sites whose certificate error the user continued past.
+    certificates_allowed: HashSet<String>,
+    failed: bool,
+    crashed: bool,
+    hung: bool,
+    audible: bool,
+    capturing: bool,
+    fullscreen: bool,
+}
+
+struct PageRequest {
+    tab_id: u64,
+    kind: RequestKind,
+}
+
+enum RequestKind {
+    SignIn,
+    Certificate {
+        url: String,
+        code: i32,
+    },
+    /// What waits for the page to let go.
+    Leave(Leaving),
+}
+
+enum Leaving {
+    Close,
+    Reload,
+    Navigate(String),
+    /// Back (-1) or forward (1).
+    Go(isize),
 }
 
 impl History {
@@ -95,6 +151,13 @@ fn page_title(url: &str) -> String {
         .unwrap_or_else(|| url.to_owned())
 }
 
+fn host_of(url: &str) -> String {
+    Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
 fn is_download(url: &str) -> bool {
     url.contains("download-demo")
 }
@@ -131,6 +194,7 @@ impl Engine {
             pages: RefCell::default(),
             next_id: Cell::new(0),
             permission_requests: RefCell::default(),
+            page_requests: RefCell::default(),
         };
         Ok((engine, receiver))
     }
@@ -157,6 +221,7 @@ impl Engine {
                 index: 0,
                 zoom: 100,
                 find_active: 0,
+                demo: Demo::default(),
             },
         );
         self.send(EngineEvent::Created { tab_id });
@@ -181,6 +246,13 @@ impl Engine {
     pub fn redo_in_page(&self) {}
 
     pub fn navigate(&self, tab_id: u64, url: &str) {
+        if is_download(url) || !self.asks_before_leaving(tab_id, Leaving::Navigate(url.to_owned()))
+        {
+            self.go_to_address(tab_id, url);
+        }
+    }
+
+    fn go_to_address(&self, tab_id: u64, url: &str) {
         {
             let mut pages = self.pages.borrow_mut();
             let Some(page) = pages.get_mut(&tab_id) else {
@@ -207,7 +279,9 @@ impl Engine {
     }
 
     pub fn reload(&self, tab_id: u64) {
-        self.load(tab_id);
+        if !self.asks_before_leaving(tab_id, Leaving::Reload) {
+            self.load(tab_id);
+        }
     }
 
     /// Loads finish at once here, so there is nothing to stop.
@@ -285,9 +359,111 @@ impl Engine {
         }
     }
 
+    /// Closes the tab's page unless it asks first ("unsaved-demo"): then
+    /// `LeavePage` follows, and `Closed` once the user leaves.
+    pub fn close_tab_asking(&mut self, tab_id: u64) -> bool {
+        if self.asks_before_leaving(tab_id, Leaving::Close) {
+            return false;
+        }
+        self.close_tab(tab_id);
+        true
+    }
+
     pub fn respond_permission(&self, id: u64, _decision: PermissionDecision) {
         self.permission_requests.borrow_mut().remove(&id);
     }
+
+    /// Signing in loads the page; cancelling shows the site's refusal.
+    pub fn respond_sign_in(&self, id: u64, credentials: Option<(&str, &str)>) {
+        let Some(PageRequest { tab_id, .. }) = self.page_requests.borrow_mut().remove(&id) else {
+            return;
+        };
+        if credentials.is_some() {
+            self.demo(tab_id, |demo| demo.signed_in = true);
+            return self.load(tab_id);
+        }
+        let Some(url) = self.current_url(tab_id) else {
+            return;
+        };
+        self.send(EngineEvent::NewDocument { tab_id });
+        self.send(EngineEvent::Address { tab_id, url });
+        self.send(EngineEvent::Title {
+            tab_id,
+            title: "401 Authorization Required".into(),
+        });
+        self.send(self.loading_event(tab_id, false));
+    }
+
+    /// Continuing loads the page; refusing fails the load.
+    pub fn respond_certificate(&self, id: u64, proceed: bool) {
+        let Some(PageRequest {
+            tab_id,
+            kind: RequestKind::Certificate { url, code },
+        }) = self.page_requests.borrow_mut().remove(&id)
+        else {
+            return;
+        };
+        if proceed {
+            let host = host_of(&url);
+            self.demo(tab_id, |demo| {
+                demo.certificates_allowed.insert(host);
+            });
+            return self.load(tab_id);
+        }
+        self.send(EngineEvent::LoadError {
+            tab_id,
+            url,
+            code,
+            message: match code {
+                -200 => "ERR_CERT_COMMON_NAME_INVALID",
+                -201 => "ERR_CERT_DATE_INVALID",
+                -206 => "ERR_CERT_REVOKED",
+                _ => "ERR_CERT_AUTHORITY_INVALID",
+            }
+            .into(),
+        });
+        self.send(self.loading_event(tab_id, false));
+    }
+
+    pub fn respond_leave(&mut self, id: u64, leave: bool) {
+        let Some(PageRequest {
+            tab_id,
+            kind: RequestKind::Leave(leaving),
+        }) = self.page_requests.borrow_mut().remove(&id)
+        else {
+            return;
+        };
+        if !leave {
+            return;
+        }
+        match leaving {
+            Leaving::Close => self.close_tab(tab_id),
+            Leaving::Reload => self.load(tab_id),
+            Leaving::Navigate(url) => self.go_to_address(tab_id, &url),
+            Leaving::Go(step) => self.go_now(tab_id, step),
+        }
+    }
+
+    /// Waiting brings the page back; ending it crashes it.
+    pub fn respond_unresponsive(&self, tab_id: u64, wait: bool) {
+        if !self.has_tab(tab_id) {
+            return;
+        }
+        self.send(if wait {
+            EngineEvent::Responsive { tab_id }
+        } else {
+            EngineEvent::Crashed {
+                tab_id,
+                reason: CrashReason::Crashed,
+            }
+        });
+    }
+
+    /// Previews play no sound.
+    pub fn set_muted(&self, _tab_id: u64, _muted: bool) {}
+
+    /// Previews draw the whole card, so there is no page view to hide.
+    pub fn set_page_covered(&mut self, _tab_id: u64, _covered: bool) {}
 
     pub fn shutdown(&mut self) -> Result<()> {
         self.pages.borrow_mut().clear();
@@ -295,6 +471,12 @@ impl Engine {
     }
 
     fn go(&self, tab_id: u64, step: isize) {
+        if !self.asks_before_leaving(tab_id, Leaving::Go(step)) {
+            self.go_now(tab_id, step);
+        }
+    }
+
+    fn go_now(&self, tab_id: u64, step: isize) {
         {
             let mut pages = self.pages.borrow_mut();
             let Some(page) = pages.get_mut(&tab_id) else {
@@ -312,7 +494,8 @@ impl Engine {
         self.load(tab_id);
     }
 
-    /// Reports one complete, instant load of the tab's current entry.
+    /// Reports one complete, instant load of the tab's current entry, or
+    /// what a demo page does instead.
     fn load(&self, tab_id: u64) {
         let (url, can_go_back, can_go_forward) = {
             let pages = self.pages.borrow();
@@ -331,6 +514,10 @@ impl Engine {
             can_go_back,
             can_go_forward,
         };
+        if self.stops_before_loading(tab_id, &url) {
+            self.send(loading(true));
+            return self.stop_before_loading(tab_id, &url);
+        }
         let title = page_title(&url);
         let asks = url.contains("permission-demo").then(|| url.clone());
         let hovered = url.contains("status-demo").then(|| {
@@ -338,7 +525,10 @@ impl Engine {
         });
         self.send(loading(true));
         self.send(EngineEvent::NewDocument { tab_id });
-        self.send(EngineEvent::Address { tab_id, url });
+        self.send(EngineEvent::Address {
+            tab_id,
+            url: url.clone(),
+        });
         self.send(EngineEvent::Title { tab_id, title });
         for progress in [0.4, 1.0] {
             self.send(EngineEvent::Progress { tab_id, progress });
@@ -349,6 +539,188 @@ impl Engine {
         }
         if let Some(url) = asks {
             self.request_permissions(tab_id, &url);
+        }
+        self.after_loading(tab_id, &url);
+    }
+
+    /// Whether the demo page at `url` stops before it loads: it asks for a
+    /// sign-in, its certificate doesn't verify, or it fails.
+    fn stops_before_loading(&self, tab_id: u64, url: &str) -> bool {
+        let pages = self.pages.borrow();
+        let Some(demo) = pages.get(&tab_id).map(|page| &page.demo) else {
+            return false;
+        };
+        (url.contains("auth-demo") && !demo.signed_in)
+            || (url.contains("cert-demo") && !demo.certificates_allowed.contains(&host_of(url)))
+            || (url.contains("error-demo") && !(url.contains("once") && demo.failed))
+    }
+
+    fn stop_before_loading(&self, tab_id: u64, url: &str) {
+        let host = host_of(url);
+        if url.contains("auth-demo") {
+            let proxy = url.contains("proxy");
+            let id = self.add_request(tab_id, RequestKind::SignIn);
+            return self.send(EngineEvent::SignInRequest {
+                id,
+                tab_id,
+                host: if proxy {
+                    "proxy.corp.example:3128".into()
+                } else {
+                    host
+                },
+                realm: if proxy { "Corporate proxy" } else { "Staging" }.into(),
+                proxy,
+                secure: url.starts_with("https:"),
+            });
+        }
+        if url.contains("cert-demo") {
+            let code = if url.contains("expired") {
+                -201
+            } else if url.contains("revoked") {
+                -206
+            } else if url.contains("name") {
+                -200
+            } else {
+                -202
+            };
+            let kind = RequestKind::Certificate {
+                url: url.to_owned(),
+                code,
+            };
+            let id = self.add_request(tab_id, kind);
+            return self.send(EngineEvent::CertificateError {
+                id,
+                tab_id,
+                url: url.to_owned(),
+                code,
+            });
+        }
+        self.demo(tab_id, |demo| demo.failed = true);
+        let (code, message) = [
+            ("offline", -106, "ERR_INTERNET_DISCONNECTED"),
+            ("refused", -102, "ERR_CONNECTION_REFUSED"),
+            ("timeout", -118, "ERR_CONNECTION_TIMED_OUT"),
+            ("reset", -101, "ERR_CONNECTION_RESET"),
+            ("ssl", -107, "ERR_SSL_PROTOCOL_ERROR"),
+            ("redirects", -310, "ERR_TOO_MANY_REDIRECTS"),
+            ("empty", -324, "ERR_EMPTY_RESPONSE"),
+        ]
+        .into_iter()
+        .find(|(word, ..)| url.contains(word))
+        .map_or((-105, "ERR_NAME_NOT_RESOLVED"), |(_, code, message)| {
+            (code, message)
+        });
+        self.send(EngineEvent::LoadError {
+            tab_id,
+            url: url.to_owned(),
+            code,
+            message: message.into(),
+        });
+        self.send(self.loading_event(tab_id, false));
+    }
+
+    /// What demo pages do once loaded.
+    fn after_loading(&self, tab_id: u64, url: &str) {
+        let audible = url.contains("audio-demo");
+        let capturing = url.contains("camera-demo");
+        let (crash, hang, sound, camera, fullscreen) = {
+            let mut pages = self.pages.borrow_mut();
+            let Some(demo) = pages.get_mut(&tab_id).map(|page| &mut page.demo) else {
+                return;
+            };
+            let crash = url.contains("crash-demo") && !std::mem::replace(&mut demo.crashed, true);
+            let hang = url.contains("hang-demo") && !std::mem::replace(&mut demo.hung, true);
+            let sound = std::mem::replace(&mut demo.audible, audible) != audible;
+            let camera = std::mem::replace(&mut demo.capturing, capturing) != capturing;
+            let fullscreen =
+                url.contains("fullscreen-demo") && !std::mem::replace(&mut demo.fullscreen, true);
+            (crash, hang, sound, camera, fullscreen)
+        };
+        if sound {
+            self.send(EngineEvent::Audible { tab_id, audible });
+        }
+        if camera {
+            self.send(EngineEvent::MediaAccess {
+                tab_id,
+                video: capturing && !url.contains("mic"),
+                audio: capturing,
+            });
+        }
+        if url.contains("popup-demo") {
+            self.send(EngineEvent::PopupBlocked {
+                tab_id,
+                url: "https://offers.example/win-a-prize".into(),
+            });
+        }
+        if fullscreen {
+            self.send(EngineEvent::Fullscreen {
+                tab_id,
+                fullscreen: true,
+            });
+        }
+        if crash {
+            let reason = if url.contains("oom") {
+                CrashReason::OutOfMemory
+            } else {
+                CrashReason::Crashed
+            };
+            self.send(EngineEvent::Crashed { tab_id, reason });
+        }
+        if hang {
+            self.send(EngineEvent::Unresponsive { tab_id });
+        }
+    }
+
+    /// Asks before the tab's "unsaved-demo" page is left for `leaving`.
+    fn asks_before_leaving(&self, tab_id: u64, leaving: Leaving) -> bool {
+        if !self
+            .current_url(tab_id)
+            .is_some_and(|url| url.contains("unsaved-demo"))
+        {
+            return false;
+        }
+        let (closing, reload) = (
+            matches!(leaving, Leaving::Close),
+            matches!(leaving, Leaving::Reload),
+        );
+        let id = self.add_request(tab_id, RequestKind::Leave(leaving));
+        self.send(EngineEvent::LeavePage {
+            id,
+            tab_id,
+            closing,
+            reload,
+        });
+        true
+    }
+
+    fn add_request(&self, tab_id: u64, kind: RequestKind) -> u64 {
+        let id = self.next_id();
+        self.page_requests
+            .borrow_mut()
+            .insert(id, PageRequest { tab_id, kind });
+        id
+    }
+
+    fn current_url(&self, tab_id: u64) -> Option<String> {
+        let pages = self.pages.borrow();
+        let page = pages.get(&tab_id)?;
+        page.entries.get(page.index).cloned()
+    }
+
+    fn demo(&self, tab_id: u64, change: impl FnOnce(&mut Demo)) {
+        if let Some(page) = self.pages.borrow_mut().get_mut(&tab_id) {
+            change(&mut page.demo);
+        }
+    }
+
+    fn loading_event(&self, tab_id: u64, loading: bool) -> EngineEvent {
+        let pages = self.pages.borrow();
+        let page = pages.get(&tab_id);
+        EngineEvent::Loading {
+            tab_id,
+            loading,
+            can_go_back: page.is_some_and(History::can_go_back),
+            can_go_forward: page.is_some_and(History::can_go_forward),
         }
     }
 
@@ -430,6 +802,18 @@ impl Engine {
             self.permission_requests.borrow_mut().remove(&id);
             self.send(EngineEvent::PermissionDismissed { id });
         }
+        let mut ids: Vec<u64> = self
+            .page_requests
+            .borrow()
+            .iter()
+            .filter(|(_, request)| request.tab_id == tab_id)
+            .map(|(&id, _)| id)
+            .collect();
+        ids.sort();
+        for id in ids {
+            self.page_requests.borrow_mut().remove(&id);
+            self.send(EngineEvent::RequestDismissed { id });
+        }
     }
 
     fn send(&self, event: EngineEvent) {
@@ -443,7 +827,20 @@ impl Engine {
 impl Engine {
     pub fn set_corner_caps(&mut self, _radius: f64, _colors: [u32; 4]) {}
     pub fn set_fullscreen_layout(&mut self, _fullscreen: bool) {}
-    pub fn exit_fullscreen(&self, _tab_id: u64) {}
+    /// Ends a "fullscreen-demo" page's fullscreen, as Esc does on macOS.
+    pub fn exit_fullscreen(&self, tab_id: u64) {
+        let was = self
+            .pages
+            .borrow_mut()
+            .get_mut(&tab_id)
+            .is_some_and(|page| std::mem::take(&mut page.demo.fullscreen));
+        if was {
+            self.send(EngineEvent::Fullscreen {
+                tab_id,
+                fullscreen: false,
+            });
+        }
+    }
     pub fn set_traffic_lights_hidden(&self, _hidden: bool) {}
     /// The command bar is a child window only on macOS.
     #[allow(dead_code)]

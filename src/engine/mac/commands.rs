@@ -1,6 +1,6 @@
 //! Menu commands for a tab's page: zoom, printing and developer tools.
 
-use super::{BrowserLink, Engine, popups};
+use super::{Engine, popups};
 use crate::engine::{ZoomStep, zoom_percent};
 use cef::*;
 
@@ -36,16 +36,7 @@ impl Engine {
             host.close_dev_tools();
             return;
         }
-        let mut client = popups::tools_client(BrowserLink {
-            tab_id,
-            instance: 0,
-            events: self.events.clone(),
-            pending: self.pending.clone(),
-            keys: self.keys.clone(),
-            live_browsers: self.live_browsers.clone(),
-            downloads: self.downloads.clone(),
-            permissions: self.permissions.clone(),
-        });
+        let mut client = popups::tools_client(self.link(tab_id, 0));
         host.show_dev_tools(
             Some(&WindowInfo::default()),
             Some(&mut client),
