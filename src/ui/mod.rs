@@ -22,9 +22,9 @@ use crate::{Dismiss, app::BrowserApp};
 use drag::DraggedEdge;
 use gpui::{
     AnyView, App, AppContext, Bounds, BoxShadow, Context, Div, DragMoveEvent, FontWeight,
-    InteractiveElement, IntoElement, ModifiersChangedEvent, MouseButton, ParentElement, Pixels,
-    Render, SharedString, StatefulInteractiveElement, Styled, Window, div, point,
-    prelude::FluentBuilder, px, size,
+    InteractiveElement, IntoElement, ModifiersChangedEvent, MouseButton, MouseMoveEvent,
+    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    point, prelude::FluentBuilder, px, size,
 };
 use theme::Theme;
 
@@ -159,6 +159,11 @@ impl Render for BrowserApp {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &Dismiss, _, cx| this.dismiss(cx)))
             .map(|root| menu::handle_menu_keys(root, cx))
+            .when(self.sidebar_peek, |root| {
+                root.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                    this.peek_pointer_moved(event.position.x, cx)
+                }))
+            })
             .on_modifiers_changed(
                 cx.listener(|this, event: &ModifiersChangedEvent, window, cx| {
                     if !event.modifiers.control {

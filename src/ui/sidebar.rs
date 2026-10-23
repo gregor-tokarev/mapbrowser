@@ -365,17 +365,28 @@ impl BrowserApp {
     /// A peeking sidebar hides again once the pointer has left it, unless a
     /// menu, a rename, a drag or the command bar opened from it still needs it.
     fn update_peek(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if !self.sidebar_peek
-            || self.menu.is_some()
-            || self.renaming.is_some()
-            || self.renaming_tab.is_some()
-            || self.command_bar.is_some()
-            || cx.has_active_drag()
-        {
-            return;
-        }
-        if f32::from(window.mouse_position().x) >= self.state.sidebar_width() {
+        if self.peek_ends_at(window.mouse_position().x, cx) {
             self.end_peek();
+        }
+    }
+
+    fn peek_ends_at(&self, x: Pixels, cx: &App) -> bool {
+        self.sidebar_peek
+            && self.menu.is_none()
+            && self.renaming.is_none()
+            && self.renaming_tab.is_none()
+            && self.command_bar.is_none()
+            && !cx.has_active_drag()
+            && f32::from(x) >= self.state.sidebar_width()
+    }
+
+    /// The pointer moved while the sidebar peeks. A quick move can leave the
+    /// sidebar without one event over it, and then no hover change redraws
+    /// to end the peek; this ends it once the pointer is past the sidebar.
+    pub(super) fn peek_pointer_moved(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        if self.peek_ends_at(x, cx) {
+            self.end_peek();
+            cx.notify();
         }
     }
 
