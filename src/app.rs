@@ -2050,7 +2050,7 @@ impl BrowserApp {
             self.persist_later(cx);
         }
         // Short: the sidebar's toast is narrow.
-        self.show_toast(format!("Using {}", engine.name()), cx);
+        self.show_toast_kind(ToastKind::Info, format!("Using {}", engine.name()), cx);
     }
 
     /// A tab's page committed a new document at `url`: a visit, in the
