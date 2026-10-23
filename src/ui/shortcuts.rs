@@ -56,6 +56,7 @@ const COLUMNS: [&[Group]; 2] = [
                 ("Go to tab 1–8", &["⌘1–⌘8"]),
                 ("Go to the last tab", &["⌘9"]),
                 ("Back to recent tabs, hold ⌃", &["⌃Tab"]),
+                ("Cancel the switch, hold ⌃", &["⌃Esc"]),
                 ("Next or previous tab", &["⌥⌘↓", "⌥⌘↑"]),
                 ("Pin or unpin the tab", &["⌘D"]),
                 ("Copy the address", &["⇧⌘C"]),
