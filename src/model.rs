@@ -110,6 +110,19 @@ pub struct BrowserState {
     /// than a backup or the defaults.
     #[serde(skip)]
     from_state_file: bool,
+    /// How this launch made do without a readable state.json, to tell the
+    /// user once.
+    #[serde(skip)]
+    pub recovery: Option<Recovery>,
+}
+
+/// state.json couldn't be read at launch: the session came from the backup
+/// or, without a readable one, from the defaults.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Recovery {
+    pub from_backup: bool,
+    /// Where the damaged file was set aside, if there was one.
+    pub kept: Option<PathBuf>,
 }
 
 /// Where the browser window was, in points.
@@ -164,6 +177,7 @@ impl Default for BrowserState {
             closed: Vec::new(),
             storage_dir: data_dir(),
             from_state_file: false,
+            recovery: None,
         }
     }
 }
@@ -311,7 +325,7 @@ impl StateSnapshot {
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                    quarantine(&state_path)?
+                    quarantine(&state_path).map(drop)?
                 }
                 Err(error) => return Err(error),
             }
@@ -353,36 +367,40 @@ impl BrowserState {
         forget_written(root);
         let state_path = root.join(STATE_FILE);
         let backup_path = root.join(BACKUP_FILE);
-        let state = match read_state(&state_path, root) {
-            Ok(state) => Self {
-                from_state_file: true,
-                ..state
-            },
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                quarantine(&state_path)?;
-                match read_state(&backup_path, root) {
-                    Ok(state) => state,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => Self::at_root(root),
-                    Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                        quarantine(&backup_path)?;
-                        Self::at_root(root)
-                    }
-                    Err(error) => return Err(error),
-                }
+        // A damaged state.json is set aside; `kept` says where.
+        let (kept, missing) = match read_state(&state_path, root) {
+            Ok(state) => {
+                return Self::loaded(Self {
+                    from_state_file: true,
+                    ..state
+                });
             }
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                (Some(quarantine(&state_path)?), false)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (None, true),
+            Err(error) => return Err(error),
+        };
+        let (state, from_backup, kept) = match read_state(&backup_path, root) {
+            Ok(state) => (state, true, kept),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match read_state(&backup_path, root) {
-                    Ok(state) => state,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => Self::at_root(root),
-                    Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                        quarantine(&backup_path)?;
-                        Self::at_root(root)
-                    }
-                    Err(error) => return Err(error),
-                }
+                (Self::at_root(root), false, kept)
+            }
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                let backup = quarantine(&backup_path)?;
+                (Self::at_root(root), false, kept.or(Some(backup)))
             }
             Err(error) => return Err(error),
         };
+        // A first launch has neither file, and nothing to tell.
+        let first_launch = missing && !from_backup && kept.is_none();
+        Self::loaded(Self {
+            recovery: (!first_launch).then_some(Recovery { from_backup, kept }),
+            ..state
+        })
+    }
+
+    fn loaded(state: Self) -> io::Result<Self> {
         state.ensure_profile_dirs()?;
         Ok(state)
     }
@@ -974,7 +992,7 @@ fn read_state(path: &Path, root: &Path) -> io::Result<BrowserState> {
 fn newer_schema() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        "this session was created by a newer version of MapBrowser",
+        "this session was created by a newer version of Map Browser",
     )
 }
 
@@ -990,12 +1008,12 @@ fn unique_suffix() -> String {
     format!("{}-{timestamp}-{count}", std::process::id())
 }
 
-fn quarantine(path: &Path) -> io::Result<()> {
+/// Sets a damaged file aside under a new name, which it returns.
+fn quarantine(path: &Path) -> io::Result<PathBuf> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    fs::rename(
-        path,
-        path.with_file_name(format!("{name}.corrupt-{}", unique_suffix())),
-    )
+    let kept = path.with_file_name(format!("{name}.corrupt-{}", unique_suffix()));
+    fs::rename(path, &kept)?;
+    Ok(kept)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8], durability: Durability) -> io::Result<()> {

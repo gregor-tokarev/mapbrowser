@@ -707,9 +707,9 @@ impl CommandBar {
                                 .flex_none()
                                 .whitespace_nowrap()
                                 .text_color(if selected {
-                                    gpui::white().opacity(0.72)
+                                    gpui::white()
                                 } else {
-                                    theme.ink(0.45)
+                                    theme.tertiary()
                                 })
                                 .child(SharedString::from(format!(" — {detail}"))),
                         )
@@ -724,7 +724,7 @@ impl CommandBar {
                         .gap(px(8.))
                         .text_size(px(12.))
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(gpui::white().opacity(0.9))
+                        .text_color(gpui::white())
                         .child(item.hint)
                         .child(
                             div()

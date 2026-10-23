@@ -5,7 +5,7 @@ use crate::{
     engine::{Engine, EngineEvent, Navigation, Shortcut, ZoomStep, navigation_for},
     favicons::{FaviconStore, host_of},
     input::{InputEvent, InputStyle, TextInput},
-    model::{self, BrowserState, ClosedTab, Pin, Space, SpaceId, Tab, TabId},
+    model::{self, BrowserState, ClosedTab, Pin, Recovery, Space, SpaceId, Tab, TabId},
     native,
     recent::{RecentTabs, TabSwitch},
     ui::{
@@ -20,16 +20,17 @@ use crate::{
         menu::{MenuKind, OpenMenu},
         permissions::PermissionPrompts,
         redraw::{self, Drawn},
+        shortcuts::ShortcutsWindow,
         swipe::SwipeTracker,
         theme::Theme,
-        toast_window::ToastWindow,
+        toast_window::{Toast, ToastKind, ToastWindow},
         window_frame::WindowFrame,
     },
 };
 use gpui::{
-    App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, MouseDownEvent,
-    Pixels, Point, ScrollWheelEvent, SharedString, Subscription, Task, Window, WindowAppearance,
-    WindowHandle, http_client::Url, px,
+    App, AppContext, ClipboardItem, Context, Entity, ExternalPaths, FocusHandle, Focusable,
+    MouseDownEvent, Pixels, Point, PromptLevel, ScrollWheelEvent, SharedString, Subscription, Task,
+    Window, WindowAppearance, WindowHandle, http_client::Url, px,
 };
 use std::{
     cell::RefCell,
@@ -43,7 +44,6 @@ const SAVE_DELAY: Duration = Duration::from_millis(500);
 /// Page titles and addresses can change every second (timers, chat badges,
 /// tickers), in every space: those changes alone are saved this rarely.
 const PAGE_SAVE_DELAY: Duration = Duration::from_secs(10);
-const TOAST_DURATION: Duration = Duration::from_millis(1500);
 
 /// Navigation state of a loaded tab, for the toolbar and the progress bar.
 #[derive(Clone, Copy, Debug, Default)]
@@ -63,11 +63,6 @@ pub struct Slide {
     pub direction: f32,
     /// Milliseconds since `start` of each frame, for MAPBROWSER_TRACE_ANIMATION.
     pub frames: Vec<f32>,
-}
-
-pub struct Toast {
-    pub text: SharedString,
-    _timer: Task<()>,
 }
 
 pub struct CommandBarWindow {
@@ -128,6 +123,12 @@ pub struct BrowserApp {
     /// The toast over the card while the sidebar is hidden.
     pub(crate) toast_window: Option<ToastWindow>,
     pub link_status: LinkStatus,
+    /// Why the last save failed, until one succeeds; a notice says so.
+    pub(crate) save_failure: Option<SharedString>,
+    /// What the menu bar shows now.
+    menu_bar: crate::MenuBarState,
+    /// Help > Keyboard Shortcuts, while open.
+    pub(crate) shortcuts: Option<ShortcutsWindow>,
 }
 
 /// OS open-URL events are web addresses, never address-bar search queries.
@@ -145,6 +146,67 @@ pub fn external_web_url(value: &str) -> Option<Url> {
     }
     let url = Url::parse(value).ok()?;
     url.has_host().then_some(url)
+}
+
+/// Files a tab shows, as the bundle declares for Finder: pages, PDFs,
+/// images and text. Web locations (.webloc) open their address.
+const SHOWN_FILE_EXTENSIONS: [&str; 15] = [
+    "html", "htm", "xhtml", "xht", "shtml", "pdf", "svg", "txt", "png", "jpg", "jpeg", "gif",
+    "webp", "avif", "bmp",
+];
+
+/// What a link or file opened from another app (Finder, the Dock, `open
+/// -a`) opens: a web address, a file a tab can show, or a .webloc's
+/// address. Only this path, and dropping files on the sidebar, opens file
+/// URLs; other files and schemes open nothing.
+pub fn opened_address(value: &str) -> Option<Url> {
+    if let Some(url) = external_web_url(value) {
+        return Some(url);
+    }
+    let url = Url::parse(value)
+        .ok()
+        .filter(|url| url.scheme() == "file")?;
+    opened_file(&url.to_file_path().ok()?)
+}
+
+/// The address a file opens at, if a tab can show it.
+pub fn opened_file(path: &std::path::Path) -> Option<Url> {
+    if !path.is_file() {
+        return None;
+    }
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if extension == "webloc" {
+        return external_web_url(&native::webloc_address(path)?);
+    }
+    SHOWN_FILE_EXTENSIONS
+        .contains(&extension.as_str())
+        .then(|| Url::from_file_path(path).ok())
+        .flatten()
+}
+
+/// The address in a .webloc's XML property list: the string after its URL
+/// key.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub fn webloc_address_in_xml(plist: &str) -> Option<String> {
+    const KEY: &str = "<key>URL</key>";
+    let after_key = &plist[plist.find(KEY)? + KEY.len()..];
+    let value = after_key.trim_start().strip_prefix("<string>")?;
+    let value = &value[..value.find("</string>")?];
+    Some(
+        value
+            .trim()
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&"),
+    )
+}
+
+/// A preview's command-line argument: an address or a file's path.
+#[cfg(not(target_os = "macos"))]
+pub fn argument_address(argument: &str) -> Option<Url> {
+    opened_address(argument).or_else(|| opened_file(&std::path::absolute(argument).ok()?))
 }
 
 /// What the shell draws of a tab's URL: on macOS the host (the URL pill,
@@ -233,6 +295,9 @@ impl BrowserApp {
             find: Find::default(),
             toast_window: None,
             link_status: LinkStatus::default(),
+            save_failure: None,
+            menu_bar: crate::MenuBarState::default(),
+            shortcuts: None,
         };
         this._subscriptions.extend([
             cx.subscribe_in(
@@ -298,7 +363,18 @@ impl BrowserApp {
             }
         })
         .detach();
-        // The channel also holds URLs delivered before the window existed.
+        // Links that launched the app open now, before the saved selection
+        // gets a browser: only the last of them loads (lazy restore).
+        let space_id = this.state.selected_space_id;
+        let mut launched_with_links = false;
+        while let Ok(url) = external_urls.try_recv() {
+            let address = model::normalize_address(url.as_str());
+            launched_with_links |= this.state.new_tab(space_id, address).is_some();
+        }
+        if launched_with_links {
+            this.persist_later(cx);
+        }
+        // Links opened later arrive here.
         cx.spawn_in(window, async move |this, cx| {
             while let Ok(url) = external_urls.recv().await {
                 if this
@@ -331,6 +407,11 @@ impl BrowserApp {
         this.load_favicons(hosts, cx);
         // Lazy restore: only the tab on screen gets a browser now.
         this.show_selected();
+        if let Some(recovery) = this.state.recovery.take() {
+            cx.defer_in(window, move |this, window, cx| {
+                this.tell_recovery(recovery, window, cx)
+            });
+        }
         this
     }
 
@@ -1023,30 +1104,21 @@ impl BrowserApp {
             let id = tab.id;
             self.reload(id, cx);
         }
-        self.show_toast(
+        self.show_toast_kind(
+            ToastKind::Info,
             if disabled {
-                format!("Blocking off for {host}")
+                format!("Content blocking off for {host}")
             } else {
-                format!("Blocking on for {host}")
+                format!("Content blocking on for {host}")
             },
             cx,
         );
         self.persist_later(cx);
     }
 
+    /// A toast saying something was done (✓); `show_toast_kind` for others.
     pub fn show_toast(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
-        let timer = cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(TOAST_DURATION).await;
-            let _ = this.update(cx, |this, cx| {
-                this.toast = None;
-                cx.notify();
-            });
-        });
-        self.toast = Some(Toast {
-            text: text.into(),
-            _timer: timer,
-        });
-        cx.notify();
+        self.show_toast_kind(ToastKind::Done, text, cx);
     }
 
     pub fn open_menu(
@@ -1056,13 +1128,11 @@ impl BrowserApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The window's root takes the keys, so the menu works from the
+        // keyboard.
         self.engine.borrow().focus_shell();
         window.focus(&self.focus_handle);
-        self.menu = Some(OpenMenu {
-            kind,
-            anchor,
-            above: anchor.y,
-        });
+        self.menu = Some(OpenMenu::new(kind, anchor, window.viewport_size().height));
         cx.notify();
     }
 
@@ -1361,7 +1431,7 @@ impl BrowserApp {
                 };
                 let percent = active.and_then(|id| self.engine.borrow().zoom(id, step));
                 if let Some(percent) = percent {
-                    self.show_toast(format!("Zoom {percent}%"), cx);
+                    self.show_toast_kind(ToastKind::Info, format!("Zoom {percent}%"), cx);
                 }
             }
             Shortcut::Stop => {
@@ -1725,19 +1795,49 @@ impl BrowserApp {
             }) else {
                 return;
             };
-            match snapshot {
-                // Writing waits on fsync; keep it off the main thread.
-                Ok(snapshot) => cx
-                    .background_executor()
-                    .spawn(async move {
-                        if let Err(error) = snapshot.write() {
-                            eprintln!("Couldn't save this session: {error}");
-                        }
-                    })
-                    .detach(),
-                Err(error) => eprintln!("Couldn't save this session: {error}"),
-            }
+            let snapshot = match snapshot {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| this.save_finished(Err(error), cx));
+                    return;
+                }
+            };
+            // Writing waits on fsync; keep it off the main thread. It runs
+            // to the end even if a newer save replaces this task; only its
+            // outcome is reported back.
+            let written = cx
+                .background_executor()
+                .spawn(async move { snapshot.write().map(drop) });
+            let mut async_cx = cx.clone();
+            cx.foreground_executor()
+                .spawn(async move {
+                    let written = written.await;
+                    let _ = this.update(&mut async_cx, |this, cx| this.save_finished(written, cx));
+                })
+                .detach();
         }));
+    }
+
+    /// A failed save puts up a notice that stays until a save succeeds:
+    /// otherwise new tabs would be lost at the next launch without a word.
+    fn save_finished(&mut self, result: std::io::Result<()>, cx: &mut Context<Self>) {
+        let failure = match result {
+            Ok(()) => None,
+            Err(error) => {
+                eprintln!("Couldn't save this session: {error}");
+                Some(SharedString::from(save_failure_reason(&error)))
+            }
+        };
+        if self.save_failure != failure {
+            self.save_failure = failure;
+            cx.notify();
+        }
+    }
+
+    /// The notice's Try Again: saves at once.
+    pub(crate) fn save_again(&mut self, cx: &mut Context<Self>) {
+        self.save_due = None;
+        self.schedule_save(Duration::ZERO, cx);
     }
 
     fn save_now(&mut self) {
@@ -1746,6 +1846,113 @@ impl BrowserApp {
         if let Err(error) = self.state.save() {
             eprintln!("Couldn't save this session: {error}");
         }
+    }
+
+    /// Keeps the menu bar's changing items (Show or Hide Sidebar, Pin or
+    /// Unpin Tab, the spaces) in step with the window. Called on every
+    /// frame; the menu bar is rebuilt only when they change, which is rare.
+    pub(crate) fn sync_menu_bar(&mut self, cx: &mut Context<Self>) {
+        let sidebar_hidden = self.state.sidebar_hidden;
+        let tab_pinned = self
+            .state
+            .active_tab()
+            .is_some_and(|tab| tab.pin != Pin::Today);
+        let spaces = self.state.spaces.iter().take(9).map(|space| &space.name);
+        let shown = &self.menu_bar;
+        if shown.sidebar_hidden == sidebar_hidden
+            && shown.tab_pinned == tab_pinned
+            && shown.spaces.iter().eq(spaces.clone())
+        {
+            return;
+        }
+        let state = crate::MenuBarState {
+            sidebar_hidden,
+            tab_pinned,
+            spaces: spaces.cloned().collect(),
+        };
+        self.menu_bar = state.clone();
+        cx.defer(move |cx| cx.set_menus(crate::menus(&state)));
+    }
+
+    /// Map Browser > Set as Default Browser…: macOS asks the user to
+    /// confirm, and changes https along with http.
+    pub fn set_default_browser(&mut self, cx: &mut Context<Self>) {
+        if native::is_default_browser() {
+            self.show_toast_kind(
+                ToastKind::Info,
+                "Map Browser is already your default browser",
+                cx,
+            );
+        } else {
+            native::set_as_default_browser();
+        }
+    }
+
+    /// Files dropped on the sidebar open as tabs, as from Finder.
+    pub fn open_dropped(&mut self, paths: &ExternalPaths, cx: &mut Context<Self>) {
+        let mut refused = None;
+        for path in paths.paths() {
+            match opened_file(path) {
+                Some(url) => self.open_url(url.as_str(), cx),
+                None => refused = refused.or(path.file_name()),
+            }
+        }
+        if let Some(name) = refused {
+            let name = name.to_string_lossy();
+            self.show_toast_kind(ToastKind::Failed, format!("Can't open “{name}”"), cx);
+        }
+    }
+
+    /// Says once, after a launch that couldn't read state.json, where the
+    /// session came from and where the damaged file was kept.
+    fn tell_recovery(&mut self, recovery: Recovery, window: &mut Window, cx: &mut Context<Self>) {
+        let folder = self.state.root_dir().display().to_string();
+        let kept = recovery.kept.as_ref().map(|kept| {
+            let name = kept.file_name().unwrap_or_default().to_string_lossy();
+            format!("The damaged file was kept as “{name}” in {folder}.")
+        });
+        let (message, detail) = if recovery.from_backup {
+            (
+                "Map Browser restored your tabs from a backup.",
+                "Your saved spaces and tabs couldn't be read, so they were opened from the last backup. Changes made since then may be missing.",
+            )
+        } else {
+            (
+                "Map Browser couldn't restore your tabs.",
+                "Your saved spaces and tabs couldn't be read, and there was no backup to open, so Map Browser started with new spaces.",
+            )
+        };
+        let detail = match &kept {
+            Some(kept) => format!("{detail}\n\n{kept}"),
+            None => detail.to_owned(),
+        };
+        let buttons: &[&str] = if kept.is_some() {
+            &["OK", "Show in Finder"]
+        } else {
+            &["OK"]
+        };
+        let answer = window.prompt(PromptLevel::Warning, message, Some(&detail), buttons, cx);
+        let kept = recovery.kept;
+        cx.spawn(async move |_, _| {
+            if answer.await == Ok(1)
+                && let Some(kept) = kept
+            {
+                native::reveal_in_finder(&kept);
+            }
+        })
+        .detach();
+    }
+}
+
+/// Why a save failed, in a few words for the notice.
+fn save_failure_reason(error: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => {
+            "its folder can't be written to".to_owned()
+        }
+        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => "the disk is full".to_owned(),
+        _ => error.to_string(),
     }
 }
 

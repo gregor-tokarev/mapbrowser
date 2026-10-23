@@ -11,6 +11,7 @@ pub mod link_status;
 pub mod menu;
 pub mod permissions;
 pub mod redraw;
+pub mod shortcuts;
 mod sidebar;
 pub mod swipe;
 pub mod theme;
@@ -136,6 +137,10 @@ impl Render for BrowserApp {
         self.sync_find_bar(card, window, cx);
         self.sync_toast_window(card, window, cx);
         self.sync_link_status(card, window, cx);
+        self.sync_menu_bar(cx);
+        if let Some(width) = self.sidebar_width() {
+            self.fit_toast(width, window);
+        }
         let sidebar = self
             .sidebar_width()
             .map(|width| self.render_sidebar(width, &theme, frame, cx));
@@ -147,9 +152,10 @@ impl Render for BrowserApp {
             .size_full()
             .relative()
             .font_family(UI_FONT)
-            .key_context("Browser")
+            .key_context(self.key_context())
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &Dismiss, _, cx| this.dismiss(cx)))
+            .map(|root| menu::handle_menu_keys(root, cx))
             .on_modifiers_changed(
                 cx.listener(|this, event: &ModifiersChangedEvent, window, cx| {
                     if !event.modifiers.control {

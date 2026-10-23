@@ -196,7 +196,11 @@ impl BrowserApp {
     ) {
         // Without the sidebar's ring, nothing would show it started.
         if self.sidebar_width().is_none() {
-            self.show_toast(format!("Downloading {name}"), cx);
+            self.show_toast_kind(
+                super::toast_window::ToastKind::Info,
+                format!("Downloading {name}"),
+                cx,
+            );
         }
         self.downloads.start(id, tab_id, name, path);
         // A link that opened a new tab for a file leaves it blank: close it

@@ -25,9 +25,22 @@ mod native {
 
     /// Previews have no Finder.
     pub fn reveal_in_finder(_path: &std::path::Path) {}
+
+    /// Previews have no default browser to be.
+    pub fn is_default_browser() -> bool {
+        false
+    }
+
+    /// Previews have no default browser to be.
+    pub fn set_as_default_browser() {}
+
+    /// Previews read only the XML form of a .webloc, which macOS also writes.
+    pub fn webloc_address(path: &std::path::Path) -> Option<String> {
+        crate::app::webloc_address_in_xml(&std::fs::read_to_string(path).ok()?)
+    }
 }
 
-use app::{BrowserApp, external_web_url, run_shortcut};
+use app::{BrowserApp, opened_address, run_shortcut};
 use blocker::ContentBlocker;
 use engine::{Engine, Shortcut};
 use gpui::{prelude::*, *};
@@ -49,7 +62,9 @@ actions!(
         Redo,
         Minimize,
         Zoom,
-        BringAllToFront
+        BringAllToFront,
+        SetDefaultBrowser,
+        ShowShortcuts
     ]
 );
 
@@ -85,6 +100,9 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-shift-tab", Browse(PreviousTab), None),
         KeyBinding::new("cmd-alt-down", Browse(NextTabInList), None),
         KeyBinding::new("cmd-alt-up", Browse(PreviousTabInList), None),
+        // Chrome's and Safari's keys for the same, after the menu's own.
+        KeyBinding::new("cmd-shift-]", Browse(NextTabInList), None),
+        KeyBinding::new("cmd-shift-[", Browse(PreviousTabInList), None),
         KeyBinding::new("cmd-alt-left", Browse(PreviousSpace), None),
         KeyBinding::new("cmd-alt-right", Browse(NextSpace), None),
         KeyBinding::new("cmd-r", Browse(Reload), None),
@@ -121,26 +139,61 @@ fn key_bindings() -> Vec<KeyBinding> {
             None,
         ));
     }
+    // Previews have no menu bar, so no Help menu: ⌘/ stands in for it.
+    // On macOS web editors keep ⌘/ (comment a line, list their keys).
+    #[cfg(not(target_os = "macos"))]
+    bindings.push(KeyBinding::new("cmd-/", ShowShortcuts, None));
     bindings
 }
 
-fn menus() -> Vec<Menu> {
+/// What the menu bar's changing items follow: Show or Hide Sidebar, Pin or
+/// Unpin Tab, and the spaces ⌃1–⌃9 go to.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MenuBarState {
+    pub sidebar_hidden: bool,
+    pub tab_pinned: bool,
+    /// The first nine spaces' names.
+    pub spaces: Vec<String>,
+}
+
+pub fn menus(state: &MenuBarState) -> Vec<Menu> {
     use Shortcut::*;
     let menu = |name: &'static str, items| Menu {
         name: name.into(),
         items,
     };
+    let mut spaces = vec![
+        MenuItem::action("New Space", NewSpace),
+        MenuItem::separator(),
+        MenuItem::action("Next Space", Browse(NextSpace)),
+        MenuItem::action("Previous Space", Browse(PreviousSpace)),
+    ];
+    if !state.spaces.is_empty() {
+        spaces.push(MenuItem::separator());
+    }
+    spaces.extend(
+        state
+            .spaces
+            .iter()
+            .zip(1..=9u8)
+            .map(|(name, number)| MenuItem::action(name.clone(), Browse(SelectSpace(number)))),
+    );
     vec![
+        // AppKit titles this menu with the bundle's name, "Map Browser".
         menu(
-            "Map",
+            "Map Browser",
             vec![
-                MenuItem::action("About Map", About),
+                MenuItem::action("About Map Browser", About),
                 MenuItem::separator(),
-                MenuItem::action("Hide Map", Hide),
+                MenuItem::action("Set as Default Browser…", SetDefaultBrowser),
+                MenuItem::separator(),
+                MenuItem::os_submenu("Services", SystemMenuType::Services),
+                MenuItem::separator(),
+                MenuItem::action("Hide Map Browser", Hide),
                 MenuItem::action("Hide Others", HideOthers),
                 MenuItem::action("Show All", ShowAll),
                 MenuItem::separator(),
-                MenuItem::action("Quit Map", Quit),
+                MenuItem::action("Quit Map Browser", Quit),
             ],
         ),
         menu(
@@ -181,9 +234,16 @@ fn menus() -> Vec<Menu> {
         menu(
             "View",
             vec![
-                MenuItem::action("Toggle Sidebar", Browse(ToggleSidebar)),
+                MenuItem::action(
+                    if state.sidebar_hidden {
+                        "Show Sidebar"
+                    } else {
+                        "Hide Sidebar"
+                    },
+                    Browse(ToggleSidebar),
+                ),
                 MenuItem::separator(),
-                MenuItem::action("Reload Page", Browse(Reload)),
+                MenuItem::action("Reload", Browse(Reload)),
                 MenuItem::action("Stop", Browse(Stop)),
                 MenuItem::action("Back", Browse(Back)),
                 MenuItem::action("Forward", Browse(Forward)),
@@ -195,22 +255,24 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Developer Tools", Browse(DevTools)),
             ],
         ),
-        menu(
-            "Spaces",
-            vec![
-                MenuItem::action("New Space", NewSpace),
-                MenuItem::separator(),
-                MenuItem::action("Next Space", Browse(NextSpace)),
-                MenuItem::action("Previous Space", Browse(PreviousSpace)),
-            ],
-        ),
+        menu("Spaces", spaces),
         menu(
             "Tab",
             vec![
-                MenuItem::action("Pin or Unpin Tab", Browse(TogglePin)),
+                MenuItem::action(
+                    if state.tab_pinned {
+                        "Unpin Tab"
+                    } else {
+                        "Pin Tab"
+                    },
+                    Browse(TogglePin),
+                ),
                 MenuItem::action("Copy URL", Browse(CopyUrl)),
                 MenuItem::separator(),
-                MenuItem::action("Clear Today Tabs", Browse(ClearToday)),
+                MenuItem::action("Next Tab", Browse(NextTabInList)),
+                MenuItem::action("Previous Tab", Browse(PreviousTabInList)),
+                MenuItem::separator(),
+                MenuItem::action("Clear Today", Browse(ClearToday)),
             ],
         ),
         // The name makes it AppKit's Window menu, which lists the windows.
@@ -222,6 +284,11 @@ fn menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("Bring All to Front", BringAllToFront),
             ],
+        ),
+        // The name makes it AppKit's Help menu, with its search field.
+        menu(
+            "Help",
+            vec![MenuItem::action("Keyboard Shortcuts", ShowShortcuts)],
         ),
     ]
 }
@@ -241,11 +308,33 @@ fn main() -> anyhow::Result<()> {
     let engine = Rc::new(RefCell::new(engine));
     let retained_engine = engine.clone();
     let (external_urls_tx, external_urls_rx) = async_channel::unbounded();
-    let application = Application::new().with_assets(ui::icons::Assets);
-    application.on_open_urls(move |urls| {
-        for url in urls.iter().filter_map(|url| external_web_url(url)) {
+    // Previews have no Launch Services: addresses and files given on the
+    // command line stand in for links and files opened from other apps.
+    #[cfg(not(target_os = "macos"))]
+    for argument in std::env::args().skip(1) {
+        if let Some(url) = app::argument_address(&argument) {
             let _ = external_urls_tx.try_send(url);
         }
+    }
+    let application = Application::new().with_assets(ui::icons::Assets);
+    // Links, and files from Finder, the Dock and `open -a`. Files arrive as
+    // file URLs; `opened_address` keeps the kinds a browser shows.
+    application.on_open_urls(move |urls| {
+        for url in urls.iter().filter_map(|url| opened_address(url)) {
+            let _ = external_urls_tx.try_send(url);
+        }
+    });
+    // A click on the Dock icon with no window on screen (minimised, say)
+    // brings the browser window back.
+    application.on_reopen(|cx| {
+        let browser = cx
+            .windows()
+            .into_iter()
+            .find_map(|window| window.downcast::<BrowserApp>());
+        if let Some(browser) = browser {
+            let _ = browser.update(cx, |_, window, _| window.activate_window());
+        }
+        cx.activate(true);
     });
     application.run(move |cx: &mut App| {
         // First: of bindings for the same keys, GPUI picks the one added
@@ -254,12 +343,15 @@ fn main() -> anyhow::Result<()> {
         input::init(cx);
         ui::command_bar::init(cx);
         ui::find_bar::init(cx);
+        ui::menu::init(cx);
+        ui::shortcuts::init(cx);
         cx.on_action(|_: &About, _| native::show_about_panel());
         cx.on_action(|_: &Hide, cx| cx.hide());
         cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
         cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
         cx.on_action(|_: &BringAllToFront, _| native::bring_all_to_front());
-        cx.set_menus(menus());
+        // The browser window keeps it up to date (`BrowserApp::sync_menu_bar`).
+        cx.set_menus(menus(&MenuBarState::default()));
         let (bounds, display_id) = ui::window_frame::initial(state.window.as_ref(), cx);
         let window = cx
             .open_window(
@@ -308,6 +400,16 @@ fn main() -> anyhow::Result<()> {
         cx.on_action(move |_: &NewSpace, cx| {
             cx.defer(move |cx| {
                 let _ = window.update(cx, |app, window, cx| app.new_space(window, cx));
+            })
+        });
+        cx.on_action(move |_: &SetDefaultBrowser, cx| {
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |app, _, cx| app.set_default_browser(cx));
+            })
+        });
+        cx.on_action(move |_: &ShowShortcuts, cx| {
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |app, window, cx| app.show_shortcuts(window, cx));
             })
         });
         // Like NewSpace, these act on the browser window, also while the
