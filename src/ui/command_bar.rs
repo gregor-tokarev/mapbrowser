@@ -907,7 +907,12 @@ fn actions(context: &CommandContext) -> Vec<(CommandItem, &'static str)> {
         actions.push((item, "go space"));
     }
     actions.push((
-        action(Command::ShowHistory, "Show History", Icon::History, "⌘Y"),
+        action(
+            Command::ShowHistory,
+            "Show All History",
+            Icon::History,
+            "⌘Y",
+        ),
         "visited pages",
     ));
     actions.push((clear_history_action(), "delete forget"));

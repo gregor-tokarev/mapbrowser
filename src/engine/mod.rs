@@ -178,8 +178,12 @@ pub enum EngineEvent {
         tab_id: u64,
         fullscreen: bool,
     },
-    /// Text to put on the clipboard ("Copy Link Address").
-    CopyText(String),
+    /// An address to put on the clipboard, from the page menu's Copy Link
+    /// Address, or Copy Image Address when `image`.
+    CopyText {
+        text: String,
+        image: bool,
+    },
     /// An image to put on the clipboard, as PNG ("Copy Image"); none if it
     /// couldn't be fetched.
     CopyImage(Option<Vec<u8>>),

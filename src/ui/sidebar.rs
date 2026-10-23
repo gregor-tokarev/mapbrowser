@@ -1425,7 +1425,7 @@ impl BrowserApp {
                             .child(icon(Icon::Broom, 12., theme.tertiary()))
                             .child("Clear"),
                     )
-                    .maybe_tooltip(self.tooltip("Close All Today Tabs", "⇧⌘K", theme, width))
+                    .maybe_tooltip(self.tooltip("Clear Today", "⇧⌘K", theme, width))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.end_rename(window, cx);
                         this.clear_today(cx)

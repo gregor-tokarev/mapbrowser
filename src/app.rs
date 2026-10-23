@@ -2455,9 +2455,17 @@ impl BrowserApp {
                 }
             }
             EngineEvent::Shortcut(shortcut) => self.shortcut(shortcut, window, cx),
-            EngineEvent::CopyText(text) => {
+            EngineEvent::CopyText { text, image } => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
-                self.show_toast("Copied Link", cx);
+                // In the words of the menu item that copied it.
+                self.show_toast(
+                    if image {
+                        "Copied Image Address"
+                    } else {
+                        "Copied Link Address"
+                    },
+                    cx,
+                );
             }
             EngineEvent::CopyImage(Some(png)) => {
                 let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, png);
@@ -2740,26 +2748,25 @@ impl BrowserApp {
         }
     }
 
-    /// Keeps the menu bar's changing items (Show or Hide Sidebar, Pin or
-    /// Unpin Tab, the spaces) in step with the window. Called on every
-    /// frame; the menu bar is rebuilt only when they change, which is rare.
+    /// Keeps the menu bar's changing items (Show or Hide Sidebar, what ⌘D
+    /// and ⌘W do to the tab, the spaces) in step with the window. Called on
+    /// every frame; the menu bar is rebuilt only when they change, which is
+    /// rare.
     pub(crate) fn sync_menu_bar(&mut self, cx: &mut Context<Self>) {
-        let sidebar_hidden = self.state.sidebar_hidden;
-        let tab_pinned = self
-            .state
-            .active_tab()
-            .is_some_and(|tab| tab.pin != Pin::Today);
+        // The words the sidebar button and the command bar use.
+        let sidebar_hidden = self.sidebar_toggle_shows();
+        let pin = self.state.active_tab().map_or(Pin::Today, |tab| tab.pin);
         let spaces = self.state.spaces.iter().take(9).map(|space| &space.name);
         let shown = &self.menu_bar;
         if shown.sidebar_hidden == sidebar_hidden
-            && shown.tab_pinned == tab_pinned
+            && shown.pin == pin
             && shown.spaces.iter().eq(spaces.clone())
         {
             return;
         }
         let state = crate::MenuBarState {
             sidebar_hidden,
-            tab_pinned,
+            pin,
             spaces: spaces.cloned().collect(),
         };
         self.menu_bar = state.clone();

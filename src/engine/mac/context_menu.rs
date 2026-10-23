@@ -114,7 +114,7 @@ wrap_context_menu_handler! {
             };
             match command_id {
                 MENU_OPEN_LINK => request_tab(&self.link, frame, target.link, false),
-                MENU_COPY_LINK => self.link.send(EngineEvent::CopyText(target.link)),
+                MENU_COPY_LINK => self.link.send(EngineEvent::CopyText { text: target.link, image: false }),
                 MENU_DOWNLOAD_LINK => download(&target.link),
                 MENU_OPEN_IMAGE => request_tab(&self.link, frame, target.image, false),
                 MENU_SAVE_IMAGE => download(&target.image),
@@ -124,7 +124,7 @@ wrap_context_menu_handler! {
                         host.download_image(Some(&CefString::from(target.image.as_str())), 0, 0, 0, Some(&mut callback));
                     }
                 }
-                MENU_COPY_IMAGE_ADDRESS => self.link.send(EngineEvent::CopyText(target.image)),
+                MENU_COPY_IMAGE_ADDRESS => self.link.send(EngineEvent::CopyText { text: target.image, image: true }),
                 MENU_INSPECT => {
                     if let Some(host) = browser.as_deref().and_then(|browser| browser.host()) {
                         let at = params.as_deref().map(|params| Point { x: params.xcoord(), y: params.ycoord() });

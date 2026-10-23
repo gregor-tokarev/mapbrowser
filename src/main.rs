@@ -45,7 +45,7 @@ use app::{BrowserApp, opened_address, run_shortcut};
 use blocker::ContentBlocker;
 use engine::{Engine, Shortcut};
 use gpui::{prelude::*, *};
-use model::BrowserState;
+use model::{BrowserState, Pin};
 use std::{cell::RefCell, rc::Rc};
 use ui::{command_bar::CommandMode, downloads::request_quit};
 
@@ -156,18 +156,25 @@ fn key_bindings() -> Vec<KeyBinding> {
     bindings
 }
 
-/// What the menu bar's changing items follow: Show or Hide Sidebar, Pin or
-/// Unpin Tab, and the spaces ⌃1–⌃9 go to.
+/// What the menu bar's changing items follow: Show or Hide Sidebar, what
+/// ⌘D and ⌘W do to the active tab, and the spaces ⌃1–⌃9 go to.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MenuBarState {
     pub sidebar_hidden: bool,
-    pub tab_pinned: bool,
+    /// The active tab's section.
+    pub pin: Pin,
     /// The first nine spaces' names.
     pub spaces: Vec<String>,
 }
 
 pub fn menus(state: &MenuBarState) -> Vec<Menu> {
     use Shortcut::*;
+    // The tab's own menu words: ⌘W only unloads a pinned tab or favorite.
+    let (close, pin) = match state.pin {
+        Pin::Today => ("Close Tab", "Pin Tab"),
+        Pin::Pinned => ("Unload Tab", "Unpin Tab"),
+        Pin::Favorite => ("Unload Tab", "Remove from Favorites"),
+    };
     let menu = |name: &'static str, items| Menu {
         name: name.into(),
         items,
@@ -214,7 +221,7 @@ pub fn menus(state: &MenuBarState) -> Vec<Menu> {
                 MenuItem::action("Open Location…", Browse(EditAddress)),
                 MenuItem::action("Reopen Closed Tab", Browse(ReopenClosedTab)),
                 MenuItem::separator(),
-                MenuItem::action("Close Tab", Browse(CloseTab)),
+                MenuItem::action(close, Browse(CloseTab)),
                 MenuItem::separator(),
                 MenuItem::action("Print…", Browse(Print)),
             ],
@@ -280,14 +287,7 @@ pub fn menus(state: &MenuBarState) -> Vec<Menu> {
         menu(
             "Tab",
             vec![
-                MenuItem::action(
-                    if state.tab_pinned {
-                        "Unpin Tab"
-                    } else {
-                        "Pin Tab"
-                    },
-                    Browse(TogglePin),
-                ),
+                MenuItem::action(pin, Browse(TogglePin)),
                 MenuItem::action("Copy URL", Browse(CopyUrl)),
                 MenuItem::separator(),
                 MenuItem::action("Next Tab", Browse(NextTabInList)),

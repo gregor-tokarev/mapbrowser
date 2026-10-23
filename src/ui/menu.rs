@@ -625,7 +625,7 @@ impl BrowserApp {
                 entries.push(Entry::Separator);
                 // Favorite tiles show no title to rename.
                 if tab.pin != Pin::Favorite {
-                    entries.push(Entry::item("Rename Tab…", "", Action::RenameTab(id)));
+                    entries.push(Entry::item("Rename Tab", "", Action::RenameTab(id)));
                     if tab.custom_title.is_some() {
                         entries.push(Entry::item("Reset Name", "", Action::ResetTabName(id)));
                     }
@@ -639,7 +639,7 @@ impl BrowserApp {
                 }
                 entries.extend([
                     Entry::item("Copy URL", "⇧⌘C", Action::CopyUrl(id)),
-                    Entry::item("Duplicate", "", Action::Duplicate(id)),
+                    Entry::item("Duplicate Tab", "", Action::Duplicate(id)),
                 ]);
                 if self.state.spaces.len() > 1 {
                     entries.push(Entry::item("Move to Space", "›", Action::AskMoveTab(id)));
@@ -654,7 +654,7 @@ impl BrowserApp {
                     };
                     entries.push(Entry::item(label, "", Action::ToggleMute(id)));
                 }
-                entries.extend([Entry::Separator]);
+                entries.push(Entry::Separator);
                 if tab.pin == Pin::Today {
                     let today: Vec<TabId> = self
                         .state
@@ -793,7 +793,7 @@ impl BrowserApp {
                     },
                     Entry::Separator,
                     Entry::Check {
-                        label: "Block Ads and Trackers",
+                        label: "Ad Blocking",
                         checked: !self.state.is_blocking_disabled(&host),
                         action: Action::ToggleBlocking(id),
                     },

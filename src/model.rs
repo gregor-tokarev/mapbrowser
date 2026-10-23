@@ -1357,7 +1357,7 @@ fn clamp_sidebar_width(width: f32) -> f32 {
 
 fn fallback_title(url: &str) -> String {
     if url == BLANK_URL {
-        "New tab".into()
+        "New Tab".into()
     } else {
         url.to_owned()
     }
@@ -2391,7 +2391,7 @@ mod tests {
         );
         let blank = state.new_tab(space, "  ").unwrap();
         assert_eq!(state.tab(blank).unwrap().url, BLANK_URL);
-        assert_eq!(state.tab(blank).unwrap().title, "New tab");
+        assert_eq!(state.tab(blank).unwrap().title, "New Tab");
     }
 
     #[test]
