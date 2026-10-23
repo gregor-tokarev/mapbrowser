@@ -118,9 +118,10 @@ pub fn favicon_wait(
         .filter(|wait| !wait.is_zero())
 }
 
-/// The page menu's "Search Google for “…”" for `selection`, or nothing for
-/// a blank one. Long selections are cut short; `&` is doubled, as menu
-/// labels read a single one as a mnemonic marker.
+/// The page menu's "Search Google for “…”" (or the chosen search engine)
+/// for `selection`, or nothing for a blank one. Long selections are cut
+/// short; `&` is doubled, as menu labels read a single one as a mnemonic
+/// marker.
 #[cfg(any(target_os = "macos", test))]
 pub fn search_label(selection: &str) -> Option<String> {
     const MAX_CHARS: usize = 32;
@@ -136,7 +137,11 @@ pub fn search_label(selection: &str) -> Option<String> {
         }
         shown.push('…');
     }
-    Some(format!("Search Google for “{}”", shown.replace('&', "&&")))
+    let engine = crate::model::current_search_engine().name();
+    Some(format!(
+        "Search {engine} for “{}”",
+        shown.replace('&', "&&")
+    ))
 }
 
 /// `text` with its middle replaced by "…" so that it keeps `max_chars`

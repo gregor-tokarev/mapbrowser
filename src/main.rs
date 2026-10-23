@@ -2,6 +2,7 @@ mod app;
 mod blocker;
 mod engine;
 mod favicons;
+mod history;
 mod input;
 mod launch_error;
 mod model;
@@ -46,13 +47,14 @@ use engine::{Engine, Shortcut};
 use gpui::{prelude::*, *};
 use model::BrowserState;
 use std::{cell::RefCell, rc::Rc};
-use ui::downloads::request_quit;
+use ui::{command_bar::CommandMode, downloads::request_quit};
 
 actions!(
     mapbrowser,
     [
         Quit,
         About,
+        Settings,
         Hide,
         HideOthers,
         ShowAll,
@@ -64,7 +66,9 @@ actions!(
         Zoom,
         BringAllToFront,
         SetDefaultBrowser,
-        ShowShortcuts
+        ShowShortcuts,
+        ShowHistory,
+        ClearHistory
     ]
 );
 
@@ -87,10 +91,14 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-h", Hide, None),
         KeyBinding::new("alt-cmd-h", HideOthers, None),
         KeyBinding::new("cmd-m", Minimize, None),
-        // The key monitor sends these to a focused page first; bound here
-        // so the Edit menu shows them.
+        // The key monitor sends these to a focused page first; the shell's
+        // text fields take them while they have focus.
         KeyBinding::new("cmd-z", Undo, None),
         KeyBinding::new("cmd-shift-z", Redo, None),
+        // Not browser shortcuts: a page that leaves them alone hands them to
+        // the menu bar.
+        KeyBinding::new("cmd-,", Settings, None),
+        KeyBinding::new("cmd-y", ShowHistory, None),
         KeyBinding::new("escape", Dismiss, Some("Browser")),
         KeyBinding::new("cmd-t", Browse(CommandBar), None),
         KeyBinding::new("cmd-l", Browse(EditAddress), None),
@@ -185,6 +193,7 @@ pub fn menus(state: &MenuBarState) -> Vec<Menu> {
             vec![
                 MenuItem::action("About Map Browser", About),
                 MenuItem::separator(),
+                MenuItem::action("Settings…", Settings),
                 MenuItem::action("Set as Default Browser…", SetDefaultBrowser),
                 MenuItem::separator(),
                 MenuItem::os_submenu("Services", SystemMenuType::Services),
@@ -209,7 +218,8 @@ pub fn menus(state: &MenuBarState) -> Vec<Menu> {
             ],
         ),
         // Routed to whichever view has focus, the web page included. Undo
-        // and Redo act on the page only; the shell's text fields have none.
+        // and Redo act on the shell's text field that has focus, else on
+        // the page.
         menu(
             "Edit",
             vec![
@@ -253,6 +263,15 @@ pub fn menus(state: &MenuBarState) -> Vec<Menu> {
                 MenuItem::action("Zoom Out", Browse(ZoomOut)),
                 MenuItem::separator(),
                 MenuItem::action("Developer Tools", Browse(DevTools)),
+            ],
+        ),
+        menu(
+            "History",
+            vec![
+                MenuItem::action("Show All History", ShowHistory),
+                MenuItem::action("Reopen Closed Tab", Browse(ReopenClosedTab)),
+                MenuItem::separator(),
+                MenuItem::action("Clear History…", ClearHistory),
             ],
         ),
         menu("Spaces", spaces),
@@ -410,6 +429,26 @@ fn main() -> anyhow::Result<()> {
         cx.on_action(move |_: &ShowShortcuts, cx| {
             cx.defer(move |cx| {
                 let _ = window.update(cx, |app, window, cx| app.show_shortcuts(window, cx));
+            })
+        });
+        // History and settings are lists in the command bar.
+        cx.on_action(move |_: &ShowHistory, cx| {
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |app, window, cx| {
+                    app.toggle_command_bar(CommandMode::History, window, cx)
+                });
+            })
+        });
+        cx.on_action(move |_: &Settings, cx| {
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |app, window, cx| {
+                    app.toggle_command_bar(CommandMode::Settings, window, cx)
+                });
+            })
+        });
+        cx.on_action(move |_: &ClearHistory, cx| {
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |app, window, cx| app.ask_to_clear_history(window, cx));
             })
         });
         // Like NewSpace, these act on the browser window, also while the

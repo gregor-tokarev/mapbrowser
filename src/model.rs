@@ -1,7 +1,8 @@
 //! Persistent spaces and tabs. Each space owns a distinct Chromium profile.
 
 use crate::favicons::{host_and_parents, normalize_host};
-use serde::{Deserialize, Serialize};
+use gpui::http_client::Url;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions},
@@ -9,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         LazyLock, Mutex, PoisonError,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -104,6 +105,9 @@ pub struct BrowserState {
     /// can still be undone after a restart.
     #[serde(default)]
     closed: Vec<ClosedTab>,
+    /// Where typed searches go.
+    #[serde(default)]
+    search_engine: SearchEngine,
     #[serde(skip, default = "data_dir")]
     storage_dir: PathBuf,
     /// Whether this is the session saved last, read from state.json, rather
@@ -141,6 +145,110 @@ pub struct SavedWindow {
     pub fullscreen: bool,
 }
 
+/// The search engine typed searches go to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SearchEngine {
+    #[default]
+    Google,
+    DuckDuckGo,
+    Bing,
+    Brave,
+    Kagi,
+    Ecosia,
+}
+
+impl SearchEngine {
+    pub const ALL: [Self; 6] = [
+        Self::Google,
+        Self::DuckDuckGo,
+        Self::Bing,
+        Self::Brave,
+        Self::Kagi,
+        Self::Ecosia,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Google => "Google",
+            Self::DuckDuckGo => "DuckDuckGo",
+            Self::Bing => "Bing",
+            Self::Brave => "Brave Search",
+            Self::Kagi => "Kagi",
+            Self::Ecosia => "Ecosia",
+        }
+    }
+
+    /// What a search with it is called: "Google Search", "Brave Search".
+    pub fn search_label(self) -> String {
+        let name = self.name();
+        if name.ends_with(" Search") {
+            name.to_owned()
+        } else {
+            format!("{name} Search")
+        }
+    }
+
+    /// Its name in state.json.
+    fn id(self) -> &'static str {
+        match self {
+            Self::Google => "google",
+            Self::DuckDuckGo => "duckduckgo",
+            Self::Bing => "bing",
+            Self::Brave => "brave",
+            Self::Kagi => "kagi",
+            Self::Ecosia => "ecosia",
+        }
+    }
+
+    /// The results page's address, up to the encoded query.
+    fn query_url(self) -> &'static str {
+        match self {
+            Self::Google => "https://www.google.com/search?q=",
+            Self::DuckDuckGo => "https://duckduckgo.com/?q=",
+            Self::Bing => "https://www.bing.com/search?q=",
+            Self::Brave => "https://search.brave.com/search?q=",
+            Self::Kagi => "https://kagi.com/search?q=",
+            Self::Ecosia => "https://www.ecosia.org/search?q=",
+        }
+    }
+}
+
+impl Serialize for SearchEngine {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.id())
+    }
+}
+
+/// Lenient: an engine this version doesn't know (saved by a newer one) is
+/// Google, rather than a damaged session.
+impl<'de> Deserialize<'de> for SearchEngine {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(value
+            .as_str()
+            .and_then(|id| Self::ALL.into_iter().find(|engine| engine.id() == id))
+            .unwrap_or_default())
+    }
+}
+
+/// The session's search engine, for the whole process: the page menu's
+/// "Search … for" runs in Chromium's callbacks, away from the session.
+static SEARCH_ENGINE: AtomicU8 = AtomicU8::new(0);
+
+/// The search engine `search_url` uses.
+pub fn current_search_engine() -> SearchEngine {
+    let index = usize::from(SEARCH_ENGINE.load(Ordering::Relaxed));
+    SearchEngine::ALL.get(index).copied().unwrap_or_default()
+}
+
+fn use_search_engine(engine: SearchEngine) {
+    let index = SearchEngine::ALL
+        .iter()
+        .position(|&known| known == engine)
+        .unwrap_or(0);
+    SEARCH_ENGINE.store(index as u8, Ordering::Relaxed);
+}
+
 fn schema_version() -> u32 {
     SCHEMA_VERSION
 }
@@ -175,6 +283,7 @@ impl Default for BrowserState {
             blocking_exceptions: BTreeSet::new(),
             window: None,
             closed: Vec::new(),
+            search_engine: SearchEngine::default(),
             storage_dir: data_dir(),
             from_state_file: false,
             recovery: None,
@@ -402,6 +511,7 @@ impl BrowserState {
 
     fn loaded(state: Self) -> io::Result<Self> {
         state.ensure_profile_dirs()?;
+        use_search_engine(state.search_engine);
         Ok(state)
     }
 
@@ -514,6 +624,16 @@ impl BrowserState {
 
     pub fn set_sidebar_width(&mut self, width: f32) {
         self.sidebar_width = clamp_sidebar_width(width);
+    }
+
+    pub fn search_engine(&self) -> SearchEngine {
+        self.search_engine
+    }
+
+    /// Returns whether the engine changed.
+    pub fn set_search_engine(&mut self, engine: SearchEngine) -> bool {
+        use_search_engine(engine);
+        std::mem::replace(&mut self.search_engine, engine) != engine
     }
 
     /// Hosts where content blocking is off, as the engine takes them.
@@ -837,6 +957,14 @@ impl BrowserState {
         self.closed.retain(|closed| closed.tab.id != tab_id);
     }
 
+    /// Forgets every closed tab, with the browsing history. Returns whether
+    /// there were any.
+    pub fn clear_closed(&mut self) -> bool {
+        let had_any = !self.closed.is_empty();
+        self.closed.clear();
+        had_any
+    }
+
     fn validate_and_repair(&mut self) -> io::Result<()> {
         if self.schema_version > SCHEMA_VERSION {
             return Err(newer_schema());
@@ -1016,6 +1144,12 @@ fn quarantine(path: &Path) -> io::Result<PathBuf> {
     Ok(kept)
 }
 
+/// Replaces a file of the data directory the way routine session saves do:
+/// complete or not at all, without flushing the drive.
+pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    atomic_write(path, bytes, Durability::Ordered)
+}
+
 fn atomic_write(path: &Path, bytes: &[u8], durability: Durability) -> io::Result<()> {
     let temporary = path.with_extension(format!("tmp-{}", unique_suffix()));
     let result = (|| {
@@ -1101,29 +1235,62 @@ pub fn normalize_address(input: &str) -> String {
     if input.is_empty() {
         return "about:blank".into();
     }
+    if let Some(query) = forced_search(input) {
+        return search_url(query);
+    }
     web_address(input).unwrap_or_else(|| search_url(input))
 }
 
 /// Whether address-bar text is searched for rather than opened as a URL.
 pub fn is_search_query(input: &str) -> bool {
     let input = input.trim();
-    !input.is_empty() && web_address(input).is_none()
+    !input.is_empty() && (forced_search(input).is_some() || web_address(input).is_none())
 }
+
+/// What a leading "?" asks to search for, even if it looks like an
+/// address, as in Chrome: "?example.com" searches for "example.com".
+pub fn forced_search(input: &str) -> Option<&str> {
+    input
+        .trim()
+        .strip_prefix('?')
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+}
+
+/// The words a search for address-bar text looks for.
+pub fn search_text(input: &str) -> &str {
+    forced_search(input).unwrap_or(input.trim())
+}
+
+/// Host names that only mean something on the local network, as with
+/// mDNS (.local) and home routers (.lan, .home.arpa). Pages there rarely
+/// have certificates, so they open over HTTP, as Chrome and Safari do.
+const LOCAL_SUFFIXES: &[&str] = &[
+    ".local",
+    ".lan",
+    ".home",
+    ".home.arpa",
+    ".internal",
+    ".intranet",
+    ".corp",
+    ".localdomain",
+];
 
 /// The URL that trimmed, non-empty text names, or `None` for a search query.
 fn web_address(input: &str) -> Option<String> {
     let lower = input.to_ascii_lowercase();
-    if [
-        "http://",
-        "https://",
-        "file://",
-        "about:",
-        "data:",
-        "chrome:",
-        "devtools:",
-    ]
-    .iter()
-    .any(|prefix| lower.starts_with(prefix))
+    // Typed web addresses must be complete: "https://" alone, a space in
+    // the host or a port that isn't a number are searched for instead.
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        let url = Url::parse(input).ok()?;
+        return url
+            .host_str()
+            .is_some_and(|host| !host.is_empty())
+            .then(|| input.to_owned());
+    }
+    if ["file://", "about:", "data:", "chrome:", "devtools:"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
     {
         return Some(input.to_owned());
     }
@@ -1138,58 +1305,83 @@ fn web_address(input: &str) -> Option<String> {
     ]
     .iter()
     .any(|prefix| lower.starts_with(prefix));
-    if !non_web_scheme && !input.chars().any(char::is_whitespace) {
-        let schemeless = input.strip_prefix("//").unwrap_or(input);
-        let authority = schemeless
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or(schemeless);
-        // A colon in user:password must not make a URL into a search query.
-        let server = authority.rsplit('@').next().unwrap_or(authority);
-        let host = server
-            .split(':')
-            .next()
-            .unwrap_or(server)
-            .to_ascii_lowercase();
-        let local = host == "localhost"
-            || host.ends_with(".localhost")
-            || host.ends_with(".local")
-            || host == "127.0.0.1"
-            || host == "0.0.0.0"
-            || server.starts_with("[::1]");
-        if local {
-            return Some(format!("http://{schemeless}"));
-        }
-        let has_path = schemeless[authority.len()..].starts_with('/');
-        // "me@example.com" is an email address to search for; a login
-        // has a password or comes with a path.
-        if authority
-            .rsplit_once('@')
-            .is_some_and(|(userinfo, _)| !userinfo.contains(':'))
-            && !has_path
-        {
-            return None;
-        }
-        let has_port = server
-            .split_once(':')
-            .is_some_and(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()));
-        // Dotted words ("node.js", "e.g.") are searched unless they end in
-        // a real domain suffix or come with a path or port.
-        let known_suffix = || {
-            psl::suffix(host.trim_end_matches('.').as_bytes())
-                .is_some_and(|suffix| suffix.is_known())
-        };
-        if server.starts_with('[')
-            || host.parse::<std::net::Ipv4Addr>().is_ok()
-            || (host.contains('.') && (has_path || has_port || known_suffix()))
-        {
-            return Some(format!("https://{schemeless}"));
-        }
+    if non_web_scheme || input.chars().any(char::is_whitespace) {
+        return None;
     }
-    None
+    let schemeless = input.strip_prefix("//").unwrap_or(input);
+    let authority = schemeless
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(schemeless);
+    // A colon in user:password must not make a URL into a search query.
+    let server = authority.rsplit('@').next().unwrap_or(authority);
+    let (host, port) = split_port(server);
+    // "example.com:abc" is no address.
+    if port.is_some_and(|port| port.parse::<u16>().is_err()) {
+        return None;
+    }
+    let host = host.to_ascii_lowercase();
+    let has_path = schemeless[authority.len()..].starts_with('/');
+    let has_port = port.is_some();
+    // IP addresses (routers, NAS boxes, dev servers) and local names are
+    // reached over HTTP; Chrome doesn't upgrade them to HTTPS either.
+    let ip = host.parse::<std::net::Ipv4Addr>().is_ok()
+        || host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .is_some_and(|host| host.parse::<std::net::Ipv6Addr>().is_ok());
+    let name = host.trim_end_matches('.');
+    if ip
+        || name == "localhost"
+        || name.ends_with(".localhost")
+        || LOCAL_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+    {
+        return Some(format!("http://{schemeless}"));
+    }
+    // "me@example.com" is an email address to search for; a login has a
+    // password or comes with a path.
+    if authority
+        .rsplit_once('@')
+        .is_some_and(|(userinfo, _)| !userinfo.contains(':'))
+        && !has_path
+    {
+        return None;
+    }
+    if name.is_empty() || name.starts_with('[') {
+        return None;
+    }
+    // A real domain suffix opens over HTTPS. Other names are intranet hosts
+    // ("router/", "nas:5000", "wiki.corp/page") when they come with a path
+    // or port, else words ("node.js", "e.g.", "café") to search for.
+    let known_suffix =
+        name.contains('.') && psl::suffix(name.as_bytes()).is_some_and(|suffix| suffix.is_known());
+    if known_suffix {
+        Some(format!("https://{schemeless}"))
+    } else if has_path || has_port {
+        Some(format!("http://{schemeless}"))
+    } else {
+        None
+    }
 }
 
-/// A Google search for `input`.
+/// Splits "host:port" and "[ipv6]:port"; the port is `None` without a colon.
+fn split_port(server: &str) -> (&str, Option<&str>) {
+    if server.starts_with('[') {
+        return match server.find(']') {
+            Some(end) => {
+                let (host, rest) = server.split_at(end + 1);
+                (host, rest.strip_prefix(':'))
+            }
+            None => (server, None),
+        };
+    }
+    match server.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (server, None),
+    }
+}
+
+/// A search for `input` with the chosen search engine.
 pub fn search_url(input: &str) -> String {
     let mut query = String::new();
     for byte in input.bytes() {
@@ -1204,7 +1396,7 @@ pub fn search_url(input: &str) -> String {
             }
         }
     }
-    format!("https://www.google.com/search?q={query}")
+    format!("{}{query}", current_search_engine().query_url())
 }
 
 #[cfg(test)]
@@ -1944,9 +2136,10 @@ mod tests {
             ("example.com.", "https://example.com."),
             ("localhost:8000", "http://localhost:8000"),
             ("raspberrypi.local", "http://raspberrypi.local"),
-            ("192.168.1.1", "https://192.168.1.1"),
-            ("intranet.corp/wiki", "https://intranet.corp/wiki"),
-            ("build.internal:8080", "https://build.internal:8080"),
+            // IP addresses and intranet names open over HTTP.
+            ("192.168.1.1", "http://192.168.1.1"),
+            ("intranet.corp/wiki", "http://intranet.corp/wiki"),
+            ("build.internal:8080", "http://build.internal:8080"),
             // Dotted words and email addresses are searched.
             ("node.js", "https://www.google.com/search?q=node.js"),
             ("next.js", "https://www.google.com/search?q=next.js"),

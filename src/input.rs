@@ -2,7 +2,8 @@
 // Copyright 2022 - 2025 Zed Industries, Inc. Licensed under Apache-2.0.
 // See licenses/GPUI-Apache-2.0.txt.
 // Modified for Mapbrowser: reusable field API, navigation events, scoped shortcuts,
-// mouse focus, horizontal scrolling, themable styling, and corrected IME selection.
+// mouse focus, horizontal scrolling, themable styling, corrected IME selection,
+// undo and redo, and pasting on one line.
 
 use std::ops::Range;
 
@@ -56,7 +57,36 @@ pub struct TextInput {
     is_selecting: bool,
     scroll_x: Pixels,
     style: InputStyle,
+    /// States ⌘Z goes back to, the latest last, and those ⇧⌘Z redoes.
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    /// The run of typing or deleting the last edit was part of, and where
+    /// it left the caret: the next edit of that kind there joins it, so ⌘Z
+    /// takes back a typed word or a held Backspace at once, as in AppKit.
+    run: Option<(EditKind, usize)>,
+    /// What the next `replace_text_in_range` is; the platform's text input
+    /// calls it for typing.
+    next_edit: EditKind,
 }
+
+/// The text and selection ⌘Z or ⇧⌘Z restores.
+#[derive(Clone, Debug)]
+struct Snapshot {
+    content: SharedString,
+    selected_range: Range<usize>,
+    selection_reversed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditKind {
+    Typing,
+    Deleting,
+    /// Pasting, cutting and deleting a selection or a word undo one by one.
+    Other,
+}
+
+/// Edits a field keeps for ⌘Z.
+const UNDO_LIMIT: usize = 100;
 
 /// Colours and metrics of the field; the defaults are the original dark style.
 #[derive(Clone, Debug)]
@@ -147,6 +177,10 @@ impl TextInput {
             is_selecting: false,
             scroll_x: px(0.),
             style: InputStyle::default(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            run: None,
+            next_edit: EditKind::Typing,
         }
     }
 
@@ -159,18 +193,27 @@ impl TextInput {
         &self.content
     }
 
+    /// Replaces the text, which ⌘Z then can't go back past: the address ⌘L
+    /// starts with, a space's name, the last text found.
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.content = text.replace(['\r', '\n'], " ").into();
         self.selected_range = self.content.len()..self.content.len();
         self.selection_reversed = false;
         self.marked_range = None;
         self.scroll_x = px(0.);
+        self.undo.clear();
+        self.redo.clear();
+        self.run = None;
         cx.notify();
     }
 
     pub fn set_placeholder(&mut self, placeholder: &str, cx: &mut Context<Self>) {
         self.placeholder = placeholder.to_owned().into();
         cx.notify();
+    }
+
+    pub fn focus(&self, window: &mut Window) {
+        window.focus(&self.focus_handle);
     }
 
     pub fn select_all_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -195,6 +238,85 @@ impl TextInput {
         if self.content != *previous {
             cx.emit(InputEvent::Changed(self.content.to_string()));
         }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            content: self.content.clone(),
+            selected_range: self.selected_range.clone(),
+            selection_reversed: self.selection_reversed,
+        }
+    }
+
+    /// Before an edit of `kind` to `range`: keeps the text for ⌘Z, unless
+    /// the edit continues the run of typing or deleting where it ended.
+    fn begin_edit(&mut self, kind: EditKind, range: &Range<usize>) {
+        let continues = match (kind, self.run) {
+            (EditKind::Typing, Some((EditKind::Typing, caret))) => {
+                self.selected_range.is_empty()
+                    && *range == self.selected_range
+                    && range.start == caret
+            }
+            // Backspace takes the character before the caret, Delete the
+            // one after it.
+            (EditKind::Deleting, Some((EditKind::Deleting, caret))) => {
+                range.end == caret || range.start == caret
+            }
+            _ => false,
+        };
+        if !continues {
+            self.undo.push(self.snapshot());
+            if self.undo.len() > UNDO_LIMIT {
+                self.undo.remove(0);
+            }
+        }
+        self.redo.clear();
+    }
+
+    /// After an edit of `kind`: where its run goes on.
+    fn end_edit(&mut self, kind: EditKind) {
+        self.run = (kind != EditKind::Other).then(|| (kind, self.cursor_offset()));
+    }
+
+    /// ⌘Z, and Edit > Undo, while the field has focus. Neither reaches the
+    /// page then, even with nothing left to undo.
+    fn undo(&mut self, _: &crate::Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.marked_range.is_none()
+            && let Some(snapshot) = self.undo.pop()
+        {
+            self.redo.push(self.snapshot());
+            self.restore(snapshot, cx);
+        }
+    }
+
+    fn redo(&mut self, _: &crate::Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.marked_range.is_none()
+            && let Some(snapshot) = self.redo.pop()
+        {
+            self.undo.push(self.snapshot());
+            self.restore(snapshot, cx);
+        }
+    }
+
+    fn restore(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
+        let previous = std::mem::replace(&mut self.content, snapshot.content);
+        self.selected_range = snapshot.selected_range;
+        self.selection_reversed = snapshot.selection_reversed;
+        self.run = None;
+        self.emit_changed_since(&previous, cx);
+        cx.notify();
+    }
+
+    /// Replaces the selection with `text` in an edit of `kind`.
+    fn edit_selection(
+        &mut self,
+        kind: EditKind,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.next_edit = kind;
+        self.replace_text_in_range(None, text, window, cx);
     }
 
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
@@ -261,14 +383,14 @@ impl TextInput {
         if self.selected_range.is_empty() {
             self.select_to(self.previous_word(), cx);
         }
-        self.replace_text_in_range(None, "", window, cx);
+        self.edit_selection(EditKind::Other, "", window, cx);
     }
 
     fn delete_to_start(&mut self, _: &DeleteToStart, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             self.select_to(0, cx);
         }
-        self.replace_text_in_range(None, "", window, cx);
+        self.edit_selection(EditKind::Other, "", window, cx);
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -309,17 +431,29 @@ impl TextInput {
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        let kind = self.deletion_kind();
         if self.selected_range.is_empty() {
             self.select_to(self.previous_boundary(self.cursor_offset()), cx)
         }
-        self.replace_text_in_range(None, "", window, cx)
+        self.edit_selection(kind, "", window, cx)
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        let kind = self.deletion_kind();
         if self.selected_range.is_empty() {
             self.select_to(self.next_boundary(self.cursor_offset()), cx)
         }
-        self.replace_text_in_range(None, "", window, cx)
+        self.edit_selection(kind, "", window, cx)
+    }
+
+    /// Single characters deleted one after another undo together; a
+    /// deleted selection on its own.
+    fn deletion_kind(&self) -> EditKind {
+        if self.selected_range.is_empty() {
+            EditKind::Deleting
+        } else {
+            EditKind::Other
+        }
     }
 
     fn on_mouse_down(
@@ -377,7 +511,7 @@ impl TextInput {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_text_in_range(None, &text.replace(['\r', '\n'], " "), window, cx);
+            self.edit_selection(EditKind::Other, &one_line(&text), window, cx);
         }
     }
 
@@ -393,7 +527,7 @@ impl TextInput {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
-            self.replace_text_in_range(None, "", window, cx)
+            self.edit_selection(EditKind::Other, "", window, cx)
         }
     }
 
@@ -549,6 +683,11 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        let kind = std::mem::replace(&mut self.next_edit, EditKind::Typing);
+        // Committed composed text belongs to the edit its composition began.
+        if self.marked_range.is_none() && !(range.is_empty() && new_text.is_empty()) {
+            self.begin_edit(kind, &range);
+        }
         let previous = self.content.clone();
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
@@ -556,6 +695,7 @@ impl EntityInputHandler for TextInput {
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.selection_reversed = false;
         self.marked_range.take();
+        self.end_edit(kind);
         self.emit_changed_since(&previous, cx);
         cx.notify();
     }
@@ -574,6 +714,11 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        // A composition (dead keys, input methods) is one edit, from its
+        // first marked text until it is committed.
+        if self.marked_range.is_none() {
+            self.begin_edit(EditKind::Typing, &range);
+        }
         let previous = self.content.clone();
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
@@ -869,6 +1014,8 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::select_word_right))
             .on_action(cx.listener(Self::delete_word_left))
             .on_action(cx.listener(Self::delete_to_start))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -880,6 +1027,30 @@ impl Render for TextInput {
             .line_height(self.style.line_height)
             .text_size(self.style.font_size)
             .child(TextElement { input: cx.entity() })
+    }
+}
+
+/// Pasted text on one line. Line breaks go, with the spaces around them,
+/// when the lines then make one address, as a link wrapped by a mail or
+/// chat app does ("https://example.com/very/long/", "path/to/page");
+/// between words they become spaces.
+fn one_line(text: &str) -> String {
+    if !text.contains(['\r', '\n']) {
+        return text.to_owned();
+    }
+    let lines: Vec<&str> = text
+        .split(['\r', '\n'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let joined = lines.concat();
+    if lines.len() > 1
+        && !joined.contains(char::is_whitespace)
+        && !crate::model::is_search_query(&joined)
+    {
+        joined
+    } else {
+        lines.join(" ")
     }
 }
 

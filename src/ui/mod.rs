@@ -135,6 +135,7 @@ impl Render for BrowserApp {
         };
         let card = self.card_bounds(viewport);
         self.sync_find_bar(card, window, cx);
+        self.sync_command_bar(card, window, cx);
         self.sync_toast_window(card, window, cx);
         self.sync_link_status(card, window, cx);
         self.sync_menu_bar(cx);
