@@ -19,6 +19,7 @@ use crate::{
         find_bar::Find,
         link_status::LinkStatus,
         menu::{MenuKind, OpenMenu},
+        page_notice::{Leaving, PageNotices},
         permissions::PermissionPrompts,
         redraw::{self, Drawn},
         shortcuts::ShortcutsWindow,
@@ -54,13 +55,21 @@ const HISTORY_ICONS: usize = 100;
 /// sidebar shows, so a pointer passing by doesn't open it.
 const PEEK_DELAY: Duration = Duration::from_millis(150);
 
-/// Navigation state of a loaded tab, for the toolbar and the progress bar.
+/// Navigation state of a loaded tab, for the toolbar and the progress bar,
+/// and what its page uses, for its row.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PageStatus {
     pub loading: bool,
     pub progress: f64,
     pub can_go_back: bool,
     pub can_go_forward: bool,
+    /// Its audio or video elements play sound.
+    pub audible: bool,
+    /// The user muted the tab.
+    pub muted: bool,
+    /// It uses the camera or records the screen.
+    pub camera: bool,
+    pub microphone: bool,
 }
 
 /// A space switch in progress: the sidebar pages, the window colours and
@@ -138,6 +147,9 @@ pub struct BrowserApp {
     save_due: Option<Instant>,
     pub downloads: Downloads,
     pub permissions: PermissionPrompts,
+    /// Crashes, sign-ins, certificate errors and failed loads the card
+    /// shows in place of a page.
+    pub notices: PageNotices,
     /// Tabs pages opened this session, and the tab that opened each.
     pub openers: HashMap<TabId, TabId>,
     _subscriptions: Vec<Subscription>,
@@ -297,6 +309,7 @@ impl BrowserApp {
     ) -> Self {
         let rename_input = cx.new(|cx| TextInput::new(window, cx));
         let tab_name_input = cx.new(|cx| TextInput::new(window, cx));
+        let notices = PageNotices::new(window, cx);
         let favicons = FaviconStore::new(state.root_dir());
         let history = History::load(state.root_dir());
         let restored = state
@@ -342,6 +355,7 @@ impl BrowserApp {
             save_due: None,
             downloads,
             permissions: PermissionPrompts::default(),
+            notices,
             openers: HashMap::new(),
             _subscriptions: Vec::new(),
             recent: RecentTabs::default(),
@@ -360,6 +374,8 @@ impl BrowserApp {
             restored,
             traffic_lights_hidden,
         };
+        let sign_in = this.notices.subscribe(window, cx);
+        this._subscriptions.extend(sign_in);
         this._subscriptions.extend([
             cx.subscribe_in(
                 &rename_input,
@@ -571,6 +587,7 @@ impl BrowserApp {
     /// A tab still downloading keeps its browser until the download ends:
     /// Chromium reports nothing more once it closes.
     fn drop_browser(&mut self, tab_id: TabId) {
+        self.end_page_notices(tab_id);
         if self.loaded.remove(&tab_id) && !self.downloads.running_in(tab_id) {
             self.engine.borrow_mut().close_tab(tab_id);
         }
@@ -600,7 +617,7 @@ impl BrowserApp {
         }
     }
 
-    fn exit_page_fullscreen(&self) {
+    pub(crate) fn exit_page_fullscreen(&self) {
         if self.fullscreen
             && let Some(id) = self.active_tab_id()
         {
@@ -643,6 +660,8 @@ impl BrowserApp {
             }
             None => self.show_selected(),
         }
+        // A tab that asks something (a sign-in) takes the keys.
+        self.focus_page_notice(window, cx);
         self.persist_later(cx);
         cx.notify();
     }
@@ -788,6 +807,10 @@ impl BrowserApp {
             self.error = None;
             cx.notify();
         }
+        // A page that stopped responding is ended first, then reloads.
+        if !self.reload_notices(tab_id) {
+            return;
+        }
         if self.loaded.contains(&tab_id) {
             self.engine.borrow().reload(tab_id);
         } else if self.is_active(tab_id) {
@@ -795,13 +818,25 @@ impl BrowserApp {
         }
     }
 
-    /// ⌘W: Today tabs close; pinned tabs and favorites only unload.
+    /// ⌘W: Today tabs close; pinned tabs and favorites only unload. A page
+    /// with unsaved changes asks first (`leave_tab`).
     pub fn close_tab(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
         match self.state.tab(tab_id).map(|tab| tab.pin) {
-            Some(Pin::Today) => self.remove_tab(tab_id, cx),
-            Some(_) => self.unload_tab(tab_id, cx),
+            Some(Pin::Today) => self.leave_tab(tab_id, Leaving::Close, cx),
+            Some(_) => self.leave_tab(tab_id, Leaving::Unload, cx),
             None => {}
         }
+    }
+
+    /// Mutes or unmutes the tab's page, from its row or its menu.
+    pub fn toggle_mute(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        if !self.loaded.contains(&tab_id) {
+            return;
+        }
+        let page = self.pages.entry(tab_id).or_default();
+        page.muted = !page.muted;
+        self.engine.borrow().set_muted(tab_id, page.muted);
+        cx.notify();
     }
 
     /// Removes the tab from its space; ⇧⌘T brings it back.
@@ -2247,6 +2282,7 @@ impl BrowserApp {
                 if self.new_documents.remove(&tab_id) {
                     self.record_visit(tab_id, &url, cx);
                 }
+                self.page_address_changed(tab_id, &url);
                 let Some(tab) = self.state.tab(tab_id) else {
                     return;
                 };
@@ -2315,6 +2351,7 @@ impl BrowserApp {
             EngineEvent::LoadError {
                 tab_id,
                 url,
+                code,
                 message,
             } => {
                 // Links to apps never load; one that slipped through is
@@ -2343,10 +2380,8 @@ impl BrowserApp {
                         cx.notify();
                     }
                 }
-                if self.is_active(tab_id) {
-                    self.error = Some(message);
-                    cx.notify();
-                }
+                let can_go_back = self.page(tab_id).can_go_back;
+                self.page_load_failed(tab_id, url, code, message, can_go_back, window, cx);
             }
             EngineEvent::OpenTab {
                 opener_tab_id,
@@ -2354,31 +2389,41 @@ impl BrowserApp {
                 background,
             } => self.open_from_page(opener_tab_id, &url, background, cx),
             EngineEvent::Fullscreen { tab_id, fullscreen } => {
-                self.page_fullscreen(tab_id, fullscreen, window, cx)
+                self.page_fullscreen(tab_id, fullscreen, window, cx);
+                if fullscreen && self.fullscreen && self.is_active(tab_id) {
+                    self.show_fullscreen_hint(tab_id, cx);
+                }
             }
             EngineEvent::Closed { tab_id } => {
                 self.engine.borrow_mut().forget_closed(tab_id);
+                if self.engine.borrow().has_tab(tab_id) || !self.loaded.remove(&tab_id) {
+                    return;
+                }
+                self.pages.remove(&tab_id);
+                self.new_documents.remove(&tab_id);
+                // A page asked to let go did: its tab closes, unloads or
+                // moves now.
+                if self.page_left(tab_id, cx) {
+                    return;
+                }
                 // A browser that went away on its own (the page called
                 // window.close()) leaves the tab unloaded.
-                if !self.engine.borrow().has_tab(tab_id) && self.loaded.remove(&tab_id) {
-                    self.pages.remove(&tab_id);
-                    self.new_documents.remove(&tab_id);
-                    // Its menu goes with the page, as when ⌘W closes it.
-                    if self.has_open_menu(tab_id) {
-                        self.menu = None;
-                        cx.notify();
-                    }
-                    if self.is_active(tab_id) {
-                        // Hides the emptied web container and gives keyboard
-                        // focus back to the shell; the tab loads again when
-                        // selected.
-                        self.engine.borrow_mut().activate_tab(tab_id);
-                        window.focus(&self.focus_handle);
-                        cx.notify();
-                    } else if self.drawn(tab_id).address {
-                        // Its row or tile now looks asleep.
-                        cx.notify();
-                    }
+                self.end_page_notices(tab_id);
+                // Its menu goes with the page, as when ⌘W closes it.
+                if self.has_open_menu(tab_id) {
+                    self.menu = None;
+                    cx.notify();
+                }
+                if self.is_active(tab_id) {
+                    // Hides the emptied web container and gives keyboard
+                    // focus back to the shell; the tab loads again when
+                    // selected.
+                    self.engine.borrow_mut().activate_tab(tab_id);
+                    window.focus(&self.focus_handle);
+                    cx.notify();
+                } else if self.drawn(tab_id).address {
+                    // Its row or tile now looks asleep.
+                    cx.notify();
                 }
             }
             EngineEvent::Shortcut(shortcut) => self.shortcut(shortcut, window, cx),
@@ -2386,6 +2431,12 @@ impl BrowserApp {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 self.show_toast("Copied Link", cx);
             }
+            EngineEvent::CopyImage(Some(png)) => {
+                let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, png);
+                cx.write_to_clipboard(ClipboardItem::new_image(&image));
+                self.show_toast("Copied Image", cx);
+            }
+            EngineEvent::CopyImage(None) => self.show_toast("Couldn't copy the image", cx),
             // The page takes keyboard focus from the press itself.
             EngineEvent::PagePressed => {
                 self.end_rename(window, cx);
@@ -2424,8 +2475,73 @@ impl BrowserApp {
             EngineEvent::NewDocument { tab_id } => {
                 self.new_documents.insert(tab_id);
                 self.page_replaced(tab_id, cx);
+                self.page_document_changed(tab_id, window, cx);
             }
             EngineEvent::Status { tab_id, text } => self.show_link_status(tab_id, text, window, cx),
+            EngineEvent::SignInRequest {
+                id,
+                tab_id,
+                host,
+                realm,
+                proxy,
+                secure,
+            } => self.sign_in_requested(id, tab_id, host, realm, proxy, secure, window, cx),
+            EngineEvent::CertificateError {
+                id,
+                tab_id,
+                url,
+                code,
+            } => self.certificate_error(id, tab_id, url, code, window, cx),
+            EngineEvent::LeavePage {
+                id,
+                tab_id,
+                closing,
+                reload,
+            } => self.leave_requested(id, tab_id, closing, reload, window, cx),
+            EngineEvent::RequestDismissed { id } => self.page_request_dismissed(id, window, cx),
+            EngineEvent::Crashed { tab_id, reason } => {
+                if let Some(page) = self.pages.get_mut(&tab_id) {
+                    // The renderer took its loads, sound and camera along.
+                    *page = PageStatus {
+                        can_go_back: page.can_go_back,
+                        can_go_forward: page.can_go_forward,
+                        muted: page.muted,
+                        ..PageStatus::default()
+                    };
+                }
+                self.page_replaced(tab_id, cx);
+                self.page_crashed(tab_id, reason, window, cx);
+                if self.drawn(tab_id).address {
+                    cx.notify();
+                }
+            }
+            EngineEvent::Unresponsive { tab_id } => self.page_responsive(tab_id, false, window, cx),
+            EngineEvent::Responsive { tab_id } => self.page_responsive(tab_id, true, window, cx),
+            EngineEvent::PopupBlocked { tab_id, .. } => self.popup_blocked(tab_id, cx),
+            EngineEvent::Audible { tab_id, audible } => {
+                let Some(page) = self.pages.get_mut(&tab_id) else {
+                    return;
+                };
+                if std::mem::replace(&mut page.audible, audible) != audible
+                    && self.drawn(tab_id).address
+                {
+                    cx.notify();
+                }
+            }
+            EngineEvent::MediaAccess {
+                tab_id,
+                video,
+                audio,
+            } => {
+                let Some(page) = self.pages.get_mut(&tab_id) else {
+                    return;
+                };
+                let changed = (page.camera, page.microphone) != (video, audio);
+                (page.camera, page.microphone) = (video, audio);
+                if changed && self.drawn(tab_id).address {
+                    cx.notify();
+                }
+            }
         }
     }
 

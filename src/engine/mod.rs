@@ -154,10 +154,12 @@ pub enum EngineEvent {
         png: Vec<u8>,
     },
     /// A main-frame load failed. `url` is the address that failed: failed
-    /// loads never report it as `Address`.
+    /// loads never report it as `Address`. `code` is Chromium's net error
+    /// (-105 for ERR_NAME_NOT_RESOLVED), `message` its name.
     LoadError {
         tab_id: u64,
         url: String,
+        code: i32,
         message: String,
     },
     /// A page asked for a new tab: a popup, a ⌘-, ⇧- or middle-click, or the
@@ -178,6 +180,9 @@ pub enum EngineEvent {
     },
     /// Text to put on the clipboard ("Copy Link Address").
     CopyText(String),
+    /// An image to put on the clipboard, as PNG ("Copy Image"); none if it
+    /// couldn't be fetched.
+    CopyImage(Option<Vec<u8>>),
     /// A mouse button went down on the page. It takes keyboard focus, and
     /// the shell's popovers close as they would on any press outside them.
     /// Only macOS reports it; elsewhere the shell draws the whole window.
@@ -251,6 +256,97 @@ pub enum EngineEvent {
         tab_id: u64,
         text: String,
     },
+    /// A site or a proxy asks for a username and password (HTTP Basic or
+    /// Digest sign-in). `host` is "host" or "host:port"; `realm` names what
+    /// the sign-in is for and may be empty; `secure` is false when the
+    /// password would cross the network unencrypted. Answer once with
+    /// `Engine::respond_sign_in`.
+    SignInRequest {
+        id: u64,
+        tab_id: u64,
+        host: String,
+        realm: String,
+        proxy: bool,
+        secure: bool,
+    },
+    /// The certificate of `url`, which the tab is loading, didn't verify.
+    /// `code` is the net error (-202 for ERR_CERT_AUTHORITY_INVALID). The
+    /// load waits for `Engine::respond_certificate`.
+    CertificateError {
+        id: u64,
+        tab_id: u64,
+        url: String,
+        code: i32,
+    },
+    /// The page asks before it is left ("Leave site?"): it has a
+    /// beforeunload handler and unsaved changes. `closing` when the tab is
+    /// closing (`Engine::close_tab_asking`), else a navigation or, with
+    /// `reload`, a reload waits. Answer once with `Engine::respond_leave`.
+    LeavePage {
+        id: u64,
+        tab_id: u64,
+        closing: bool,
+        reload: bool,
+    },
+    /// A sign-in, certificate or leave request ended unanswered: the page
+    /// went elsewhere, crashed or closed.
+    RequestDismissed {
+        id: u64,
+    },
+    /// The tab's page crashed: its view shows nothing until
+    /// `Engine::reload` starts it again.
+    Crashed {
+        tab_id: u64,
+        reason: CrashReason,
+    },
+    /// The tab's page hasn't handled input for 15 seconds. Answer with
+    /// `Engine::respond_unresponsive`; it asks again if waiting didn't help.
+    Unresponsive {
+        tab_id: u64,
+    },
+    /// The page that wasn't responding responds again.
+    Responsive {
+        tab_id: u64,
+    },
+    /// The page tried to open `url` in a pop-up or tab without a click,
+    /// and it was blocked.
+    PopupBlocked {
+        tab_id: u64,
+        url: String,
+    },
+    /// Whether the page's audio and video elements play sound.
+    Audible {
+        tab_id: u64,
+        audible: bool,
+    },
+    /// The page started or stopped using the camera or the screen
+    /// (`video`) and the microphone (`audio`).
+    MediaAccess {
+        tab_id: u64,
+        video: bool,
+        audio: bool,
+    },
+}
+
+/// Why a page's renderer ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Previews crash for one reason only.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub enum CrashReason {
+    /// It crashed, or something ended it.
+    Crashed,
+    /// It ran out of memory.
+    OutOfMemory,
+}
+
+/// Whether a load may continue past the certificate error `code`, as
+/// Chrome allows: not for revoked, malformed or pinned certificates, known
+/// interception software, nor errors that aren't about the certificate.
+pub fn certificate_error_overridable(code: i32) -> bool {
+    // ERR_CERT_COMMON_NAME_INVALID (-200) up to ERR_CERT_END (-219), less
+    // CONTAINS_ERRORS (-203), REVOKED (-206), INVALID (-207) and
+    // KNOWN_INTERCEPTION_BLOCKED (-217).
+    (-218..=-200).contains(&code) && ![-203, -206, -207, -217].contains(&code)
 }
 
 /// How a download ended.

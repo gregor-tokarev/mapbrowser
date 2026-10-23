@@ -7,9 +7,11 @@ pub mod downloads;
 pub mod drag;
 pub mod elide;
 pub mod find_bar;
+mod fullscreen_hint;
 pub mod icons;
 pub mod link_status;
 pub mod menu;
+pub mod page_notice;
 pub mod permissions;
 pub mod redraw;
 pub mod shortcuts;
@@ -146,6 +148,7 @@ impl Render for BrowserApp {
         self.sync_command_bar(card, window, cx);
         self.sync_toast_window(card, window, cx);
         self.sync_link_status(card, window, cx);
+        self.sync_fullscreen_hint(card, window, cx);
         self.sync_menu_bar(cx);
         if let Some(width) = self.sidebar_width() {
             self.fit_toast(width, window);
@@ -191,7 +194,7 @@ impl Render for BrowserApp {
             // The whole window background is one gradient quad.
             .bg(theme.background())
             .children(self.render_card_shadow(card))
-            .child(self.render_card(card, &theme, frame, slide_finished, viewport))
+            .child(self.render_card(card, &theme, frame, slide_finished, viewport, window, cx))
             .children(self.render_progress(card, &theme))
             .children(sidebar)
             .children(self.render_peek_edge(cx))

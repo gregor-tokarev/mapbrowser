@@ -67,6 +67,8 @@ pub struct TextInput {
     /// What the next `replace_text_in_range` is; the platform's text input
     /// calls it for typing.
     next_edit: EditKind,
+    /// A password field: it shows a bullet per character and copies nothing.
+    masked: bool,
 }
 
 /// The text and selection ⌘Z or ⇧⌘Z restores.
@@ -87,6 +89,9 @@ enum EditKind {
 
 /// Edits a field keeps for ⌘Z.
 const UNDO_LIMIT: usize = 100;
+
+/// What a password field shows for each character.
+const MASK: char = '•';
 
 /// Colours and metrics of the field; the defaults are the original dark style.
 #[derive(Clone, Debug)]
@@ -181,6 +186,7 @@ impl TextInput {
             redo: Vec::new(),
             run: None,
             next_edit: EditKind::Typing,
+            masked: false,
         }
     }
 
@@ -205,6 +211,31 @@ impl TextInput {
         self.redo.clear();
         self.run = None;
         cx.notify();
+    }
+
+    pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
+        self.masked = masked;
+        cx.notify();
+    }
+
+    /// The offset in the text shown of `offset` in the content.
+    fn shown_offset(&self, offset: usize) -> usize {
+        if self.masked {
+            self.content[..offset].chars().count() * MASK.len_utf8()
+        } else {
+            offset
+        }
+    }
+
+    /// The offset in the content of `offset` in the text shown.
+    fn content_offset(&self, offset: usize) -> usize {
+        if !self.masked {
+            return offset;
+        }
+        self.content
+            .char_indices()
+            .nth(offset / MASK.len_utf8())
+            .map_or(self.content.len(), |(index, _)| index)
     }
 
     pub fn set_placeholder(&mut self, placeholder: &str, cx: &mut Context<Self>) {
@@ -469,6 +500,11 @@ impl TextInput {
             self.select_all_focus(window, cx);
             return;
         }
+        // A password's words aren't shown, so a double click takes it all.
+        if event.click_count == 2 && self.masked {
+            self.select_all_focus(window, cx);
+            return;
+        }
         if event.click_count == 2 {
             let offset = self.index_for_mouse_position(event.position);
             if let Some((start, segment)) = self
@@ -516,14 +552,14 @@ impl TextInput {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
+        if !self.selected_range.is_empty() && !self.masked {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
         }
     }
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
+        if !self.selected_range.is_empty() && !self.masked {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
@@ -560,7 +596,7 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left() + self.scroll_x)
+        self.content_offset(line.closest_index_for_x(position.x - bounds.left() + self.scroll_x))
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -762,11 +798,13 @@ impl EntityInputHandler for TextInput {
         let range = self.range_from_utf16(&range_utf16);
         Some(Bounds::from_corners(
             point(
-                bounds.left() + last_layout.x_for_index(range.start) - self.scroll_x,
+                bounds.left() + last_layout.x_for_index(self.shown_offset(range.start))
+                    - self.scroll_x,
                 bounds.top(),
             ),
             point(
-                bounds.left() + last_layout.x_for_index(range.end) - self.scroll_x,
+                bounds.left() + last_layout.x_for_index(self.shown_offset(range.end))
+                    - self.scroll_x,
                 bounds.bottom(),
             ),
         ))
@@ -784,7 +822,8 @@ impl EntityInputHandler for TextInput {
         if self.content.is_empty() {
             return Some(0);
         }
-        let utf8_index = last_layout.closest_index_for_x(line_point.x + self.scroll_x);
+        let utf8_index =
+            self.content_offset(last_layout.closest_index_for_x(line_point.x + self.scroll_x));
         Some(self.offset_to_utf16(utf8_index))
     }
 }
@@ -844,12 +883,16 @@ impl Element for TextElement {
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
         let content = input.content.clone();
-        let selected_range = input.selected_range.clone();
-        let cursor = input.cursor_offset();
+        let selected_range = input.shown_offset(input.selected_range.start)
+            ..input.shown_offset(input.selected_range.end);
+        let cursor = input.shown_offset(input.cursor_offset());
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() {
             (input.placeholder.clone(), input.style.placeholder)
+        } else if input.masked {
+            let bullets = MASK.to_string().repeat(content.chars().count());
+            (bullets.into(), style.color)
         } else {
             (content, style.color)
         };
@@ -862,7 +905,11 @@ impl Element for TextElement {
             underline: None,
             strikethrough: None,
         };
-        let runs = if let Some(marked_range) = input.marked_range.as_ref() {
+        let marked_range = input
+            .marked_range
+            .as_ref()
+            .map(|range| input.shown_offset(range.start)..input.shown_offset(range.end));
+        let runs = if let Some(marked_range) = marked_range.as_ref() {
             vec![
                 TextRun {
                     len: marked_range.start,

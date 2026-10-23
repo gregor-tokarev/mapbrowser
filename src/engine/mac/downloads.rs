@@ -1,9 +1,12 @@
 //! Downloads go straight to ~/Downloads, without a dialog. Without a
 //! handler CEF 152 hands them to Chrome's download code, which saves them
 //! there too but reports nothing to the app, and holds files it would ask
-//! about in a download bubble Alloy browsers don't have.
+//! about in a download bubble Alloy browsers don't have. Popup windows
+//! download the same way; one closed while downloading keeps its browser,
+//! hidden, until its downloads end, since CEF reports a download only
+//! while the browser that started it lives.
 
-use super::{BrowserLink, Engine, frame_url};
+use super::{BrowserLink, Engine, frame_url, popups::popup_window};
 use crate::engine::{
     CANCELLED_BY_USER, DownloadEnd, EngineEvent, download_failure, download_file_name,
     download_progress_worth_reporting, unique_file_name,
@@ -27,6 +30,9 @@ pub(super) struct Downloads(Arc<Mutex<State>>);
 struct State {
     next_id: u64,
     active: HashMap<(u64, u32), Active>,
+    /// Popups closed while downloading, by browser instance: they close
+    /// once their downloads end.
+    closing: HashMap<u64, Browser>,
 }
 
 struct Active {
@@ -141,6 +147,28 @@ impl Downloads {
         }
     }
 
+    /// Whether a download of the browser `instance` is in progress.
+    pub(super) fn running_for(&self, instance: u64) -> bool {
+        self.state()
+            .active
+            .keys()
+            .any(|&(owner, _)| owner == instance)
+    }
+
+    /// Closes the popup `browser` (`instance`) once its downloads end.
+    pub(super) fn close_when_done(&self, instance: u64, browser: Browser) {
+        self.state().closing.insert(instance, browser);
+    }
+
+    /// The popup waiting for the downloads of `instance`, now they ended.
+    fn done_closing(&self, instance: u64) -> Option<Browser> {
+        let mut state = self.state();
+        if state.active.keys().any(|&(owner, _)| owner == instance) {
+            return None;
+        }
+        state.closing.remove(&instance)
+    }
+
     /// Cancels every download in progress, for quitting: Chromium would
     /// otherwise interrupt them and leave a partial file under the final
     /// name, where cancelling deletes it. The cancels run as tasks while
@@ -203,8 +231,9 @@ fn source_url(item: &DownloadItem) -> String {
     }
 }
 
+// `popup`: a popup window's, which leaves its opener tab alone.
 wrap_download_handler! {
-    pub(super) struct TabDownloads { link: BrowserLink }
+    pub(super) struct TabDownloads { link: BrowserLink, popup: bool }
     impl DownloadHandler {
         fn can_download(&self, _browser: Option<&mut Browser>, _url: Option<&CefString>, _request_method: Option<&CefString>) -> i32 {
             1
@@ -214,20 +243,34 @@ wrap_download_handler! {
             let name = download_file_name(&suggested_name.map(ToString::to_string).unwrap_or_default());
             let (id, path) = self.link.downloads.start((self.link.instance, item.id()), &name);
             callback.cont(Some(&path_string(&path)), 0);
+            let blank = shows_no_page(browser.as_deref());
             self.link.send(EngineEvent::DownloadStarted {
                 id,
                 tab_id: self.link.tab_id,
                 name: path.file_name().map_or(name, |name| name.to_string_lossy().into_owned()),
                 path,
                 url: source_url(item),
-                blank_tab: shows_no_page(browser.as_deref()),
+                blank_tab: blank && !self.popup,
             });
+            // A popup opened only for a file has nothing to show: it goes,
+            // and closes once the file is in.
+            if blank && self.popup && let Some(browser) = browser {
+                if let Some(window) = popup_window(browser) {
+                    window.orderOut(None);
+                }
+                self.link.downloads.close_when_done(self.link.instance, browser.clone());
+            }
             1
         }
         fn on_download_updated(&self, _browser: Option<&mut Browser>, download_item: Option<&mut DownloadItem>, callback: Option<&mut DownloadItemCallback>) {
             let Some(item) = download_item else { return; };
             if let Some(event) = self.link.downloads.update((self.link.instance, item.id()), item, callback.as_deref()) {
                 self.link.send(event);
+            }
+            if let Some(popup) = self.link.downloads.done_closing(self.link.instance)
+                && let Some(host) = popup.host()
+            {
+                host.close_browser(1);
             }
         }
     }

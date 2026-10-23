@@ -20,6 +20,7 @@ use crate::{
     engine::{Permission, ZoomStep, is_insecure, site_origin},
     favicons::host_of,
     model::{Pin, SpaceId, THEME_COUNT, TabId},
+    ui::page_notice::Leaving,
 };
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, Div, Font, FontWeight, InteractiveElement,
@@ -208,6 +209,7 @@ enum Action {
     CopyUrl(TabId),
     Duplicate(TabId),
     Reload(TabId),
+    ToggleMute(TabId),
     Close(TabId),
     Delete(TabId),
     CloseOtherTabs(TabId),
@@ -642,10 +644,17 @@ impl BrowserApp {
                 if self.state.spaces.len() > 1 {
                     entries.push(Entry::item("Move to Space", "›", Action::AskMoveTab(id)));
                 }
-                entries.extend([
-                    Entry::item("Reload", "⌘R", Action::Reload(id)),
-                    Entry::Separator,
-                ]);
+                entries.push(Entry::item("Reload", "⌘R", Action::Reload(id)));
+                // Only a page that is open can play sound.
+                if self.is_loaded(id) {
+                    let label = if self.page(id).muted {
+                        "Unmute Tab"
+                    } else {
+                        "Mute Tab"
+                    };
+                    entries.push(Entry::item(label, "", Action::ToggleMute(id)));
+                }
+                entries.extend([Entry::Separator]);
                 if tab.pin == Pin::Today {
                     let today: Vec<TabId> = self
                         .state
@@ -1568,8 +1577,10 @@ impl BrowserApp {
             Action::CopyUrl(id) => self.copy_url(id, cx),
             Action::Duplicate(id) => self.duplicate_tab(id, window, cx),
             Action::Reload(id) => self.reload(id, cx),
+            Action::ToggleMute(id) => self.toggle_mute(id, cx),
             Action::Close(id) => self.close_tab(id, cx),
-            Action::Delete(id) => self.remove_tab(id, cx),
+            // A page with unsaved changes asks first.
+            Action::Delete(id) => self.leave_tab(id, Leaving::Close, cx),
             Action::CloseOtherTabs(id) => self.close_today_tabs_around(id, false, cx),
             Action::CloseTabsBelow(id) => self.close_today_tabs_around(id, true, cx),
             Action::Rename(id) => self.start_rename(id, window, cx),
@@ -1591,7 +1602,7 @@ impl BrowserApp {
             | Action::RetryDownload(_)
             | Action::ResetPermission(..)
             | Action::Zoom(_) => {}
-            Action::MoveTab(id, space_id) => self.move_tab_to_space(id, space_id, cx),
+            Action::MoveTab(id, space_id) => self.leave_tab(id, Leaving::Move(space_id), cx),
             Action::ToggleBlocking(id) => {
                 if let Some(host) = self.state.tab(id).and_then(|tab| host_of(&tab.url)) {
                     self.toggle_blocking(&host, cx);
