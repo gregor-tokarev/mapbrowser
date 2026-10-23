@@ -1894,6 +1894,10 @@ impl BrowserApp {
                 host,
                 today_others: at.is_some() && today.len() > 1,
                 today_below: at.is_some_and(|at| at + 1 < today.len()),
+                loaded: self.is_loaded(tab.id),
+                muted: self.page(tab.id).muted,
+                pinned_away: tab.pin != Pin::Today
+                    && tab.pinned_url.as_ref().is_some_and(|url| *url != tab.url),
             }
         });
         let closed = self
@@ -1964,15 +1968,21 @@ impl BrowserApp {
             Command::ClearHistory => self.ask_to_clear_history(window, cx),
             Command::SearchWith(engine) => self.set_search_engine(engine, cx),
             Command::SetDefaultBrowser => self.set_default_browser(cx),
+            Command::ShowShortcuts => self.show_shortcuts(window, cx),
             Command::Reload
             | Command::TogglePin
             | Command::ToggleFavorite
             | Command::CopyUrl
             | Command::DuplicateTab
             | Command::RenameTab
+            | Command::GoToPinnedPage
+            | Command::CloseTab
+            | Command::ToggleMute
             | Command::CloseOtherTabs
             | Command::CloseTabsBelow
-            | Command::MoveTab(_) => {
+            | Command::MoveTab(_)
+            | Command::SiteSettings
+            | Command::ClearSiteData => {
                 let Some(id) = active else {
                     return;
                 };
@@ -1983,10 +1993,19 @@ impl BrowserApp {
                     Command::DuplicateTab => self.duplicate_tab(id, window, cx),
                     // In the tab's row, which a hidden sidebar shows for that long.
                     Command::RenameTab => self.start_tab_rename(id, window, cx),
+                    Command::GoToPinnedPage => self.go_to_pinned_page(id, window, cx),
+                    Command::ToggleMute => self.toggle_mute(id, cx),
                     Command::CloseOtherTabs => self.close_today_tabs_around(id, false, cx),
                     Command::CloseTabsBelow => self.close_today_tabs_around(id, true, cx),
                     // A page with unsaved changes asks first.
+                    Command::CloseTab => self.leave_tab(id, Leaving::Close, cx),
                     Command::MoveTab(space_id) => self.leave_tab(id, Leaving::Move(space_id), cx),
+                    // Below the address, which a hidden sidebar shows for
+                    // as long as the menu is open.
+                    Command::SiteSettings => self.open_site_menu(MenuKind::Site(id), window, cx),
+                    Command::ClearSiteData => {
+                        self.open_site_menu(MenuKind::ClearSiteData(id), window, cx)
+                    }
                     _ => self.copy_url(id, cx),
                 }
             }

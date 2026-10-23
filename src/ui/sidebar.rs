@@ -1013,9 +1013,7 @@ impl BrowserApp {
         let open_site_menu = |tab_id: TabId| {
             cx.listener(move |this: &mut Self, _: &ClickEvent, window, cx| {
                 cx.stop_propagation();
-                // Below the pill, level with its left edge.
-                let anchor = point(px(8.), px(URL_PILL_TOP + 40.));
-                this.open_menu(MenuKind::Site(tab_id), anchor, window, cx);
+                this.open_site_menu(MenuKind::Site(tab_id), window, cx);
             })
         };
         div()
@@ -1172,6 +1170,28 @@ impl BrowserApp {
                     .on_click(open_site_menu(tab_id)),
                 )
             })
+    }
+
+    /// Opens a tab's site menu, or its Clear Site Data question, below the
+    /// address pill, from the shield or the command bar. A hidden sidebar
+    /// peeks while the menu is open (`peek_ends_at`); a page in fullscreen
+    /// would cover it.
+    pub(crate) fn open_site_menu(
+        &mut self,
+        kind: MenuKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.fullscreen {
+            return;
+        }
+        if self.sidebar_width().is_none() {
+            self.sidebar_peek = true;
+            self.sync_traffic_lights();
+        }
+        // Below the pill, level with its left edge.
+        let anchor = point(px(8.), px(URL_PILL_TOP + 40.));
+        self.open_menu(kind, anchor, window, cx);
     }
 
     fn render_favorites(

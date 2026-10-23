@@ -109,6 +109,11 @@ pub enum Command {
     NewSpace,
     DuplicateTab,
     RenameTab,
+    /// A pinned tab or favorite back at the page it was pinned at.
+    GoToPinnedPage,
+    /// A pinned tab or favorite, closed rather than unloaded as ⌘W does.
+    CloseTab,
+    ToggleMute,
     /// The active space's other Today tabs, closed together.
     CloseOtherTabs,
     /// The Today tabs below the active tab, closed together.
@@ -118,6 +123,10 @@ pub enum Command {
     UnloadSpace,
     /// Content blocking on the host, off or back on.
     ToggleBlocking(String),
+    /// The active tab's site menu, as the shield opens it.
+    SiteSettings,
+    /// The site menu's question before it clears the site's data.
+    ClearSiteData,
     /// What a browser shortcut does: close the tab, find, zoom, print.
     Shortcut(Shortcut),
     ShowHistory,
@@ -125,6 +134,7 @@ pub enum Command {
     ShowSettings,
     SearchWith(SearchEngine),
     SetDefaultBrowser,
+    ShowShortcuts,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,6 +173,11 @@ pub struct ActiveTab {
     /// close.
     pub today_others: bool,
     pub today_below: bool,
+    /// Whether its page is open: only then can it be unloaded or muted.
+    pub loaded: bool,
+    pub muted: bool,
+    /// A pinned tab or favorite showing another page than it was pinned at.
+    pub pinned_away: bool,
 }
 
 /// A recently closed tab.
@@ -724,19 +739,45 @@ fn actions(context: &CommandContext) -> Vec<(CommandItem, &'static str)> {
                 "name title",
             ));
         }
+        if active.pinned_away {
+            actions.push((
+                action(Command::GoToPinnedPage, "Go to Pinned Page", Icon::Pin, ""),
+                "back home original",
+            ));
+        }
         actions.push((
             action(Command::DuplicateTab, "Duplicate Tab", Icon::Duplicate, ""),
             "copy clone",
         ));
-        actions.push((
-            action(
-                Command::Shortcut(Shortcut::CloseTab),
-                "Close Tab",
-                Icon::Close,
-                "⌘W",
-            ),
-            "",
-        ));
+        if active.pin == Pin::Today {
+            actions.push((
+                action(
+                    Command::Shortcut(Shortcut::CloseTab),
+                    "Close Tab",
+                    Icon::Close,
+                    "⌘W",
+                ),
+                "",
+            ));
+        } else {
+            // As in the tab's menu: ⌘W only puts a pinned tab or favorite
+            // to sleep, and Close Tab removes it.
+            if active.loaded {
+                actions.push((
+                    action(
+                        Command::Shortcut(Shortcut::CloseTab),
+                        "Unload Tab",
+                        Icon::Minus,
+                        "⌘W",
+                    ),
+                    "sleep",
+                ));
+            }
+            actions.push((
+                action(Command::CloseTab, "Close Tab", Icon::Close, ""),
+                "remove",
+            ));
+        }
         if active.today_others {
             actions.push((
                 action(Command::CloseOtherTabs, "Close Other Tabs", Icon::Close, ""),
@@ -762,6 +803,18 @@ fn actions(context: &CommandContext) -> Vec<(CommandItem, &'static str)> {
             action(Command::CopyUrl, "Copy URL", Icon::Copy, "⇧⌘C"),
             "link address",
         ));
+        // Only a page that is open can play sound.
+        if active.loaded {
+            let (title, glyph) = if active.muted {
+                ("Unmute Tab", Icon::Speaker)
+            } else {
+                ("Mute Tab", Icon::SpeakerOff)
+            };
+            actions.push((
+                action(Command::ToggleMute, title, glyph, ""),
+                "sound audio silence",
+            ));
+        }
         for (shortcut, title, glyph, hint, keywords) in [
             (Shortcut::Reload, "Reload", Icon::Reload, "⌘R", "refresh"),
             (
@@ -825,6 +878,13 @@ fn actions(context: &CommandContext) -> Vec<(CommandItem, &'static str)> {
             "undo restore",
         ));
     }
+    if let Some(host) = context
+        .active
+        .as_ref()
+        .and_then(|active| active.host.as_ref())
+    {
+        actions.extend(site_actions(host));
+    }
     actions.push((
         action(Command::NewSpace, "New Space", Icon::Plus, ""),
         "create",
@@ -860,10 +920,54 @@ fn actions(context: &CommandContext) -> Vec<(CommandItem, &'static str)> {
         action(Command::ShowSettings, "Settings…", Icon::Settings, "⌘,"),
         "preferences",
     ));
+    actions.push((default_browser_action(), "links"));
+    actions.push((
+        action(
+            Command::ShowShortcuts,
+            "Keyboard Shortcuts",
+            Icon::Keyboard,
+            "",
+        ),
+        "help keys",
+    ));
     actions
 }
 
 const BLOCKING_WORDS: &str = "content ads trackers blocker";
+
+/// The site menu and its Clear Site Data question, for the active tab's
+/// host, with the words they are found by.
+fn site_actions(host: &str) -> [(CommandItem, &'static str); 2] {
+    [
+        (
+            action(
+                Command::SiteSettings,
+                format!("Site Settings for {host}"),
+                Icon::Shield,
+                "",
+            ),
+            "permissions camera microphone location notifications zoom",
+        ),
+        (
+            action(
+                Command::ClearSiteData,
+                format!("Clear Site Data for {host}…"),
+                Icon::Broom,
+                "",
+            ),
+            "cookies storage sign out",
+        ),
+    ]
+}
+
+fn default_browser_action() -> CommandItem {
+    action(
+        Command::SetDefaultBrowser,
+        "Set as Default Browser…",
+        Icon::Globe,
+        "",
+    )
+}
 
 fn blocking_action(host: &str, disabled: bool) -> CommandItem {
     if disabled {
@@ -1184,18 +1288,11 @@ fn settings_results(query: &str, context: &CommandContext) -> Vec<CommandItem> {
     {
         let item = blocking_action(host, active.blocking_disabled);
         settings.push((item, BLOCKING_WORDS));
+        settings.extend(site_actions(host));
     }
     settings.push((sidebar_action(context), "toggle"));
     settings.push((clear_history_action(), "delete forget"));
-    settings.push((
-        action(
-            Command::SetDefaultBrowser,
-            "Set as Default Browser…",
-            Icon::Globe,
-            "",
-        ),
-        "links",
-    ));
+    settings.push((default_browser_action(), "links"));
     let words = query_words(query);
     let mut settings: Vec<(u32, CommandItem)> = settings
         .into_iter()
@@ -1762,6 +1859,9 @@ mod tests {
                 blocking_disabled: false,
                 today_others: true,
                 today_below: true,
+                loaded: true,
+                muted: false,
+                pinned_away: false,
             }),
             spaces: vec![(1, "Personal".into()), (2, "Work".into())],
             closed: vec![ClosedEntry {

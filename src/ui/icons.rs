@@ -52,6 +52,7 @@ icons! {
     Globe => "globe",
     History => "history",
     Hourglass => "hourglass",
+    Keyboard => "keyboard",
     Link => "link",
     Lock => "lock",
     LockOpen => "lock-open",
