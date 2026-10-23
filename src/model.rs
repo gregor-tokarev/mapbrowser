@@ -32,7 +32,8 @@ pub const THEME_COUNT: u8 = 8;
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 228.;
 pub const MIN_SIDEBAR_WIDTH: f32 = 180.;
 pub const MAX_SIDEBAR_WIDTH: f32 = 420.;
-/// Closed Today tabs that ⇧⌘T and the library can bring back.
+/// Closes that ⇧⌘T and the library can undo, per space. Tabs closed
+/// together (Clear, Close Other Tabs) count as one.
 pub const REOPEN_LIMIT: usize = 20;
 
 /// The sidebar section a tab belongs to. Variants are declared in sidebar
@@ -48,21 +49,53 @@ pub enum Pin {
     Today,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Tab {
     pub id: TabId,
     pub url: String,
     pub title: String,
     #[serde(default)]
     pub pin: Pin,
+    /// A name the user gave the tab, shown instead of the page's title.
+    #[serde(default)]
+    pub custom_title: Option<String>,
+    /// The address a pinned tab or favorite had when it was pinned, which
+    /// "Go to Pinned Page" returns to. Today tabs have none.
+    #[serde(default)]
+    pub pinned_url: Option<String>,
 }
 
-/// A Today tab closed with ⌘W or Clear, which ⇧⌘T and the library bring
-/// back into its space.
+impl Tab {
+    /// What the sidebar calls the tab: the user's name for it, else the
+    /// page's title.
+    pub fn shown_title(&self) -> &str {
+        self.custom_title.as_deref().unwrap_or(&self.title)
+    }
+
+    /// Moves the tab to `pin`'s section. Pinning it remembers its address;
+    /// back in Today it has none.
+    fn repin(&mut self, pin: Pin) {
+        self.pinned_url = match pin {
+            Pin::Today => None,
+            _ => self.pinned_url.take().or_else(|| Some(self.url.clone())),
+        };
+        self.pin = pin;
+    }
+}
+
+/// A tab closed with ⌘W, Clear or Close Tab, which ⇧⌘T and the library
+/// bring back into its space.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClosedTab {
     pub space_id: SpaceId,
     pub tab: Tab,
+    /// Its place in its section when it closed, where it reopens.
+    #[serde(default)]
+    pub index: Option<usize>,
+    /// Tabs closed together (Clear, Close Other Tabs) share the first one's
+    /// id here, and ⇧⌘T reopens them together.
+    #[serde(default)]
+    pub batch: Option<TabId>,
 }
 
 /// `tabs` stays grouped by section, so its order is the sidebar order.
@@ -101,8 +134,8 @@ pub struct BrowserState {
     /// The browser window's frame, to open it there again.
     #[serde(default)]
     pub window: Option<SavedWindow>,
-    /// Recently closed Today tabs, the most recent last. Saved, so a Clear
-    /// can still be undone after a restart.
+    /// Recently closed tabs, the most recent last. Saved, so a Clear can
+    /// still be undone after a restart.
     #[serde(default)]
     closed: Vec<ClosedTab>,
     /// Where typed searches go.
@@ -783,13 +816,58 @@ impl BrowserState {
                 id,
                 url,
                 title,
-                pin: Pin::Today,
+                ..Tab::default()
             },
         );
         if select || space.selected_tab_id.is_none() {
             space.selected_tab_id = Some(id);
         }
         Some(id)
+    }
+
+    /// Opens a copy of the tab right below it, in its section, under a new
+    /// id. The selection stays.
+    pub fn duplicate_tab(&mut self, tab_id: TabId) -> Option<TabId> {
+        self.space_of_tab(tab_id)?;
+        let id = self.allocate_id();
+        let (space, index) = self.locate_tab_mut(tab_id)?;
+        let original = &space.tabs[index];
+        let copy = Tab {
+            id,
+            url: original.url.clone(),
+            title: original.title.clone(),
+            pin: original.pin,
+            custom_title: None,
+            pinned_url: original.pinned_url.clone(),
+        };
+        space.tabs.insert(index + 1, copy);
+        Some(id)
+    }
+
+    /// The tab's place in its section, top to bottom.
+    pub fn section_index(&self, tab_id: TabId) -> Option<usize> {
+        let space = self.space(self.space_of_tab(tab_id)?)?;
+        let pin = space.tabs[space.tab_index(tab_id)?].pin;
+        space.section(pin).position(|tab| tab.id == tab_id)
+    }
+
+    /// Names the tab, or with no name (or a blank one, or the page's title)
+    /// lets it follow its page's title again. Returns whether the name
+    /// changed.
+    pub fn rename_tab(&mut self, tab_id: TabId, name: Option<&str>) -> bool {
+        let Some((space, index)) = self.locate_tab_mut(tab_id) else {
+            return false;
+        };
+        let tab = &mut space.tabs[index];
+        let name = name
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && *name != tab.title)
+            .map(str::to_owned);
+        if tab.custom_title == name {
+            return false;
+        }
+        tab.custom_title = name;
+        true
     }
 
     /// Selects the tab and its space.
@@ -832,7 +910,7 @@ impl BrowserState {
             return true;
         }
         let mut tab = space.tabs.remove(index);
-        tab.pin = pin;
+        tab.repin(pin);
         let at = if pin == Pin::Today {
             space.section_start(pin)
         } else {
@@ -857,7 +935,7 @@ impl BrowserState {
             }
         }
         let mut tab = space.tabs.remove(index);
-        tab.pin = pin;
+        tab.repin(pin);
         let at = before
             .and_then(|before| space.tab_index(before))
             .unwrap_or_else(|| space.section_end(pin));
@@ -907,6 +985,25 @@ impl BrowserState {
         removed
     }
 
+    /// Closes the space's Today tabs among `ids`, as `close_tab` would one
+    /// by one. Returns them top first, each with its place in Today before
+    /// any of them closed.
+    pub fn close_today_tabs(&mut self, space_id: SpaceId, ids: &[TabId]) -> Vec<(Tab, usize)> {
+        let Some(space) = self.space_mut(space_id) else {
+            return Vec::new();
+        };
+        let places: Vec<(TabId, usize)> = space
+            .section(Pin::Today)
+            .enumerate()
+            .filter(|(_, tab)| ids.contains(&tab.id))
+            .map(|(place, tab)| (tab.id, place))
+            .collect();
+        places
+            .into_iter()
+            .filter_map(|(id, place)| Some((space.remove_at(space.tab_index(id)?), place)))
+            .collect()
+    }
+
     /// Browser callbacks can update hidden tabs without selecting their space.
     /// Returns whether the tab's URL or title changed, so unchanged reloads
     /// and repeated titles need no save.
@@ -929,27 +1026,105 @@ impl BrowserState {
         changed
     }
 
-    /// Recently closed Today tabs, the most recent last.
+    /// Recently closed tabs, the most recent last.
     pub fn closed_tabs(&self) -> &[ClosedTab] {
         &self.closed
     }
 
-    /// Remembers a closed Today tab for reopening; past `REOPEN_LIMIT` the
-    /// oldest is forgotten.
+    /// Remembers a closed tab for reopening, with no known place.
+    #[cfg(test)]
     pub fn remember_closed(&mut self, space_id: SpaceId, tab: Tab) {
-        self.closed.push(ClosedTab { space_id, tab });
+        self.remember_closed_at(space_id, tab, None);
+    }
+
+    /// Remembers a closed tab for reopening at `index` in its section.
+    pub fn remember_closed_at(&mut self, space_id: SpaceId, tab: Tab, index: Option<usize>) {
+        self.closed.push(ClosedTab {
+            space_id,
+            tab,
+            index,
+            batch: None,
+        });
         self.trim_closed();
     }
 
+    /// Remembers tabs closed together, each with its place in its section,
+    /// as one close that ⇧⌘T undoes at once. Pushed bottom first, so the
+    /// library, newest first, lists them in sidebar order.
+    pub fn remember_closed_together(&mut self, space_id: SpaceId, tabs: Vec<(Tab, usize)>) {
+        let batch = tabs.first().map(|(tab, _)| tab.id);
+        self.closed
+            .extend(tabs.into_iter().rev().map(|(tab, index)| ClosedTab {
+                space_id,
+                tab,
+                index: Some(index),
+                batch,
+            }));
+        self.trim_closed();
+    }
+
+    /// Keeps each space's `REOPEN_LIMIT` most recent closes, so one space
+    /// never pushes another's out. Tabs closed together count once, and
+    /// stay or go together.
     fn trim_closed(&mut self) {
-        let excess = self.closed.len().saturating_sub(REOPEN_LIMIT);
-        self.closed.drain(..excess);
+        let mut closes: HashMap<SpaceId, usize> = HashMap::new();
+        let mut newer_batch = None;
+        let mut keep = Vec::with_capacity(self.closed.len());
+        for closed in self.closed.iter().rev() {
+            let count = closes.entry(closed.space_id).or_default();
+            if closed.batch.is_none() || closed.batch != newer_batch {
+                *count += 1;
+            }
+            newer_batch = closed.batch;
+            keep.push(*count <= REOPEN_LIMIT);
+        }
+        let mut keep = keep.into_iter().rev();
+        self.closed.retain(|_| keep.next().unwrap_or(false));
     }
 
     /// Takes a closed tab, by default the most recent one, off the list.
     pub fn take_closed(&mut self, index: Option<usize>) -> Option<ClosedTab> {
         let index = index.or(self.closed.len().checked_sub(1))?;
         (index < self.closed.len()).then(|| self.closed.remove(index))
+    }
+
+    /// Takes the most recent close off the list: one tab, or all the tabs
+    /// closed together with it.
+    pub fn take_last_closed(&mut self) -> Vec<ClosedTab> {
+        let Some(last) = self.closed.last() else {
+            return Vec::new();
+        };
+        let start = match last.batch {
+            Some(batch) => self
+                .closed
+                .iter()
+                .rposition(|closed| closed.batch != Some(batch))
+                .map_or(0, |index| index + 1),
+            None => self.closed.len() - 1,
+        };
+        self.closed.split_off(start)
+    }
+
+    /// Puts a closed tab back in its space under a new id: in its section,
+    /// at its old place there (or as near as the section allows), else where
+    /// new tabs of that section go. The selection stays unless the space
+    /// was empty.
+    pub fn reopen_closed(&mut self, closed: ClosedTab) -> Option<TabId> {
+        self.space(closed.space_id)?;
+        let id = self.allocate_id();
+        let space = self.space_mut(closed.space_id)?;
+        let pin = closed.tab.pin;
+        let (start, end) = (space.section_start(pin), space.section_end(pin));
+        let at = match (closed.index, pin) {
+            (Some(index), _) => (start + index).min(end),
+            (None, Pin::Today) => start,
+            (None, _) => end,
+        };
+        let mut tab = Tab { id, ..closed.tab };
+        tab.repin(pin);
+        space.tabs.insert(at, tab);
+        space.selected_tab_id.get_or_insert(id);
+        Some(id)
     }
 
     /// Forgets a closed tab that isn't worth reopening.
@@ -1020,6 +1195,14 @@ impl BrowserState {
                     tab.title = sanitized.clone();
                 }
                 tab.url = sanitized;
+                // Tabs pinned before pinned addresses were kept come back
+                // to where they are now.
+                tab.pinned_url = tab.pinned_url.as_deref().map(display_url);
+                tab.repin(tab.pin);
+                tab.custom_title = tab
+                    .custom_title
+                    .take()
+                    .filter(|name| !name.trim().is_empty());
             }
             let position_theme = (index % usize::from(THEME_COUNT)) as u8;
             space.theme = Some(space.theme.unwrap_or(position_theme) % THEME_COUNT);
@@ -2442,7 +2625,7 @@ mod tests {
             id,
             url: format!("https://{id}.test/"),
             title: id.to_string(),
-            pin: Pin::Today,
+            ..Tab::default()
         }
     }
 

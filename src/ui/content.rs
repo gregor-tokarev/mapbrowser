@@ -112,8 +112,21 @@ impl BrowserApp {
             })
             .child(native_frame)
             .child(match active {
+                // With the sidebar hidden, nothing else on screen says how
+                // to get it back.
+                None if self.state.sidebar_hidden => hint(
+                    theme,
+                    "Press ⌘T to open a tab",
+                    Some("⌘S shows the sidebar"),
+                ),
                 None => hint(theme, "Press ⌘T to open a tab", None),
-                Some(tab) if !loaded => hint(theme, "Select the tab to load it", Some(&tab.title)),
+                // The selected tab without a page: closed by ⌘W or its –
+                // (pinned tabs and favorites), or by the page itself.
+                Some(tab) if !loaded => hint(
+                    theme,
+                    "This tab is asleep. Press ⌘R or click it to load it.",
+                    Some(tab.shown_title()),
+                ),
                 // Without Chromium (Linux previews) say so instead of a page.
                 Some(tab) if cfg!(not(target_os = "macos")) => hint(
                     theme,

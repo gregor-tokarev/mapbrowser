@@ -33,6 +33,8 @@ pub enum Shortcut {
     NextTab,
     /// ⌃⇧Tab
     PreviousTab,
+    /// ⌃Esc, while ⌃ is held for a ⌃Tab walk: the walk ends where it began.
+    CancelTabSwitch,
     /// ⌥⌘↓: the next tab in sidebar order.
     NextTabInList,
     /// ⌥⌘↑: the previous tab in sidebar order.
@@ -488,6 +490,9 @@ pub fn shortcut_for_key(
     Some(match (command, control, option, shift, key) {
         (false, true, false, false, 48) => Shortcut::NextTab,
         (false, true, false, true, 48) => Shortcut::PreviousTab,
+        // kVK_Escape, with ⌃ (and ⇧ for a walk going the other way) held.
+        // Pages get it first; the browser acts on it only during a walk.
+        (false, true, false, _, 53) => Shortcut::CancelTabSwitch,
         (true, false, true, false, 125) => Shortcut::NextTabInList,
         (true, false, true, false, 126) => Shortcut::PreviousTabInList,
         (true, false, true, false, 123) => Shortcut::PreviousSpace,

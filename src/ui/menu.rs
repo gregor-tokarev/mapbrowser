@@ -175,11 +175,16 @@ enum Step {
 enum Action {
     TogglePin(TabId),
     ToggleFavorite(TabId),
-    CopyLink(TabId),
+    RenameTab(TabId),
+    ResetTabName(TabId),
+    GoToPinnedPage(TabId),
+    CopyUrl(TabId),
     Duplicate(TabId),
     Reload(TabId),
     Close(TabId),
     Delete(TabId),
+    CloseOtherTabs(TabId),
+    CloseTabsBelow(TabId),
     Rename(SpaceId),
     Theme(SpaceId, u8),
     SpaceIcon(SpaceId, Option<&'static str>),
@@ -417,41 +422,74 @@ impl BrowserApp {
                 let Some(tab) = self.state.tab(id) else {
                     return Vec::new();
                 };
-                // ⌘D pins Today tabs and returns pinned tabs and favorites to Today.
-                let mut entries = vec![
-                    Entry::item(
-                        if tab.pin == Pin::Today {
-                            "Pin Tab"
-                        } else {
-                            "Unpin Tab"
-                        },
-                        "⌘D",
-                        Action::TogglePin(id),
-                    ),
-                    Entry::item(
-                        if tab.pin == Pin::Favorite {
-                            "Remove from Favorites"
-                        } else {
-                            "Add to Favorites"
-                        },
-                        "",
-                        Action::ToggleFavorite(id),
-                    ),
-                    Entry::Separator,
-                    Entry::item("Copy Link", "⇧⌘C", Action::CopyLink(id)),
+                // ⌘D pins Today tabs and returns pinned tabs and favorites
+                // to Today; a favorite can also step down to Pinned.
+                let mut entries = match tab.pin {
+                    Pin::Today => vec![
+                        Entry::item("Pin Tab", "⌘D", Action::TogglePin(id)),
+                        Entry::item("Add to Favorites", "", Action::ToggleFavorite(id)),
+                    ],
+                    Pin::Pinned => vec![
+                        Entry::item("Unpin Tab", "⌘D", Action::TogglePin(id)),
+                        Entry::item("Add to Favorites", "", Action::ToggleFavorite(id)),
+                    ],
+                    Pin::Favorite => vec![
+                        Entry::item("Remove from Favorites", "⌘D", Action::TogglePin(id)),
+                        Entry::item("Move to Pinned", "", Action::ToggleFavorite(id)),
+                    ],
+                };
+                entries.push(Entry::Separator);
+                // Favorite tiles show no title to rename.
+                if tab.pin != Pin::Favorite {
+                    entries.push(Entry::item("Rename Tab…", "", Action::RenameTab(id)));
+                    if tab.custom_title.is_some() {
+                        entries.push(Entry::item("Reset Name", "", Action::ResetTabName(id)));
+                    }
+                }
+                if tab.pin != Pin::Today {
+                    let away = tab.pinned_url.as_ref().is_some_and(|url| *url != tab.url);
+                    entries.push(
+                        Entry::item("Go to Pinned Page", "", Action::GoToPinnedPage(id))
+                            .enabled(away),
+                    );
+                }
+                entries.extend([
+                    Entry::item("Copy URL", "⇧⌘C", Action::CopyUrl(id)),
                     Entry::item("Duplicate", "", Action::Duplicate(id)),
-                ];
+                ]);
                 if self.state.spaces.len() > 1 {
                     entries.push(Entry::item("Move to Space", "›", Action::AskMoveTab(id)));
                 }
                 entries.extend([
                     Entry::item("Reload", "⌘R", Action::Reload(id)),
                     Entry::Separator,
-                    Entry::item("Close Tab", "⌘W", Action::Close(id)),
                 ]);
-                // Closing a pinned tab only unloads it; this removes it.
-                if tab.pin != Pin::Today {
-                    entries.push(Entry::item("Delete Tab", "", Action::Delete(id)));
+                if tab.pin == Pin::Today {
+                    let today: Vec<TabId> = self
+                        .state
+                        .space_of_tab(id)
+                        .and_then(|space| self.state.space(space))
+                        .map(|space| space.section(Pin::Today).map(|tab| tab.id).collect())
+                        .unwrap_or_default();
+                    let below = today
+                        .iter()
+                        .position(|&other| other == id)
+                        .is_some_and(|at| at + 1 < today.len());
+                    entries.extend([
+                        Entry::item("Close Tab", "⌘W", Action::Close(id)),
+                        Entry::item("Close Other Tabs", "", Action::CloseOtherTabs(id))
+                            .enabled(today.len() > 1),
+                        Entry::item("Close Tabs Below", "", Action::CloseTabsBelow(id))
+                            .enabled(below),
+                    ]);
+                } else {
+                    // ⌘W only puts a pinned tab or favorite to sleep; Close
+                    // Tab removes it, and ⇧⌘T brings it back to its place.
+                    entries.extend([
+                        Entry::item("Unload Tab", "⌘W", Action::Close(id))
+                            .enabled(self.is_loaded(id)),
+                        Entry::item("Close Tab", "", Action::Delete(id)),
+                    ]);
                 }
                 entries
             }
@@ -504,7 +542,7 @@ impl BrowserApp {
                 entries.extend(closed.iter().enumerate().rev().take(CLOSED_LIMIT).map(
                     |(index, closed)| Entry::Closed {
                         index,
-                        title: closed.tab.title.clone().into(),
+                        title: closed.tab.shown_title().to_owned().into(),
                     },
                 ));
                 if closed.is_empty() {
@@ -946,11 +984,16 @@ impl BrowserApp {
         match action {
             Action::TogglePin(id) => self.toggle_pin(id, cx),
             Action::ToggleFavorite(id) => self.toggle_favorite(id, cx),
-            Action::CopyLink(id) => self.copy_url(id, cx),
+            Action::RenameTab(id) => self.start_tab_rename(id, window, cx),
+            Action::ResetTabName(id) => self.reset_tab_name(id, cx),
+            Action::GoToPinnedPage(id) => self.go_to_pinned_page(id, window, cx),
+            Action::CopyUrl(id) => self.copy_url(id, cx),
             Action::Duplicate(id) => self.duplicate_tab(id, window, cx),
             Action::Reload(id) => self.reload(id, cx),
             Action::Close(id) => self.close_tab(id, cx),
             Action::Delete(id) => self.remove_tab(id, cx),
+            Action::CloseOtherTabs(id) => self.close_today_tabs_around(id, false, cx),
+            Action::CloseTabsBelow(id) => self.close_today_tabs_around(id, true, cx),
             Action::Rename(id) => self.start_rename(id, window, cx),
             Action::Theme(id, theme) => self.set_space_theme(id, theme, cx),
             Action::SpaceIcon(id, icon) => self.set_space_icon(id, icon, cx),

@@ -6,9 +6,7 @@ use crate::{
     favicons::{FaviconStore, host_of},
     history::{self, History},
     input::{InputEvent, InputStyle, TextInput},
-    model::{
-        self, BrowserState, ClosedTab, Pin, Recovery, SearchEngine, Space, SpaceId, Tab, TabId,
-    },
+    model::{self, BrowserState, Pin, Recovery, SearchEngine, Space, SpaceId, Tab, TabId},
     native,
     recent::{RecentTabs, TabSwitch},
     ui::{
@@ -24,6 +22,7 @@ use crate::{
         permissions::PermissionPrompts,
         redraw::{self, Drawn},
         shortcuts::ShortcutsWindow,
+        sidebar::TabLists,
         swipe::SwipeTracker,
         theme::Theme,
         toast_window::{Toast, ToastKind, ToastWindow},
@@ -51,6 +50,9 @@ const PAGE_SAVE_DELAY: Duration = Duration::from_secs(10);
 /// Favicons of visited pages the command bar reads from the disk cache
 /// when it opens, the most recent first.
 const HISTORY_ICONS: usize = 100;
+/// The pointer rests this long at the hidden sidebar's edge before the
+/// sidebar shows, so a pointer passing by doesn't open it.
+const PEEK_DELAY: Duration = Duration::from_millis(150);
 
 /// Navigation state of a loaded tab, for the toolbar and the progress bar.
 #[derive(Clone, Copy, Debug, Default)]
@@ -107,6 +109,15 @@ pub struct BrowserApp {
     swipe: SwipeTracker,
     pub renaming: Option<SpaceId>,
     pub rename_input: Entity<TextInput>,
+    /// The tab whose name is being edited in its row, and the field.
+    pub renaming_tab: Option<TabId>,
+    pub tab_name_input: Entity<TextInput>,
+    /// Each space's tab list and favorites scroll positions.
+    pub tab_lists: TabLists,
+    /// The hidden sidebar shows while the pointer is over it, after resting
+    /// at the window's left edge; `sidebar_hidden` stays as it was.
+    pub sidebar_peek: bool,
+    peek_task: Option<Task<()>>,
     pub command_bar: Option<CommandBarWindow>,
     pub dark: bool,
     /// A page is in HTML fullscreen: no sidebar, no card insets.
@@ -275,6 +286,7 @@ impl BrowserApp {
         cx: &mut Context<Self>,
     ) -> Self {
         let rename_input = cx.new(|cx| TextInput::new(window, cx));
+        let tab_name_input = cx.new(|cx| TextInput::new(window, cx));
         let favicons = FaviconStore::new(state.root_dir());
         let history = History::load(state.root_dir());
         let restored = state
@@ -301,6 +313,11 @@ impl BrowserApp {
             swipe: SwipeTracker::default(),
             renaming: None,
             rename_input: rename_input.clone(),
+            renaming_tab: None,
+            tab_name_input: tab_name_input.clone(),
+            tab_lists: TabLists::default(),
+            sidebar_peek: false,
+            peek_task: None,
             command_bar: None,
             dark: is_dark(window.appearance()),
             fullscreen: false,
@@ -343,6 +360,20 @@ impl BrowserApp {
                 window,
                 |this, window, cx| this.end_rename(window, cx),
             ),
+            cx.subscribe_in(
+                &tab_name_input,
+                window,
+                |this, _, event, window, cx| match event {
+                    InputEvent::Submit(name) => this.finish_tab_rename(Some(name), window, cx),
+                    InputEvent::Cancel => this.finish_tab_rename(None, window, cx),
+                    InputEvent::Changed(_) => {}
+                },
+            ),
+            cx.on_blur(
+                &tab_name_input.focus_handle(cx),
+                window,
+                |this, window, cx| this.end_tab_rename(window, cx),
+            ),
             cx.observe_window_appearance(window, |this, window, cx| {
                 let dark = is_dark(window.appearance());
                 if this.dark != dark {
@@ -370,6 +401,10 @@ impl BrowserApp {
                 if let Some(id) = this.renaming.take() {
                     let name = this.rename_input.read(cx).text().to_owned();
                     this.state.rename_space(id, name);
+                }
+                if let Some(id) = this.renaming_tab.take() {
+                    let name = this.tab_name_input.read(cx).text().to_owned();
+                    this.state.rename_tab(id, Some(&name));
                 }
                 this.save_now();
                 this.history_save_task = None;
@@ -706,16 +741,29 @@ impl BrowserApp {
             self.exit_page_fullscreen();
             self.error = None;
         }
+        let index = self.state.section_index(tab_id);
         let Some(tab) = self.state.close_tab(space_id, tab_id) else {
             return;
         };
         self.drop_browser(tab_id);
-        self.state.remember_closed(space_id, tab);
+        self.release_tab_ui(tab_id);
+        self.state.remember_closed_at(space_id, tab, index);
         if space_id == self.state.selected_space_id {
             self.show_selected();
         }
         self.persist_later(cx);
         cx.notify();
+    }
+
+    /// A tab that closes or moves takes its menu and its name field along:
+    /// left open, they would hang over other rows.
+    fn release_tab_ui(&mut self, tab_id: TabId) {
+        if self.has_open_menu(tab_id) {
+            self.menu = None;
+        }
+        if self.renaming_tab == Some(tab_id) {
+            self.renaming_tab = None;
+        }
     }
 
     /// Closes the tab's browser but keeps its entry. The selection moves on,
@@ -730,6 +778,7 @@ impl BrowserApp {
         };
         let (space_id, selected) = (space.id, space.selected_tab_id == Some(tab_id));
         let successor = space.successor_of(tab_id);
+        self.release_tab_ui(tab_id);
         self.finish_slide();
         if self.is_active(tab_id) {
             self.exit_page_fullscreen();
@@ -754,20 +803,32 @@ impl BrowserApp {
         cx.notify();
     }
 
-    /// Reopens a closed tab (the most recent one by default) at the top of
-    /// Today in its space.
+    /// Reopens a closed tab in its space, in its section and at its place
+    /// there, and selects it. By default (⇧⌘T) that is the most recent
+    /// close, with every tab closed together with it, in their order.
     pub fn reopen_closed(
         &mut self,
         index: Option<usize>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ClosedTab { space_id, tab }) = self.state.take_closed(index) else {
+        let mut closed = match index {
+            Some(index) => self.state.take_closed(Some(index)).into_iter().collect(),
+            None => self.state.take_last_closed(),
+        };
+        // Top to bottom: each one's old place counts the ones above it.
+        closed.sort_by_key(|closed| closed.index);
+        let Some(space_id) = closed.first().map(|closed| closed.space_id) else {
             return;
         };
-        if let Some(id) = self.state.new_background_tab(space_id, &tab.url) {
-            self.state.update_tab(id, &tab.url, &tab.title);
-            self.go_to(space_id, Some(id), window, cx);
+        let reopened: Vec<TabId> = closed
+            .into_iter()
+            .filter_map(|closed| self.state.reopen_closed(closed))
+            .collect();
+        match reopened.first() {
+            Some(&first) => self.go_to(space_id, Some(first), window, cx),
+            // Its space is gone; the list changed all the same.
+            None => self.persist_later(cx),
         }
     }
 
@@ -776,24 +837,82 @@ impl BrowserApp {
         self.finish_slide();
         let space_id = self.state.selected_space_id;
         let cleared = self.state.clear_today(space_id);
-        if cleared.is_empty() {
+        let cleared = cleared
+            .into_iter()
+            .enumerate()
+            .map(|(index, tab)| (tab, index))
+            .collect();
+        self.closed_together(space_id, cleared, cx);
+    }
+
+    /// "Close Other Tabs", or with `below` "Close Tabs Below": Today tabs
+    /// close together, as with Clear, and the tab stays, selected if the
+    /// selection was among them.
+    pub fn close_today_tabs_around(&mut self, tab_id: TabId, below: bool, cx: &mut Context<Self>) {
+        let Some(space) = self
+            .state
+            .space_of_tab(tab_id)
+            .and_then(|id| self.state.space(id))
+        else {
+            return;
+        };
+        let space_id = space.id;
+        let today: Vec<TabId> = space.section(Pin::Today).map(|tab| tab.id).collect();
+        let Some(at) = today.iter().position(|&id| id == tab_id) else {
+            return;
+        };
+        let ids = if below {
+            today[at + 1..].to_vec()
+        } else {
+            today.into_iter().filter(|&id| id != tab_id).collect()
+        };
+        let selected = space.selected_tab_id;
+        self.finish_slide();
+        let closed = self.state.close_today_tabs(space_id, &ids);
+        if selected.is_some_and(|id| ids.contains(&id)) {
+            self.state.select_tab_in_space(space_id, tab_id);
+        }
+        self.closed_together(space_id, closed, cx);
+    }
+
+    /// Tabs that closed together, each with its place in Today: their pages
+    /// go, and one ⇧⌘T brings them all back, as a toast says.
+    fn closed_together(
+        &mut self,
+        space_id: SpaceId,
+        closed: Vec<(Tab, usize)>,
+        cx: &mut Context<Self>,
+    ) {
+        if closed.is_empty() {
             return;
         }
-        if cleared.iter().any(|tab| self.loaded.contains(&tab.id)) {
+        if closed.iter().any(|(tab, _)| self.loaded.contains(&tab.id)) {
             self.exit_page_fullscreen();
         }
-        // Pushed bottom first, so ⇧⌘T restores the top tab first.
-        for tab in cleared.into_iter().rev() {
+        for (tab, _) in &closed {
             self.drop_browser(tab.id);
-            self.state.remember_closed(space_id, tab);
+            self.release_tab_ui(tab.id);
         }
-        self.error = None;
-        self.show_selected();
+        let count = closed.len();
+        self.state.remember_closed_together(space_id, closed);
+        if space_id == self.state.selected_space_id {
+            self.error = None;
+            self.show_selected();
+        }
+        let toast = if count == 1 {
+            "Closed 1 tab · ⇧⌘T reopens it".to_owned()
+        } else {
+            format!("Closed {count} tabs · ⇧⌘T reopens them")
+        };
+        self.show_undo_toast(toast, cx);
         self.persist_later(cx);
         cx.notify();
     }
 
     pub fn set_pin(&mut self, tab_id: TabId, pin: Pin, cx: &mut Context<Self>) {
+        if self.state.tab(tab_id).is_some_and(|tab| tab.pin != pin) {
+            self.release_tab_ui(tab_id);
+        }
         if self.state.set_pin(tab_id, pin) {
             self.persist_later(cx);
             cx.notify();
@@ -819,15 +938,120 @@ impl BrowserApp {
         self.set_pin(tab_id, pin, cx);
     }
 
+    /// Opens a copy of the tab right below it, in its section, and selects it.
     pub fn duplicate_tab(&mut self, tab_id: TabId, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(space_id), Some(tab)) = (self.state.space_of_tab(tab_id), self.state.tab(tab_id))
+        let Some(space_id) = self.state.space_of_tab(tab_id) else {
+            return;
+        };
+        if let Some(id) = self.state.duplicate_tab(tab_id) {
+            self.go_to(space_id, Some(id), window, cx);
+        }
+    }
+
+    /// "Go to Pinned Page": a pinned tab or favorite goes back to the
+    /// address it was pinned at, and is selected.
+    pub fn go_to_pinned_page(
+        &mut self,
+        tab_id: TabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(url) = self
+            .state
+            .tab(tab_id)
+            .and_then(|tab| tab.pinned_url.clone())
         else {
             return;
         };
-        let (url, title) = (tab.url.clone(), tab.title.clone());
-        if let Some(id) = self.state.new_background_tab(space_id, &url) {
-            self.state.update_tab(id, &url, &title);
-            self.go_to(space_id, Some(id), window, cx);
+        if self.loaded.contains(&tab_id) {
+            // `Address` reports the page once it loads, as for ⌘L.
+            self.engine.borrow().navigate(tab_id, &url);
+        } else if self.state.update_tab(tab_id, &url, "") {
+            // Selecting it loads it there.
+            self.persist_later(cx);
+        }
+        if self.is_active(tab_id) {
+            self.error = None;
+            cx.notify();
+        }
+        self.select_tab(tab_id, window, cx);
+    }
+
+    /// Edits the tab's name in place, in its row. Only rows of the active
+    /// space are drawn, and only with the sidebar shown; favorites show no
+    /// name.
+    pub fn start_tab_rename(&mut self, tab_id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self
+            .state
+            .active_space()
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id && tab.pin != Pin::Favorite)
+        else {
+            return;
+        };
+        if self.sidebar_width().is_none() {
+            return;
+        }
+        let (name, title) = (tab.shown_title().to_owned(), tab.title.clone());
+        self.end_rename(window, cx);
+        let theme = self.theme();
+        self.renaming_tab = Some(tab_id);
+        self.engine.borrow().focus_shell();
+        self.tab_name_input.update(cx, |input, cx| {
+            input.set_style(
+                InputStyle {
+                    text: theme.title(),
+                    placeholder: theme.tertiary(),
+                    cursor: theme.focus(),
+                    selection: theme.focus().opacity(0.35),
+                    font_size: px(14.),
+                    line_height: px(18.),
+                },
+                cx,
+            );
+            // Emptied, the field shows the page's title, which Return keeps.
+            input.set_placeholder(&title, cx);
+            input.set_text_and_select_all(&name, window, cx);
+        });
+        cx.notify();
+    }
+
+    fn finish_tab_rename(
+        &mut self,
+        name: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab_id) = self.renaming_tab.take() else {
+            return;
+        };
+        if let Some(name) = name
+            && self.state.rename_tab(tab_id, Some(name))
+        {
+            self.persist_later(cx);
+        }
+        window.focus(&self.focus_handle);
+        // A menu opening ended the rename; it keeps keyboard focus.
+        if self.menu.is_none() {
+            self.focus_page();
+        }
+        cx.notify();
+    }
+
+    /// Ends a tab's rename, keeping the name typed so far, like `end_rename`.
+    pub(crate) fn end_tab_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.renaming_tab.is_some() {
+            let name = self.tab_name_input.read(cx).text().to_owned();
+            self.finish_tab_rename(Some(&name), window, cx);
+        }
+    }
+
+    /// "Reset Name": the tab shows its page's title again.
+    pub fn reset_tab_name(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        if self.state.rename_tab(tab_id, None) {
+            self.persist_later(cx);
+            cx.notify();
         }
     }
 
@@ -847,6 +1071,7 @@ impl BrowserApp {
             return;
         }
         self.drop_browser(tab_id);
+        self.release_tab_ui(tab_id);
         self.openers.remove(&tab_id);
         if self.state.selected_space_id == from || self.state.selected_space_id == space_id {
             self.show_selected();
@@ -1019,8 +1244,10 @@ impl BrowserApp {
 
     /// Ends a rename, keeping the name typed so far. Shortcuts, presses on
     /// the page and sidebar buttons that show another page move keyboard
-    /// focus to the page without GPUI noticing, so they end it here.
+    /// focus to the page without GPUI noticing, so they end it here, a
+    /// tab's rename too.
     pub(crate) fn end_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.end_tab_rename(window, cx);
         if self.renaming.is_some() {
             let name = self.rename_input.read(cx).text().to_owned();
             self.finish_rename(Some(&name), window, cx);
@@ -1036,10 +1263,50 @@ impl BrowserApp {
             return;
         }
         self.state.sidebar_hidden = hidden;
+        // Showing it while it peeks keeps it.
+        self.sidebar_peek = false;
+        self.peek_task = None;
         self.menu = None;
         self.engine.borrow().set_traffic_lights_hidden(hidden);
         self.persist_later(cx);
         cx.notify();
+    }
+
+    /// The pointer came to (or left) the hidden sidebar's edge, at the
+    /// window's left: after `PEEK_DELAY` there, the sidebar shows until the
+    /// pointer leaves it (`update_peek`). Only hover events and a one-off
+    /// timer drive it.
+    pub fn point_at_sidebar_edge(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        if !hovered {
+            self.peek_task = None;
+            return;
+        }
+        if !self.state.sidebar_hidden || self.sidebar_peek || self.peek_task.is_some() {
+            return;
+        }
+        self.peek_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PEEK_DELAY).await;
+            let _ = this.update(cx, |this, cx| {
+                this.peek_task = None;
+                if this.state.sidebar_hidden && !this.fullscreen && !this.sidebar_peek {
+                    this.sidebar_peek = true;
+                    // It shows under the pointer, which only moving would report.
+                    this.sidebar_hovered = true;
+                    this.engine.borrow().set_traffic_lights_hidden(false);
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    /// Hides a peeking sidebar again, for the frame being drawn.
+    pub(crate) fn end_peek(&mut self) {
+        if std::mem::take(&mut self.sidebar_peek) {
+            self.sidebar_hovered = false;
+            self.engine
+                .borrow()
+                .set_traffic_lights_hidden(self.state.sidebar_hidden);
+        }
     }
 
     /// Follows the sidebar's edge, dragged with the pointer at `x`. Far
@@ -1422,7 +1689,7 @@ impl BrowserApp {
                     id: tab.id,
                     space_id: space.id,
                     space_name: space.name.clone(),
-                    title: tab.title.clone(),
+                    title: tab.shown_title().to_owned(),
                     url: tab.url.clone(),
                 })
             })
@@ -1613,6 +1880,9 @@ impl BrowserApp {
 
     pub fn shortcut(&mut self, shortcut: Shortcut, window: &mut Window, cx: &mut Context<Self>) {
         self.end_rename(window, cx);
+        // As with a macOS menu, a key closes an open menu first; the menu
+        // would otherwise stay over a tab that moved or closed.
+        self.close_menu(cx);
         // Shortcuts that act on the page, or open something of their own,
         // close the bar and run with the page in focus. The others leave it
         // open, with its results brought up to date.
@@ -1662,6 +1932,12 @@ impl BrowserApp {
             Shortcut::ReopenClosedTab => self.reopen_closed(None, window, cx),
             Shortcut::NextTab => self.walk_recent_tabs(true, window, cx),
             Shortcut::PreviousTab => self.walk_recent_tabs(false, window, cx),
+            // Releasing ⌃ then finds no walk, and the tab on screen stays.
+            Shortcut::CancelTabSwitch => {
+                if self.tab_switch.take().is_some() {
+                    cx.notify();
+                }
+            }
             Shortcut::NextTabInList => {
                 if let Some(id) = neighbour_tab(tabs, active, true) {
                     self.select_tab(id, window, cx);
@@ -1940,12 +2216,20 @@ impl BrowserApp {
                 if !self.engine.borrow().has_tab(tab_id) && self.loaded.remove(&tab_id) {
                     self.pages.remove(&tab_id);
                     self.new_documents.remove(&tab_id);
+                    // Its menu goes with the page, as when ⌘W closes it.
+                    if self.has_open_menu(tab_id) {
+                        self.menu = None;
+                        cx.notify();
+                    }
                     if self.is_active(tab_id) {
                         // Hides the emptied web container and gives keyboard
                         // focus back to the shell; the tab loads again when
                         // selected.
                         self.engine.borrow_mut().activate_tab(tab_id);
                         window.focus(&self.focus_handle);
+                        cx.notify();
+                    } else if self.drawn(tab_id).address {
+                        // Its row or tile now looks asleep.
                         cx.notify();
                     }
                 }
@@ -2285,7 +2569,7 @@ mod tests {
                 id,
                 url: format!("https://{id}.test/"),
                 title: id.to_string(),
-                pin: Pin::Today,
+                ..Tab::default()
             })
             .collect()
     }

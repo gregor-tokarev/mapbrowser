@@ -61,6 +61,9 @@ pub enum ToastKind {
 pub struct Toast {
     pub kind: ToastKind,
     pub text: SharedString,
+    /// Says how to undo what was done ("Closed 3 tabs · ⇧⌘T reopens
+    /// them"): the sidebar wraps it to two lines rather than cut the hint.
+    undo: bool,
     /// The text as the sidebar shows it, elided to fit `.0` points.
     fitted: Option<(f32, SharedString)>,
     _timer: Task<()>,
@@ -74,6 +77,10 @@ impl Toast {
             .map_or_else(|| self.text.clone(), |(_, text)| text.clone())
     }
 }
+
+/// How long a toast that says how to undo something stays, long enough to
+/// read it and act.
+const UNDO_DURATION: Duration = Duration::from_secs(4);
 
 /// How long a toast stays: 1.5 s for a few words, longer for long ones and
 /// failures, which take longer to read, but at most 5 s.
@@ -209,6 +216,23 @@ impl BrowserApp {
     ) {
         let text = text.into();
         let duration = toast_duration(kind, &text);
+        self.set_toast(kind, text, duration, false, cx);
+    }
+
+    /// Shows a ✓ toast that says how to undo what was done, for
+    /// `UNDO_DURATION`.
+    pub fn show_undo_toast(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.set_toast(ToastKind::Done, text.into(), UNDO_DURATION, true, cx);
+    }
+
+    fn set_toast(
+        &mut self,
+        kind: ToastKind,
+        text: SharedString,
+        duration: Duration,
+        undo: bool,
+        cx: &mut Context<Self>,
+    ) {
         let timer = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(duration).await;
             let _ = this.update(cx, |this, cx| {
@@ -219,6 +243,7 @@ impl BrowserApp {
         self.toast = Some(Toast {
             kind,
             text,
+            undo,
             fitted: None,
             _timer: timer,
         });
@@ -235,9 +260,11 @@ impl BrowserApp {
     }
 
     /// Fits the toast to the sidebar, `width` wide; measured once per width.
+    /// An undo toast wraps instead.
     pub(super) fn fit_toast(&mut self, width: f32, window: &Window) {
         let room = (width - SIDEBAR_CHROME_WIDTH).max(0.);
         if let Some(toast) = &mut self.toast
+            && !toast.undo
             && toast
                 .fitted
                 .as_ref()
@@ -275,7 +302,15 @@ impl BrowserApp {
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme.title())
                 .child(mark(toast.kind, theme))
-                .child(truncated(toast.shown()).min_w_0())
+                .child(if toast.undo {
+                    div()
+                        .min_w_0()
+                        .line_clamp(2)
+                        .text_ellipsis()
+                        .child(toast.text.clone())
+                } else {
+                    truncated(toast.shown()).min_w_0()
+                })
         });
         // The reason may be long: the notice wraps, within a known width.
         let text_width = width - SIDEBAR_CHROME_WIDTH;
