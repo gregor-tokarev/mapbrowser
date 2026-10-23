@@ -481,7 +481,10 @@ impl BrowserApp {
     /// edge of.
     pub(super) fn prepare_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let stale_menu = self.menu.as_ref().is_some_and(|menu| match menu.kind {
-            MenuKind::Tab(id) | MenuKind::MoveTab(id) => self.state.tab(id).is_none(),
+            MenuKind::Tab(id)
+            | MenuKind::MoveTab(id)
+            | MenuKind::Site(id)
+            | MenuKind::ClearSiteData(id) => self.state.tab(id).is_none(),
             MenuKind::Space(id) | MenuKind::DeleteSpace(id) => self.state.space(id).is_none(),
             _ => false,
         });
