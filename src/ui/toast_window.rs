@@ -113,13 +113,17 @@ fn window_size(text: &str, card: Bounds<Pixels>, window: &Window) -> gpui::Size<
 }
 
 impl BrowserApp {
-    /// The toast, if the sidebar that shows toasts is hidden. Pages in HTML
-    /// fullscreen (videos) show none.
+    /// The toast, if the sidebar that shows toasts is hidden, else the
+    /// progress of running downloads, which its ring would show. Pages in
+    /// HTML fullscreen (videos) show none.
     fn toast_over_card(&self) -> Option<SharedString> {
+        if self.sidebar_width().is_some() || self.fullscreen {
+            return None;
+        }
         self.toast
             .as_ref()
-            .filter(|_| self.sidebar_width().is_none() && !self.fullscreen)
             .map(|toast| toast.text.clone())
+            .or_else(|| self.downloads_over_card())
     }
 
     /// Called on every frame of the browser window: the pop-up opens,

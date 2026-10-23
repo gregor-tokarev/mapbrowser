@@ -48,6 +48,7 @@ icons! {
     File => "file",
     Globe => "globe",
     Link => "link",
+    LockOpen => "lock-open",
     MapPin => "map-pin",
     Mic => "mic",
     Minus => "minus",

@@ -200,15 +200,17 @@ pub enum EngineEvent {
         final_update: bool,
     },
     /// A download started, saved straight to `path` in the Downloads
-    /// folder. `blank_tab`: the tab never showed a page (a link that opened
-    /// a new tab for the file), so it has nothing to keep it open for.
-    /// Events stop once the tab's browser closes: keep it until the
-    /// download finishes.
+    /// folder. `url` is where it comes from, before any redirect, for
+    /// downloading it again. `blank_tab`: the tab never showed a page (a
+    /// link that opened a new tab for the file), so it has nothing to keep
+    /// it open for. Events stop once the tab's browser closes: keep it
+    /// until the download finishes.
     DownloadStarted {
         id: u64,
         tab_id: u64,
         name: String,
         path: PathBuf,
+        url: String,
         blank_tab: bool,
     },
     /// Bytes received so far, coalesced to steps of 5 % or one second.
@@ -217,10 +219,10 @@ pub enum EngineEvent {
         received: u64,
         total: Option<u64>,
     },
-    /// The download completed (`ok`), was cancelled or failed.
+    /// The download completed, was cancelled or failed.
     DownloadFinished {
         id: u64,
-        ok: bool,
+        end: DownloadEnd,
     },
     /// A page asks to use `permissions` (sorted, without repeats). Answer
     /// once with `Engine::respond_permission`.
@@ -249,15 +251,64 @@ pub enum EngineEvent {
     },
 }
 
-/// Something a page asks permission to use.
+/// How a download ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DownloadEnd {
+    /// Saved in full: `size` bytes.
+    Complete { size: u64 },
+    /// Stopped from the library, or by quitting.
+    Cancelled,
+    /// Interrupted; `reason` says why in a few words, when Chromium knows.
+    Failed { reason: Option<&'static str> },
+}
+
+/// Chromium's interrupt reason (cef_download_interrupt_reason_t) for a
+/// download the user cancelled.
+#[cfg(any(target_os = "macos", test))]
+pub const CANCELLED_BY_USER: u32 = 40;
+
+/// Why a download stopped, from Chromium's interrupt reason, in a few
+/// words for the library. `None` without a reason worth showing.
+#[cfg(any(target_os = "macos", test))]
+pub fn download_failure(reason: u32) -> Option<&'static str> {
+    Some(match reason {
+        1 | 10 => "Couldn't save the file",
+        2 => "No permission to save in Downloads",
+        3 => "Not enough disk space",
+        5 => "File name too long",
+        6 => "File too large to save",
+        7 => "A virus was found",
+        11 => "Blocked by the system",
+        12 => "Security check failed",
+        13 | 14 | 38 => "Download incomplete",
+        15 => "The file is already in Downloads",
+        20 | 24 => "Network error",
+        21 => "The connection timed out",
+        22 => "The connection was lost",
+        23 | 37 => "The server can't be reached",
+        30 | 31 | 39 => "Server error",
+        33 => "The file is no longer there",
+        34 => "The server needs you to sign in",
+        35 => "The server's certificate isn't valid",
+        36 => "The server refused it",
+        41 | 50 => "Interrupted",
+        _ => return None,
+    })
+}
+
+/// Something a page asks permission to use. Declared in the order the
+/// permission card names them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 // Previews ask for a few kinds only.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum Permission {
+    /// The camera, and also moving it (pan, tilt and zoom).
     Camera,
     Microphone,
     /// The screen (getDisplayMedia), with or without its sound.
     Screen,
+    /// Scrolling and zooming a tab or window the page captures.
+    CapturedSurfaceControl,
     Location,
     Notifications,
     Clipboard,
@@ -266,6 +317,33 @@ pub enum Permission {
     Downloads,
     /// Embedded content's own cookies and site data.
     StorageAccess,
+    /// More room for the site's data on this Mac.
+    DiskQuota,
+    LocalFonts,
+    /// Placing windows across displays (Window Management API).
+    WindowManagement,
+    IdleDetection,
+    PointerLock,
+    KeyboardLock,
+    /// Devices on the local network.
+    LocalNetwork,
+    /// Apps and services on this Mac (localhost).
+    LoopbackNetwork,
+    /// Motion and orientation sensors.
+    Sensors,
+    /// DRM-protected media.
+    ProtectedMedia,
+    /// Keeping access to files and folders opened in the page.
+    FileSystem,
+    /// Opening links of a kind of its own (web+…, mailto:).
+    ProtocolHandler,
+    /// Installing the site as an app.
+    AppInstallation,
+    /// Signing in to other sites with this one (FedCM).
+    IdentityProvider,
+    VirtualReality,
+    AugmentedReality,
+    HandTracking,
     /// Anything else Chromium asks about.
     Other,
 }
@@ -291,17 +369,37 @@ const MEDIA_PERMISSIONS: [(u32, Permission); 4] = [
 /// cef_permission_request_types_t, for OnShowPermissionPrompt. Other bits
 /// are `Permission::Other`.
 #[cfg(any(target_os = "macos", test))]
-const PROMPT_PERMISSIONS: [(u32, Permission); 10] = [
+const PROMPT_PERMISSIONS: [(u32, Permission); 29] = [
+    (1, Permission::AugmentedReality),
     (2, Permission::Camera),
     (4, Permission::Camera),
+    (8, Permission::CapturedSurfaceControl),
     (16, Permission::Clipboard),
     (32, Permission::StorageAccess),
+    (64, Permission::DiskQuota),
+    (128, Permission::LocalFonts),
     (256, Permission::Location),
+    (512, Permission::HandTracking),
+    (1024, Permission::IdentityProvider),
+    (2048, Permission::IdleDetection),
     (4096, Permission::Microphone),
     (8192, Permission::Midi),
     (16384, Permission::Downloads),
     (32768, Permission::Notifications),
+    (1 << 16, Permission::KeyboardLock),
+    (1 << 17, Permission::PointerLock),
+    (1 << 18, Permission::ProtectedMedia),
+    (1 << 19, Permission::ProtocolHandler),
     (1 << 20, Permission::StorageAccess),
+    (1 << 21, Permission::VirtualReality),
+    (1 << 22, Permission::AppInstallation),
+    (1 << 23, Permission::WindowManagement),
+    (1 << 24, Permission::FileSystem),
+    // Local network access, before and after Chromium split it in two.
+    (1 << 25, Permission::LocalNetwork),
+    (1 << 26, Permission::LocalNetwork),
+    (1 << 27, Permission::LoopbackNetwork),
+    (1 << 28, Permission::Sensors),
 ];
 
 /// The permissions in a CEF media access bit set.
@@ -361,7 +459,6 @@ pub fn download_file_name(suggested: &str) -> String {
 /// `name` if it isn't `taken`, else the first free "name (1).ext",
 /// "name (2).ext"…, as Chrome numbers them. ".tar.gz" and the like stay
 /// whole.
-#[cfg(any(target_os = "macos", test))]
 pub fn unique_file_name(name: &str, taken: impl Fn(&str) -> bool) -> String {
     if !taken(name) {
         return name.to_owned();
@@ -586,6 +683,34 @@ pub fn navigation_for(url: &str) -> Navigation {
         "mailto" | "tel" | "sms" | "facetime" | "facetime-audio" => Navigation::OpenInApp,
         _ => Navigation::Block,
     }
+}
+
+/// A page's origin as Chromium keeps permissions and site data for it:
+/// scheme, host and any port ("https://meet.example"). `None` for
+/// addresses without a host.
+pub fn site_origin(url: &str) -> Option<String> {
+    let url = gpui::http_client::Url::parse(url).ok()?;
+    url.host_str()?;
+    Some(url.origin().ascii_serialization())
+}
+
+/// Whether `url` is a plain-HTTP page that others on the network could read
+/// or change. This Mac's own servers (localhost, loopback addresses) and
+/// the local network's .local names are trusted, as Chrome trusts them.
+pub fn is_insecure(url: &str) -> bool {
+    let Some(host) = gpui::http_client::Url::parse(url)
+        .ok()
+        .filter(|url| url.scheme() == "http")
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+    else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(address) = host.parse::<std::net::IpAddr>() {
+        return !address.is_loopback();
+    }
+    let host = host.trim_end_matches('.');
+    !(host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local"))
 }
 
 /// How a page asked for a new window (Chromium's window disposition).
@@ -1255,8 +1380,12 @@ mod tests {
             prompt_permissions(4 | 4096 | 32768),
             [Camera, Microphone, Notifications]
         );
-        // Unknown and unnamed bits (window management, idle detection).
-        assert_eq!(prompt_permissions(1 << 23 | 2048 | 16), [Clipboard, Other]);
+        assert_eq!(
+            prompt_permissions(1 << 23 | 2048 | 16),
+            [Clipboard, WindowManagement, IdleDetection]
+        );
+        // Bits Chromium may add later.
+        assert_eq!(prompt_permissions(1 << 30 | 128), [LocalFonts, Other]);
     }
 
     #[test]

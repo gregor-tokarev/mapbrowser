@@ -33,6 +33,9 @@ pub const MIN_SIDEBAR_WIDTH: f32 = 180.;
 pub const MAX_SIDEBAR_WIDTH: f32 = 420.;
 /// Closed Today tabs that ⇧⌘T and the library can bring back.
 pub const REOPEN_LIMIT: usize = 20;
+/// Finished downloads the library keeps, also after a restart. Running
+/// ones are kept on top of these.
+pub const DOWNLOAD_LIMIT: usize = 20;
 
 /// The sidebar section a tab belongs to. Variants are declared in sidebar
 /// order, so sorting by `Pin` groups favorites, pinned tabs, then Today.
@@ -62,6 +65,37 @@ pub struct Tab {
 pub struct ClosedTab {
     pub space_id: SpaceId,
     pub tab: Tab,
+}
+
+/// Where a download stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DownloadState {
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+/// A download as the library lists it, saved so recent downloads are still
+/// listed after a restart.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedDownload {
+    pub name: String,
+    pub path: PathBuf,
+    /// Where it came from, without credentials, to download it again.
+    #[serde(default)]
+    pub url: String,
+    /// The space whose profile downloads it again.
+    #[serde(default)]
+    pub space_id: Option<SpaceId>,
+    pub state: DownloadState,
+    /// Bytes saved, once done.
+    #[serde(default)]
+    pub size: Option<u64>,
+    /// Why it failed, in a few words.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// `tabs` stays grouped by section, so its order is the sidebar order.
@@ -104,6 +138,9 @@ pub struct BrowserState {
     /// can still be undone after a restart.
     #[serde(default)]
     closed: Vec<ClosedTab>,
+    /// Recent downloads, the newest first.
+    #[serde(default)]
+    downloads: Vec<SavedDownload>,
     #[serde(skip, default = "data_dir")]
     storage_dir: PathBuf,
     /// Whether this is the session saved last, read from state.json, rather
@@ -162,6 +199,7 @@ impl Default for BrowserState {
             blocking_exceptions: BTreeSet::new(),
             window: None,
             closed: Vec::new(),
+            downloads: Vec::new(),
             storage_dir: data_dir(),
             from_state_file: false,
         }
@@ -819,6 +857,22 @@ impl BrowserState {
         self.closed.retain(|closed| closed.tab.id != tab_id);
     }
 
+    /// Recent downloads as last saved, the newest first.
+    pub fn downloads(&self) -> &[SavedDownload] {
+        &self.downloads
+    }
+
+    /// Saves the library's downloads, the newest first: every running one
+    /// and the `DOWNLOAD_LIMIT` newest others. True if anything changed.
+    pub fn set_downloads(&mut self, mut downloads: Vec<SavedDownload>) -> bool {
+        trim_downloads(&mut downloads);
+        if self.downloads == downloads {
+            return false;
+        }
+        self.downloads = downloads;
+        true
+    }
+
     fn validate_and_repair(&mut self) -> io::Result<()> {
         if self.schema_version > SCHEMA_VERSION {
             return Err(newer_schema());
@@ -896,8 +950,30 @@ impl BrowserState {
             .iter()
             .filter_map(|host| normalize_host(host))
             .collect();
+        // A download still running when the app last stopped (a crash, a
+        // quit from the Dock) never finished.
+        for download in &mut self.downloads {
+            if download.state == DownloadState::Running {
+                download.state = DownloadState::Failed;
+                download.error = Some("Interrupted".into());
+            }
+            download.url = display_url(&download.url);
+        }
+        trim_downloads(&mut self.downloads);
         Ok(())
     }
+}
+
+/// Keeps every running download and the `DOWNLOAD_LIMIT` newest others.
+fn trim_downloads(downloads: &mut Vec<SavedDownload>) {
+    let mut others = 0;
+    downloads.retain(|download| {
+        if download.state == DownloadState::Running {
+            return true;
+        }
+        others += 1;
+        others <= DOWNLOAD_LIMIT
+    });
 }
 
 fn clamp_sidebar_width(width: f32) -> f32 {

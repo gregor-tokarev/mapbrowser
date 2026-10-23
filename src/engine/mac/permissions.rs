@@ -1,8 +1,9 @@
 //! Camera, microphone, screen, location and other permission requests go
 //! to the shell, which asks the user. With Alloy style and no handler CEF
-//! denies media access and ignores every other prompt.
+//! denies media access and ignores every other prompt. The site menu reads
+//! and resets the answers Chromium keeps in each space's profile.
 
-use super::BrowserLink;
+use super::{BrowserLink, Engine};
 use crate::engine::{
     EngineEvent, Permission, PermissionDecision, media_permissions, prompt_permissions,
 };
@@ -21,17 +22,109 @@ const _: () = {
     assert!(Media::CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE as u32 == 2);
     assert!(Media::CEF_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE as u32 == 4);
     assert!(Media::CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE as u32 == 8);
+    assert!(Prompt::CEF_PERMISSION_TYPE_AR_SESSION as u32 == 1);
     assert!(Prompt::CEF_PERMISSION_TYPE_CAMERA_PAN_TILT_ZOOM as u32 == 2);
     assert!(Prompt::CEF_PERMISSION_TYPE_CAMERA_STREAM as u32 == 4);
+    assert!(Prompt::CEF_PERMISSION_TYPE_CAPTURED_SURFACE_CONTROL as u32 == 8);
     assert!(Prompt::CEF_PERMISSION_TYPE_CLIPBOARD as u32 == 16);
     assert!(Prompt::CEF_PERMISSION_TYPE_TOP_LEVEL_STORAGE_ACCESS as u32 == 32);
+    assert!(Prompt::CEF_PERMISSION_TYPE_DISK_QUOTA as u32 == 64);
+    assert!(Prompt::CEF_PERMISSION_TYPE_LOCAL_FONTS as u32 == 128);
     assert!(Prompt::CEF_PERMISSION_TYPE_GEOLOCATION as u32 == 256);
+    assert!(Prompt::CEF_PERMISSION_TYPE_HAND_TRACKING as u32 == 512);
+    assert!(Prompt::CEF_PERMISSION_TYPE_IDENTITY_PROVIDER as u32 == 1024);
+    assert!(Prompt::CEF_PERMISSION_TYPE_IDLE_DETECTION as u32 == 2048);
     assert!(Prompt::CEF_PERMISSION_TYPE_MIC_STREAM as u32 == 4096);
     assert!(Prompt::CEF_PERMISSION_TYPE_MIDI_SYSEX as u32 == 8192);
     assert!(Prompt::CEF_PERMISSION_TYPE_MULTIPLE_DOWNLOADS as u32 == 16384);
     assert!(Prompt::CEF_PERMISSION_TYPE_NOTIFICATIONS as u32 == 32768);
+    assert!(Prompt::CEF_PERMISSION_TYPE_KEYBOARD_LOCK as u32 == 1 << 16);
+    assert!(Prompt::CEF_PERMISSION_TYPE_POINTER_LOCK as u32 == 1 << 17);
+    assert!(Prompt::CEF_PERMISSION_TYPE_PROTECTED_MEDIA_IDENTIFIER as u32 == 1 << 18);
+    assert!(Prompt::CEF_PERMISSION_TYPE_REGISTER_PROTOCOL_HANDLER as u32 == 1 << 19);
     assert!(Prompt::CEF_PERMISSION_TYPE_STORAGE_ACCESS as u32 == 1 << 20);
+    assert!(Prompt::CEF_PERMISSION_TYPE_VR_SESSION as u32 == 1 << 21);
+    assert!(Prompt::CEF_PERMISSION_TYPE_WEB_APP_INSTALLATION as u32 == 1 << 22);
+    assert!(Prompt::CEF_PERMISSION_TYPE_WINDOW_MANAGEMENT as u32 == 1 << 23);
+    assert!(Prompt::CEF_PERMISSION_TYPE_FILE_SYSTEM_ACCESS as u32 == 1 << 24);
+    assert!(Prompt::CEF_PERMISSION_TYPE_LOCAL_NETWORK_ACCESS_DEPRECATED as u32 == 1 << 25);
+    assert!(Prompt::CEF_PERMISSION_TYPE_LOCAL_NETWORK as u32 == 1 << 26);
+    assert!(Prompt::CEF_PERMISSION_TYPE_LOOPBACK_NETWORK as u32 == 1 << 27);
+    assert!(Prompt::CEF_PERMISSION_TYPE_SENSORS as u32 == 1 << 28);
 };
+
+/// The content settings the site menu lists and resets. Each one asks by
+/// default, so an Allow or Block found for a site is an answer someone
+/// gave; settings that allow by default (sensors) would list every site.
+const SITE_SETTINGS: [(ContentSettingTypes, Permission); 10] = [
+    (ContentSettingTypes::MEDIASTREAM_CAMERA, Permission::Camera),
+    (ContentSettingTypes::MEDIASTREAM_MIC, Permission::Microphone),
+    (ContentSettingTypes::GEOLOCATION, Permission::Location),
+    (
+        ContentSettingTypes::NOTIFICATIONS,
+        Permission::Notifications,
+    ),
+    (
+        ContentSettingTypes::CLIPBOARD_READ_WRITE,
+        Permission::Clipboard,
+    ),
+    (ContentSettingTypes::MIDI_SYSEX, Permission::Midi),
+    (
+        ContentSettingTypes::AUTOMATIC_DOWNLOADS,
+        Permission::Downloads,
+    ),
+    (ContentSettingTypes::LOCAL_FONTS, Permission::LocalFonts),
+    (
+        ContentSettingTypes::WINDOW_MANAGEMENT,
+        Permission::WindowManagement,
+    ),
+    (
+        ContentSettingTypes::IDLE_DETECTION,
+        Permission::IdleDetection,
+    ),
+];
+
+impl Engine {
+    /// What the space's profile keeps for the site at `origin`: each
+    /// permission it allows (true) or blocks. Empty for a space whose
+    /// profile isn't open: none of its pages was shown this session.
+    pub fn site_permissions(&self, space_id: u64, origin: &str) -> Vec<(Permission, bool)> {
+        let Some(context) = self.contexts.get(&space_id) else {
+            return Vec::new();
+        };
+        let url = CefString::from(origin);
+        SITE_SETTINGS
+            .iter()
+            .filter_map(|&(kind, permission)| {
+                let value = context.content_setting(Some(&url), Some(&url), kind);
+                if value == ContentSettingValues::ALLOW {
+                    Some((permission, true))
+                } else if value == ContentSettingValues::BLOCK {
+                    Some((permission, false))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Forgets the profile's answer for `permission` at `origin`: the site
+    /// asks again next time.
+    pub fn reset_site_permission(&mut self, space_id: u64, origin: &str, permission: Permission) {
+        let Ok(context) = self.space_context(space_id) else {
+            return;
+        };
+        let url = CefString::from(origin);
+        for &(kind, _) in SITE_SETTINGS.iter().filter(|(_, kept)| *kept == permission) {
+            context.set_content_setting(
+                Some(&url),
+                Some(&url),
+                kind,
+                ContentSettingValues::DEFAULT,
+            );
+        }
+    }
+}
 
 /// Requests waiting for the user, shared by every browser's handler and
 /// the engine. Callbacks run on the UI thread, where a prompt's answer can

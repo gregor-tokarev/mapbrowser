@@ -1,9 +1,13 @@
-//! Popover menus for tabs, spaces, the library and "+". They are drawn in
-//! GPUI and kept inside the sidebar, where no native web view covers them.
+//! Popover menus for tabs, spaces, the library, the site by the address and
+//! "+". They are drawn in GPUI and kept inside the sidebar, where no native
+//! web view covers them.
 
 use super::{
+    Tooltip,
     downloads::DownloadState,
+    elide::{Cut, elided},
     icons::{Icon, icon},
+    permissions::{permission_icon, permission_name},
     press_only, shadow,
     sidebar::space_icons,
     theme::Theme,
@@ -11,12 +15,14 @@ use super::{
 };
 use crate::{
     app::BrowserApp,
+    engine::{Permission, Shortcut, is_insecure, site_origin},
+    favicons::host_of,
     model::{Pin, SpaceId, THEME_COUNT, TabId},
 };
 use gpui::{
-    AnyElement, Bounds, Context, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, Point, SharedString, Size, StatefulInteractiveElement, StyleRefinement,
-    Styled, Window, deferred, div, point, prelude::FluentBuilder, px,
+    AnyElement, Bounds, ClickEvent, Context, FontWeight, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, Pixels, Point, SharedString, Size, StatefulInteractiveElement,
+    StyleRefinement, Styled, Window, deferred, div, point, prelude::FluentBuilder, px,
 };
 
 const PADDING: f32 = 5.;
@@ -29,7 +35,13 @@ const ICONS_PER_ROW: usize = 7;
 /// A question: its title line and two lines of explanation.
 const PROMPT_HEIGHT: f32 = 64.;
 const CONFIRM_HEIGHT: f32 = 32.;
-const CLOSED_LIMIT: usize = 10;
+/// A download: its name, and its progress or how it ended below.
+const DOWNLOAD_HEIGHT: f32 = 40.;
+/// The site menu's first row: the host, and a warning line for plain HTTP.
+const SITE_HEIGHT: f32 = 28.;
+const SITE_WARNING_HEIGHT: f32 = 16.;
+const PERMISSION_HEIGHT: f32 = 28.;
+const ZOOM_HEIGHT: f32 = 30.;
 /// Distance the menu keeps from the sidebar's edges.
 const EDGE: f32 = 6.;
 /// Distance between a tab's row and its menu.
@@ -41,13 +53,18 @@ pub enum MenuKind {
     Space(SpaceId),
     /// The bottom bar's "+".
     Plus,
-    /// This session's downloads and the recently closed tabs, from the
-    /// library button.
+    /// Recent downloads and the recently closed tabs, from the library
+    /// button.
     Library,
     /// Asks before deleting a space, in place of the space menu.
     DeleteSpace(SpaceId),
     /// The spaces a tab can move to, in place of the tab menu.
     MoveTab(TabId),
+    /// The site the tab shows, from the shield by the address: blocking,
+    /// permissions, zoom and its data in this space.
+    Site(TabId),
+    /// Asks before clearing the site's data, in place of the site menu.
+    ClearSiteData(TabId),
 }
 
 pub struct OpenMenu {
@@ -78,9 +95,18 @@ enum Action {
     AskDeleteSpace(SpaceId),
     DeleteSpace(SpaceId),
     RevealDownload(u64),
+    CancelDownload(u64),
+    RetryDownload(u64),
     /// "Move to Space ›": the menu lists the spaces.
     AskMoveTab(TabId),
     MoveTab(TabId, SpaceId),
+    ToggleBlocking(TabId),
+    ResetPermission(TabId, Permission),
+    /// The page zoom a step in, out or back to 100%.
+    Zoom(Shortcut),
+    /// "Clear Site Data…": the menu asks first.
+    AskClearSiteData(TabId),
+    ClearSiteData(TabId),
 }
 
 enum Entry {
@@ -108,13 +134,37 @@ enum Entry {
         label: &'static str,
         action: Action,
     },
-    /// A download; finished and running ones show in Finder when clicked.
+    /// A download, with × while it runs and ↻ once stopped; finished ones
+    /// show in Finder when clicked.
     Download {
         id: u64,
         name: SharedString,
-        status: Option<String>,
-        failed: bool,
+        status: String,
+        state: DownloadState,
+        missing: bool,
+        can_retry: bool,
     },
+    /// The site a site menu is about, and whether its connection is plain
+    /// HTTP.
+    Site {
+        host: String,
+        origin: String,
+        insecure: bool,
+    },
+    /// A setting, with a check mark while it is on.
+    Check {
+        label: &'static str,
+        checked: bool,
+        action: Action,
+    },
+    /// A permission the site was given or refused, with Reset.
+    Permission {
+        permission: Permission,
+        allowed: bool,
+        action: Action,
+    },
+    /// The page's zoom, with − and +; the percentage resets it.
+    Zoom(u32),
     /// A space, with its icon or its theme's dot.
     Space {
         name: SharedString,
@@ -149,9 +199,15 @@ impl Entry {
             Entry::Item { .. }
             | Entry::Closed { .. }
             | Entry::Empty(_)
-            | Entry::Download { .. }
+            | Entry::Check { .. }
             | Entry::Space { .. }
             | Entry::Note(_) => ITEM_HEIGHT,
+            Entry::Download { .. } => DOWNLOAD_HEIGHT,
+            Entry::Site { insecure, .. } => {
+                SITE_HEIGHT + if *insecure { SITE_WARNING_HEIGHT } else { 0. }
+            }
+            Entry::Permission { .. } => PERMISSION_HEIGHT,
+            Entry::Zoom(_) => ZOOM_HEIGHT,
             Entry::Separator => SEPARATOR_HEIGHT,
             Entry::Header(_) => HEADER_HEIGHT,
             Entry::Swatches(..) => SWATCH_ROW_HEIGHT,
@@ -286,30 +342,106 @@ impl BrowserApp {
                 Entry::item("New Space", "", Action::NewSpace),
             ],
             MenuKind::Library => {
-                let mut entries = Vec::new();
-                let downloads = self.downloads.recent().map(|download| Entry::Download {
-                    id: download.id,
-                    name: download.name.clone(),
-                    status: download.status(),
-                    failed: download.state == DownloadState::Failed,
-                });
-                entries.extend(downloads);
-                if !entries.is_empty() {
-                    entries.insert(0, Entry::Header("Downloads"));
-                    entries.push(Entry::Separator);
+                let mut entries = vec![Entry::Header("Downloads")];
+                let downloads: Vec<Entry> = self
+                    .downloads
+                    .listed()
+                    .map(|download| Entry::Download {
+                        id: download.id,
+                        name: download.name.clone(),
+                        status: download.status(),
+                        state: download.state,
+                        missing: download.missing,
+                        can_retry: download.can_retry()
+                            && download
+                                .space_id
+                                .is_some_and(|id| self.state.space(id).is_some()),
+                    })
+                    .collect();
+                if downloads.is_empty() {
+                    entries.push(Entry::Empty("No downloads yet"));
                 }
-                entries.push(Entry::Header("Recently Closed"));
+                entries.extend(downloads);
+                entries.extend([Entry::Separator, Entry::Header("Recently Closed")]);
+                // Every tab ⇧⌘T can still bring back, the most recent first.
                 let closed = self.state.closed_tabs();
-                entries.extend(closed.iter().enumerate().rev().take(CLOSED_LIMIT).map(
-                    |(index, closed)| Entry::Closed {
+                entries.extend(closed.iter().enumerate().rev().map(|(index, closed)| {
+                    Entry::Closed {
                         index,
                         title: closed.tab.title.clone().into(),
-                    },
-                ));
+                    }
+                }));
                 if closed.is_empty() {
                     entries.push(Entry::Empty("No recently closed tabs"));
                 }
                 entries
+            }
+            MenuKind::Site(id) => {
+                let Some((url, host)) = self
+                    .state
+                    .tab(id)
+                    .and_then(|tab| Some((tab.url.clone(), host_of(&tab.url)?)))
+                else {
+                    return Vec::new();
+                };
+                let mut entries = vec![
+                    Entry::Site {
+                        host: host.clone(),
+                        origin: site_origin(&url).unwrap_or_default(),
+                        insecure: is_insecure(&url),
+                    },
+                    Entry::Separator,
+                    Entry::Check {
+                        label: "Block Ads and Trackers",
+                        checked: !self.state.is_blocking_disabled(&host),
+                        action: Action::ToggleBlocking(id),
+                    },
+                    Entry::Separator,
+                    Entry::Header("Permissions"),
+                ];
+                let permissions = self.site_permissions(id);
+                if permissions.is_empty() {
+                    entries.push(Entry::Empty("Nothing allowed or blocked"));
+                }
+                entries.extend(permissions.into_iter().map(|(permission, allowed)| {
+                    Entry::Permission {
+                        permission,
+                        allowed,
+                        action: Action::ResetPermission(id, permission),
+                    }
+                }));
+                if let Some(percent) = self.engine.borrow().zoom_percent(id) {
+                    entries.extend([Entry::Separator, Entry::Zoom(percent)]);
+                }
+                entries.extend([
+                    Entry::Separator,
+                    Entry::item("Clear Site Data…", "", Action::AskClearSiteData(id)),
+                ]);
+                entries
+            }
+            MenuKind::ClearSiteData(id) => {
+                let Some((url, host)) = self
+                    .state
+                    .tab(id)
+                    .and_then(|tab| Some((tab.url.clone(), host_of(&tab.url)?)))
+                else {
+                    return Vec::new();
+                };
+                vec![
+                    Entry::Site {
+                        host,
+                        origin: site_origin(&url).unwrap_or_default(),
+                        insecure: false,
+                    },
+                    Entry::Prompt {
+                        title: "Clear this site's data?".into(),
+                        detail: "It signs you out of the site in this space and reloads the page.",
+                    },
+                    Entry::Confirm {
+                        label: "Clear",
+                        action: Action::ClearSiteData(id),
+                    },
+                ]
             }
             MenuKind::DeleteSpace(id) => {
                 let Some(space) = self.state.space(id) else {
@@ -359,10 +491,13 @@ impl BrowserApp {
         let width: f32 = match menu.kind {
             MenuKind::Tab(_) | MenuKind::Plus | MenuKind::MoveTab(_) => 200.,
             MenuKind::Space(_) | MenuKind::Library | MenuKind::DeleteSpace(_) => 212.,
+            MenuKind::Site(_) | MenuKind::ClearSiteData(_) => 236.,
         };
         let width = width.min(sidebar - 2. * EDGE);
         let entries = self.menu_entries(menu.kind);
-        let height = 2. * PADDING + entries.iter().map(Entry::height).sum::<f32>();
+        // A long menu (the library) scrolls within the window's height.
+        let height = (2. * PADDING + entries.iter().map(Entry::height).sum::<f32>())
+            .min(f32::from(viewport.height) - 2. * EDGE);
         let origin = place(
             menu.anchor,
             menu.above,
@@ -376,9 +511,9 @@ impl BrowserApp {
             .left(origin.x)
             .top(origin.y)
             .w(px(width))
+            .h(px(height))
+            .overflow_y_scroll()
             .p(px(PADDING))
-            .flex()
-            .flex_col()
             .rounded(px(8.))
             .bg(theme.surface())
             .border_1()
@@ -386,11 +521,13 @@ impl BrowserApp {
             .shadow(vec![shadow(6., 24., 0.18)])
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .children(
-                entries
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, entry)| self.render_entry(index, entry, theme, cx)),
+            .child(
+                div().flex_none().flex().flex_col().children(
+                    entries
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, entry)| self.render_entry(index, entry, theme, cx)),
+                ),
             );
         // Behind the menu: a press anywhere else closes it.
         deferred(
@@ -479,34 +616,271 @@ impl BrowserApp {
                 id,
                 name,
                 status,
-                failed,
+                state,
+                missing,
+                can_retry,
             } => {
                 let muted = theme.tertiary();
                 let highlighted =
                     |style: StyleRefinement| style.text_color(gpui::white().opacity(0.8));
-                // A failed download has nothing to show in Finder.
-                item(2000 + index, !failed)
+                // Only a file that is there shows in Finder.
+                let reveal = state == DownloadState::Done && !missing;
+                let status_color = if state == DownloadState::Failed {
+                    theme.danger()
+                } else {
+                    muted
+                };
+                let button = match state {
+                    DownloadState::Running => Some((
+                        "download-cancel",
+                        Icon::Close,
+                        "Cancel Download",
+                        Action::CancelDownload(id),
+                    )),
+                    DownloadState::Failed | DownloadState::Cancelled if can_retry => Some((
+                        "download-retry",
+                        Icon::Reload,
+                        "Download Again",
+                        Action::RetryDownload(id),
+                    )),
+                    _ => None,
+                };
+                let sidebar = self.sidebar_width().unwrap_or_default();
+                let hover = theme.hover();
+                div()
+                    .id(("download", id))
+                    .group("download")
+                    .flex()
+                    .items_center()
                     .gap(px(8.))
-                    .when(!failed, |row| {
-                        row.on_click(cx.listener(move |this, _, window, cx| {
-                            this.run_menu_action(Action::RevealDownload(id), window, cx)
-                        }))
+                    .h(px(DOWNLOAD_HEIGHT))
+                    .pl(px(9.))
+                    .pr(px(4.))
+                    .rounded(px(5.))
+                    .text_color(theme.title())
+                    // The whole name: the row cuts long ones in the middle.
+                    .tooltip(Tooltip::build_wrapping(name.clone(), theme, sidebar))
+                    .when(reveal, |row| {
+                        row.hover(move |style| style.bg(focus).text_color(gpui::white()))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.run_menu_action(Action::RevealDownload(id), window, cx)
+                            }))
                     })
                     .child(
-                        icon(Icon::File, 14., muted)
-                            .when(!failed, |icon| icon.group_hover("menu-item", highlighted)),
+                        icon(Icon::File, 16., muted)
+                            .when(reveal, |icon| icon.group_hover("download", highlighted)),
                     )
-                    .child(truncated(name).flex_1().min_w_0())
-                    .children(status.map(|status| {
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(elided(name, Cut::Middle, 17.).text_size(px(13.)))
+                            .child(
+                                truncated(status)
+                                    .text_size(px(11.5))
+                                    .line_height(px(15.))
+                                    .text_color(status_color)
+                                    .when(reveal, |status| {
+                                        status.group_hover("download", highlighted)
+                                    }),
+                            ),
+                    )
+                    .children(button.map(|(button_id, glyph, label, action)| {
+                        press_only(
+                            div()
+                                .id(button_id)
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .size(px(24.))
+                                .rounded(px(6.))
+                                .hover(move |style| style.bg(hover))
+                                .child(icon(glyph, 15., theme.icon())),
+                        )
+                        .tooltip(Tooltip::build(label, "", theme, sidebar))
+                        .on_click(cx.listener(
+                            move |this, _: &ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.run_menu_action(action, window, cx)
+                            },
+                        ))
+                    }))
+                    .into_any_element()
+            }
+            Entry::Site {
+                host,
+                origin,
+                insecure,
+            } => {
+                let sidebar = self.sidebar_width().unwrap_or_default();
+                let danger = theme.danger();
+                div()
+                    .id("site")
+                    .flex()
+                    .flex_col()
+                    .px(px(9.))
+                    // The whole origin: the line keeps the end of a long host.
+                    .tooltip(Tooltip::build_wrapping(origin, theme, sidebar))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(7.))
+                            .h(px(SITE_HEIGHT))
+                            .child(icon(Icon::Globe, 15., theme.icon()))
+                            .child(
+                                elided(host, Cut::Start, 18.)
+                                    .flex_1()
+                                    .text_size(px(13.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.title()),
+                            ),
+                    )
+                    .when(insecure, |site| {
+                        site.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .h(px(SITE_WARNING_HEIGHT))
+                                .mt(px(-4.))
+                                .text_size(px(11.5))
+                                .text_color(danger)
+                                .child(icon(Icon::LockOpen, 12., danger))
+                                .child("Connection isn't secure"),
+                        )
+                    })
+                    .into_any_element()
+            }
+            Entry::Check {
+                label,
+                checked,
+                action,
+            } => item(index, true)
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .size(px(14.))
+                        .when(checked, |slot| {
+                            slot.child(
+                                icon(Icon::Check, 14., focus).group_hover("menu-item", |style| {
+                                    style.text_color(gpui::white())
+                                }),
+                            )
+                        }),
+                )
+                .child(div().flex_1().child(label))
+                .on_click(
+                    cx.listener(move |this, _, window, cx| {
+                        this.run_menu_action(action, window, cx)
+                    }),
+                )
+                .into_any_element(),
+            Entry::Permission {
+                permission,
+                allowed,
+                action,
+            } => {
+                let sidebar = self.sidebar_width().unwrap_or_default();
+                let hover = theme.hover();
+                div()
+                    .id(("permission", index))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .h(px(PERMISSION_HEIGHT))
+                    .pl(px(9.))
+                    .pr(px(4.))
+                    .text_size(px(13.))
+                    .text_color(theme.title())
+                    .child(icon(permission_icon(permission), 14., theme.icon()))
+                    .child(truncated(permission_name(permission)).flex_1().min_w_0())
+                    .child(
                         div()
                             .flex_none()
                             .text_size(px(11.5))
-                            .text_color(muted)
-                            .when(!failed, |status| {
-                                status.group_hover("menu-item", highlighted)
+                            .text_color(if allowed {
+                                theme.tertiary()
+                            } else {
+                                theme.danger()
                             })
-                            .child(status)
+                            .child(if allowed { "Allowed" } else { "Blocked" }),
+                    )
+                    .child(
+                        press_only(
+                            div()
+                                .id("reset-permission")
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .size(px(24.))
+                                .rounded(px(6.))
+                                .hover(move |style| style.bg(hover))
+                                .child(icon(Icon::Reopen, 14., theme.icon())),
+                        )
+                        // Asked again next time.
+                        .tooltip(Tooltip::build("Reset", "", theme, sidebar))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| this.run_menu_action(action, window, cx),
+                        )),
+                    )
+                    .into_any_element()
+            }
+            Entry::Zoom(percent) => {
+                let sidebar = self.sidebar_width().unwrap_or_default();
+                let hover = theme.hover();
+                let button = |id: &'static str, shortcut: Shortcut| {
+                    press_only(
+                        div()
+                            .id(id)
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .h(px(24.))
+                            .rounded(px(6.))
+                            .hover(move |style| style.bg(hover)),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.run_menu_action(Action::Zoom(shortcut), window, cx)
                     }))
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.))
+                    .h(px(ZOOM_HEIGHT))
+                    .pl(px(9.))
+                    .pr(px(4.))
+                    .text_size(px(13.))
+                    .text_color(theme.title())
+                    .child(div().flex_1().child("Zoom"))
+                    .child(
+                        button("zoom-out", Shortcut::ZoomOut)
+                            .w(px(24.))
+                            .tooltip(Tooltip::build("Zoom Out", "⌘−", theme, sidebar))
+                            .child(icon(Icon::Minus, 15., theme.icon())),
+                    )
+                    .child(
+                        button("zoom-reset", Shortcut::ZoomReset)
+                            .min_w(px(48.))
+                            .px(px(6.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .tooltip(Tooltip::build("Actual Size", "⌘0", theme, sidebar))
+                            .child(format!("{percent}%")),
+                    )
+                    .child(
+                        button("zoom-in", Shortcut::ZoomIn)
+                            .w(px(24.))
+                            .tooltip(Tooltip::build("Zoom In", "⌘+", theme, sidebar))
+                            .child(icon(Icon::Plus, 15., theme.icon())),
+                    )
                     .into_any_element()
             }
             Entry::Separator => div()
@@ -702,11 +1076,22 @@ impl BrowserApp {
         let next = match action {
             Action::AskDeleteSpace(id) => Some(MenuKind::DeleteSpace(id)),
             Action::AskMoveTab(id) => Some(MenuKind::MoveTab(id)),
+            Action::AskClearSiteData(id) => Some(MenuKind::ClearSiteData(id)),
             _ => None,
         };
         if let (Some(kind), Some(menu)) = (next, &mut self.menu) {
             menu.kind = kind;
             return cx.notify();
+        }
+        // The menu shows these changes as they happen, so it stays.
+        match action {
+            Action::CancelDownload(id) => return self.cancel_download(id),
+            Action::RetryDownload(id) => return self.retry_download(id, cx),
+            Action::ResetPermission(tab_id, permission) => {
+                return self.reset_site_permission(tab_id, permission, cx);
+            }
+            Action::Zoom(shortcut) => return self.shortcut(shortcut, window, cx),
+            _ => {}
         }
         self.close_menu(cx);
         match action {
@@ -726,10 +1111,20 @@ impl BrowserApp {
                 self.toggle_command_bar(super::command_bar::CommandMode::NewTab, window, cx)
             }
             Action::Reopen(index) => self.reopen_closed(Some(index), window, cx),
-            Action::AskDeleteSpace(_) | Action::AskMoveTab(_) => {}
+            Action::AskDeleteSpace(_) | Action::AskMoveTab(_) | Action::AskClearSiteData(_) => {}
             Action::DeleteSpace(id) => self.delete_space(id, window, cx),
             Action::RevealDownload(id) => self.reveal_download(id),
+            Action::CancelDownload(_)
+            | Action::RetryDownload(_)
+            | Action::ResetPermission(..)
+            | Action::Zoom(_) => {}
             Action::MoveTab(id, space_id) => self.move_tab_to_space(id, space_id, cx),
+            Action::ToggleBlocking(id) => {
+                if let Some(host) = self.state.tab(id).and_then(|tab| host_of(&tab.url)) {
+                    self.toggle_blocking(&host, cx);
+                }
+            }
+            Action::ClearSiteData(id) => self.clear_site_data(id, cx),
         }
     }
 }

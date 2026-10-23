@@ -5,11 +5,21 @@
 //!
 //! Addresses containing "download-demo" download a file instead (one with
 //! "fail" fails halfway), and pages whose address contains
-//! "permission-demo" ask to use the camera and microphone ("location" or
-//! "notifications" in the address ask for those). On pages whose address
-//! contains "status-demo" the pointer rests on a long link.
+//! "permission-demo" ask to use the camera and microphone ("location",
+//! "notifications", "fonts", "windows", "network" or "midi" in the address
+//! ask for those). On pages whose address contains "status-demo" the
+//! pointer rests on a long link.
+//!
+//! Demo downloads end up as small placeholder files in the data
+//! directory's "Downloads" folder, never in the user's own, so the library
+//! can show files that are there or gone. Answers to permissions Chromium
+//! keeps (location, notifications…) are kept per space and site for the
+//! site menu, as a profile would.
 
-use super::{EngineEvent, Permission, PermissionDecision, ZoomStep, step_zoom};
+use super::{
+    DownloadEnd, EngineEvent, Permission, PermissionDecision, ZoomStep, site_origin, step_zoom,
+    unique_file_name,
+};
 use crate::blocker::ContentBlocker;
 use anyhow::Result;
 use async_channel::{Receiver, Sender};
@@ -18,7 +28,8 @@ use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     ffi::c_void,
-    path::Path,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -33,13 +44,27 @@ pub struct Engine {
     events: Sender<EngineEvent>,
     pages: RefCell<HashMap<u64, History>>,
     next_id: Cell<u64>,
-    /// Unanswered permission requests and their tabs.
-    permission_requests: RefCell<HashMap<u64, u64>>,
+    /// Unanswered permission requests.
+    permission_requests: RefCell<HashMap<u64, Request>>,
+    /// What each space's stand-in profile keeps: (space, origin) to answers.
+    site_settings: RefCell<HashMap<(u64, String), Vec<(Permission, bool)>>>,
+    /// Where demo downloads are saved.
+    downloads_dir: PathBuf,
+    /// Demo downloads in progress, by id, with the file each will write.
+    downloads: Arc<Mutex<HashMap<u64, PathBuf>>>,
+}
+
+struct Request {
+    tab_id: u64,
+    origin: String,
+    permissions: Vec<Permission>,
 }
 
 struct History {
     entries: Vec<String>,
     index: usize,
+    /// The space whose stand-in profile the page uses.
+    space_id: u64,
     /// Page zoom in percent.
     zoom: u32,
     /// The selected find match, 1-based; 0 without one.
@@ -124,13 +149,16 @@ fn percent_decode(text: &str) -> String {
 }
 
 impl Engine {
-    pub fn initialize(_data_dir: &Path) -> Result<(Self, Receiver<EngineEvent>)> {
+    pub fn initialize(data_dir: &Path) -> Result<(Self, Receiver<EngineEvent>)> {
         let (events, receiver) = async_channel::unbounded();
         let engine = Self {
             events,
             pages: RefCell::default(),
             next_id: Cell::new(0),
             permission_requests: RefCell::default(),
+            site_settings: RefCell::default(),
+            downloads_dir: data_dir.join("Downloads"),
+            downloads: Arc::default(),
         };
         Ok((engine, receiver))
     }
@@ -140,7 +168,7 @@ impl Engine {
         Ok(())
     }
 
-    pub fn create_tab(&mut self, tab_id: u64, _workspace_id: u64, url: &str) -> Result<()> {
+    pub fn create_tab(&mut self, tab_id: u64, workspace_id: u64, url: &str) -> Result<()> {
         if self.has_tab(tab_id) {
             self.navigate(tab_id, url);
             return Ok(());
@@ -155,6 +183,7 @@ impl Engine {
                     vec![url.to_owned()]
                 },
                 index: 0,
+                space_id: workspace_id,
                 zoom: 100,
                 find_active: 0,
             },
@@ -221,6 +250,11 @@ impl Engine {
         Some(page.zoom)
     }
 
+    /// The tab's zoom in percent. Previews keep it per tab, not per site.
+    pub fn zoom_percent(&self, tab_id: u64) -> Option<u32> {
+        self.pages.borrow().get(&tab_id).map(|page| page.zoom)
+    }
+
     pub fn toggle_dev_tools(&self, _tab_id: u64) {}
 
     /// Previews have no print panel.
@@ -285,8 +319,88 @@ impl Engine {
         }
     }
 
-    pub fn respond_permission(&self, id: u64, _decision: PermissionDecision) {
-        self.permission_requests.borrow_mut().remove(&id);
+    /// Like Chromium, keeps Allow and Block for the permissions it keeps
+    /// (all but camera, microphone and the screen) in the tab's space.
+    pub fn respond_permission(&self, id: u64, decision: PermissionDecision) {
+        let Some(request) = self.permission_requests.borrow_mut().remove(&id) else {
+            return;
+        };
+        let space_id = self
+            .pages
+            .borrow()
+            .get(&request.tab_id)
+            .map(|page| page.space_id);
+        let (Some(space_id), Some(origin)) = (space_id, site_origin(&request.origin)) else {
+            return;
+        };
+        if decision == PermissionDecision::Dismiss {
+            return;
+        }
+        let mut settings = self.site_settings.borrow_mut();
+        let kept = settings.entry((space_id, origin)).or_default();
+        for &permission in &request.permissions {
+            if matches!(
+                permission,
+                Permission::Camera | Permission::Microphone | Permission::Screen
+            ) {
+                continue;
+            }
+            kept.retain(|&(known, _)| known != permission);
+            kept.push((permission, decision == PermissionDecision::Allow));
+        }
+    }
+
+    /// What the space's stand-in profile keeps for the site at `origin`.
+    pub fn site_permissions(&self, space_id: u64, origin: &str) -> Vec<(Permission, bool)> {
+        site_origin(origin)
+            .and_then(|origin| {
+                self.site_settings
+                    .borrow()
+                    .get(&(space_id, origin))
+                    .cloned()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn reset_site_permission(&mut self, space_id: u64, origin: &str, permission: Permission) {
+        let Some(origin) = site_origin(origin) else {
+            return;
+        };
+        if let Some(kept) = self.site_settings.borrow_mut().get_mut(&(space_id, origin)) {
+            kept.retain(|&(known, _)| known != permission);
+        }
+    }
+
+    /// Previews keep no cookies or storage: the page just reloads, as it
+    /// does on macOS once its data is gone.
+    pub fn clear_site_data(&mut self, _space_id: u64, tab_id: u64, _origin: &str) {
+        self.load(tab_id);
+    }
+
+    /// Cancels a demo download: it ends at once, and its thread stops at
+    /// its next step.
+    pub fn cancel_download(&self, id: u64) {
+        if self
+            .downloads
+            .lock()
+            .expect("demo downloads")
+            .remove(&id)
+            .is_some()
+        {
+            self.send(EngineEvent::DownloadFinished {
+                id,
+                end: DownloadEnd::Cancelled,
+            });
+        }
+    }
+
+    /// Downloads `url` again from the tab's page. False without a page.
+    pub fn start_download(&self, tab_id: u64, url: &str) -> bool {
+        if !self.has_tab(tab_id) {
+            return false;
+        }
+        self.download(tab_id, url, false);
+        true
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
@@ -358,7 +472,8 @@ impl Engine {
     }
 
     /// Downloads the demo file from `url` (named after its last path
-    /// segment) in steps on another thread, as Chromium reports progress.
+    /// segment, numbered when taken) in steps on another thread, as
+    /// Chromium reports progress, and saves a placeholder file at the end.
     fn download(&self, tab_id: u64, url: &str, blank_tab: bool) {
         let id = self.next_id();
         let name = Url::parse(url)
@@ -366,52 +481,118 @@ impl Engine {
             .and_then(|url| Some(percent_decode(url.path_segments()?.next_back()?)))
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "download-demo".to_owned());
-        let path = dirs::download_dir().unwrap_or_default().join(&name);
+        let path = {
+            let mut downloads = self.downloads.lock().expect("demo downloads");
+            let name = unique_file_name(&name, |name| {
+                let path = self.downloads_dir.join(name);
+                path.exists() || downloads.values().any(|taken| *taken == path)
+            });
+            let path = self.downloads_dir.join(name);
+            downloads.insert(id, path.clone());
+            path
+        };
         self.send(EngineEvent::DownloadStarted {
             id,
             tab_id,
-            name,
+            name: path
+                .file_name()
+                .map_or(name, |name| name.to_string_lossy().into_owned()),
             path,
+            url: url.to_owned(),
             blank_tab,
         });
-        let (events, fails) = (self.events.clone(), url.contains("fail"));
+        let (events, fails, downloads) = (
+            self.events.clone(),
+            url.contains("fail"),
+            self.downloads.clone(),
+        );
         std::thread::spawn(move || {
+            // A cancelled download is no longer listed: its thread stops.
+            let take = || downloads.lock().expect("demo downloads").remove(&id);
             for step in 1..=DOWNLOAD_STEPS {
                 std::thread::sleep(DOWNLOAD_STEP);
-                let event = if fails && step > DOWNLOAD_STEPS / 2 {
-                    EngineEvent::DownloadFinished { id, ok: false }
-                } else {
-                    EngineEvent::DownloadProgress {
-                        id,
-                        received: DOWNLOAD_SIZE * step / DOWNLOAD_STEPS,
-                        total: Some(DOWNLOAD_SIZE),
+                if !downloads.lock().expect("demo downloads").contains_key(&id) {
+                    return;
+                }
+                if fails && step > DOWNLOAD_STEPS / 2 {
+                    if take().is_some() {
+                        let end = DownloadEnd::Failed {
+                            reason: Some("Network error"),
+                        };
+                        let _ = events.try_send(EngineEvent::DownloadFinished { id, end });
                     }
+                    return;
+                }
+                let progress = EngineEvent::DownloadProgress {
+                    id,
+                    received: DOWNLOAD_SIZE * step / DOWNLOAD_STEPS,
+                    total: Some(DOWNLOAD_SIZE),
                 };
-                let finished = matches!(event, EngineEvent::DownloadFinished { .. });
-                if events.try_send(event).is_err() || finished {
+                if events.try_send(progress).is_err() {
                     return;
                 }
             }
-            let _ = events.try_send(EngineEvent::DownloadFinished { id, ok: true });
+            let Some(path) = take() else {
+                return;
+            };
+            let saved = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&path, "A Map Browser preview download.\n"));
+            let end = match saved {
+                Ok(()) => DownloadEnd::Complete {
+                    size: DOWNLOAD_SIZE,
+                },
+                Err(_) => DownloadEnd::Failed {
+                    reason: Some("Couldn't save the file"),
+                },
+            };
+            let _ = events.try_send(EngineEvent::DownloadFinished { id, end });
         });
     }
 
     fn request_permissions(&self, tab_id: u64, url: &str) {
-        let permissions = if url.contains("location") {
-            vec![Permission::Location]
-        } else if url.contains("notifications") {
-            vec![Permission::Notifications]
-        } else {
-            vec![Permission::Camera, Permission::Microphone]
-        };
+        let permissions = [
+            ("location", Permission::Location),
+            ("notifications", Permission::Notifications),
+            ("fonts", Permission::LocalFonts),
+            ("windows", Permission::WindowManagement),
+            ("network", Permission::LocalNetwork),
+            ("midi", Permission::Midi),
+        ]
+        .into_iter()
+        .find(|(word, _)| url.contains(word))
+        .map_or_else(
+            || vec![Permission::Camera, Permission::Microphone],
+            |(_, permission)| vec![permission],
+        );
+        let origin = Url::parse(url)
+            .map(|url| format!("{}/", url.origin().ascii_serialization()))
+            .unwrap_or_default();
+        // As in Chromium, what the profile keeps is answered without asking.
+        let space_id = self.pages.borrow().get(&tab_id).map(|page| page.space_id);
+        let kept = space_id.map_or_else(Vec::new, |space_id| {
+            self.site_permissions(space_id, &origin)
+        });
+        if permissions
+            .iter()
+            .all(|permission| kept.iter().any(|(known, _)| known == permission))
+        {
+            return;
+        }
         let id = self.next_id();
-        self.permission_requests.borrow_mut().insert(id, tab_id);
+        self.permission_requests.borrow_mut().insert(
+            id,
+            Request {
+                tab_id,
+                origin: origin.clone(),
+                permissions: permissions.clone(),
+            },
+        );
         self.send(EngineEvent::PermissionRequest {
             id,
             tab_id,
-            origin: Url::parse(url)
-                .map(|url| format!("{}/", url.origin().ascii_serialization()))
-                .unwrap_or_default(),
+            origin,
             permissions,
         });
     }
@@ -422,7 +603,7 @@ impl Engine {
             .permission_requests
             .borrow()
             .iter()
-            .filter(|&(_, &tab)| tab == tab_id)
+            .filter(|&(_, request)| request.tab_id == tab_id)
             .map(|(&id, _)| id)
             .collect();
         ids.sort();

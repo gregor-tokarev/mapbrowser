@@ -11,6 +11,7 @@ mod page_keys;
 mod permissions;
 mod popups;
 mod protocols;
+mod site_data;
 
 use super::{
     EditCommand, EngineEvent, PermissionDecision, edit_command, merge_features, opens_in_tab,

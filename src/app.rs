@@ -2,7 +2,7 @@
 //! page events, the command bar and persistence. Rendering lives in `ui`.
 
 use crate::{
-    engine::{Engine, EngineEvent, Navigation, Shortcut, ZoomStep, navigation_for},
+    engine::{Engine, EngineEvent, Navigation, Shortcut, ZoomStep, is_insecure, navigation_for},
     favicons::{FaviconStore, host_of},
     input::{InputEvent, InputStyle, TextInput},
     model::{self, BrowserState, ClosedTab, Pin, Space, SpaceId, Tab, TabId},
@@ -128,6 +128,9 @@ pub struct BrowserApp {
     /// The toast over the card while the sidebar is hidden.
     pub(crate) toast_window: Option<ToastWindow>,
     pub link_status: LinkStatus,
+    /// Whether the window's close, minimize and zoom buttons are hidden, as
+    /// last set: they show whenever the sidebar does.
+    traffic_lights_hidden: bool,
 }
 
 /// OS open-URL events are web addresses, never address-bar search queries.
@@ -148,10 +151,11 @@ pub fn external_web_url(value: &str) -> Option<Url> {
 }
 
 /// What the shell draws of a tab's URL: on macOS the host (the URL pill,
-/// the favicon) or, without one, the whole URL. Linux previews print the
-/// whole URL on the card.
+/// the favicon), marked "Not Secure" for plain HTTP, or, without one, the
+/// whole URL. Linux previews print the whole URL on the card.
 fn shown_url(url: &str) -> String {
     match host_of(url) {
+        Some(host) if cfg!(target_os = "macos") && is_insecure(url) => format!("http://{host}"),
         Some(host) if cfg!(target_os = "macos") => host,
         _ => model::display_url(url),
     }
@@ -197,6 +201,8 @@ impl BrowserApp {
     ) -> Self {
         let rename_input = cx.new(|cx| TextInput::new(window, cx));
         let favicons = FaviconStore::new(state.root_dir());
+        let downloads = Downloads::restore(state.downloads());
+        let traffic_lights_hidden = state.sidebar_hidden;
         let mut this = Self {
             state,
             engine,
@@ -223,7 +229,7 @@ impl BrowserApp {
             focus_handle: cx.focus_handle(),
             save_task: None,
             save_due: None,
-            downloads: Downloads::default(),
+            downloads,
             permissions: PermissionPrompts::default(),
             openers: HashMap::new(),
             _subscriptions: Vec::new(),
@@ -233,6 +239,7 @@ impl BrowserApp {
             find: Find::default(),
             toast_window: None,
             link_status: LinkStatus::default(),
+            traffic_lights_hidden,
         };
         this._subscriptions.extend([
             cx.subscribe_in(
@@ -386,7 +393,7 @@ impl BrowserApp {
         .detach();
     }
 
-    fn ensure_loaded(&mut self, tab_id: TabId) {
+    pub(crate) fn ensure_loaded(&mut self, tab_id: TabId) {
         if self.loaded.contains(&tab_id) {
             return;
         }
@@ -524,12 +531,20 @@ impl BrowserApp {
         self.finish_slide();
         self.exit_page_fullscreen();
         let space_id = self.state.selected_space_id;
+        let previous = self.active_tab_id();
         let Some(tab_id) = self
             .state
             .new_tab(space_id, model::normalize_address(input))
         else {
             return;
         };
+        // An address that turns out to be a download closes its tab again
+        // and goes back to the tab this one replaced on screen.
+        if let Some(previous) = previous {
+            let state = &self.state;
+            self.openers.retain(|tab, _| state.tab(*tab).is_some());
+            self.openers.insert(tab_id, previous);
+        }
         self.error = None;
         self.show_selected();
         if let Some(host) = self.state.tab(tab_id).and_then(|tab| host_of(&tab.url)) {
@@ -911,7 +926,15 @@ impl BrowserApp {
         }
     }
 
+    /// ⌘S and the sidebar button: hides the sidebar on screen, or shows it.
+    /// A permission card holds the sidebar open, also a hidden one: hiding
+    /// it then puts the question away too (the site can ask again), so the
+    /// sidebar always goes as asked.
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_width().is_some() && self.permission_shown().is_some() {
+            self.dismiss_shown_permissions(cx);
+            return self.set_sidebar_hidden(true, cx);
+        }
         self.set_sidebar_hidden(!self.state.sidebar_hidden, cx);
     }
 
@@ -921,9 +944,19 @@ impl BrowserApp {
         }
         self.state.sidebar_hidden = hidden;
         self.menu = None;
-        self.engine.borrow().set_traffic_lights_hidden(hidden);
         self.persist_later(cx);
         cx.notify();
+    }
+
+    /// The traffic lights show with the sidebar, also while a permission
+    /// card holds a hidden one open. Called on every frame; the engine
+    /// hears only of changes.
+    pub(crate) fn sync_traffic_lights(&mut self) {
+        let hidden = self.state.sidebar_hidden && self.permission_shown().is_none();
+        if self.traffic_lights_hidden != hidden {
+            self.traffic_lights_hidden = hidden;
+            self.engine.borrow().set_traffic_lights_hidden(hidden);
+        }
     }
 
     /// Follows the sidebar's edge, dragged with the pointer at `x`. Far
@@ -1058,6 +1091,9 @@ impl BrowserApp {
     ) {
         self.engine.borrow().focus_shell();
         window.focus(&self.focus_handle);
+        if kind == MenuKind::Library {
+            self.library_opened();
+        }
         self.menu = Some(OpenMenu {
             kind,
             anchor,
@@ -1250,7 +1286,8 @@ impl BrowserApp {
                 .map(|space| (space.id, space.name.clone()))
                 .collect(),
             can_reopen: !self.state.closed_tabs().is_empty(),
-            sidebar_hidden: self.state.sidebar_hidden,
+            // What is on screen: a permission card holds a hidden sidebar open.
+            sidebar_hidden: self.sidebar_width().is_none(),
             has_today: active_space.section(Pin::Today).next().is_some(),
         }
     }
@@ -1593,14 +1630,15 @@ impl BrowserApp {
                 tab_id,
                 name,
                 path,
+                url,
                 blank_tab,
-            } => self.download_started(id, tab_id, name, path, blank_tab, cx),
+            } => self.download_started(id, tab_id, name, path, url, blank_tab, cx),
             EngineEvent::DownloadProgress {
                 id,
                 received,
                 total,
             } => self.download_progress(id, received, total, cx),
-            EngineEvent::DownloadFinished { id, ok } => self.download_finished(id, ok, cx),
+            EngineEvent::DownloadFinished { id, end } => self.download_finished(id, end, cx),
             EngineEvent::PermissionRequest {
                 id,
                 tab_id,
@@ -1698,7 +1736,7 @@ impl BrowserApp {
         cx.notify();
     }
 
-    fn persist_later(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn persist_later(&mut self, cx: &mut Context<Self>) {
         self.schedule_save(SAVE_DELAY, cx);
     }
 

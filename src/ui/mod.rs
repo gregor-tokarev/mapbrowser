@@ -5,6 +5,7 @@ pub mod command_bar;
 mod content;
 pub mod downloads;
 pub mod drag;
+pub mod elide;
 pub mod find_bar;
 pub mod icons;
 pub mod link_status;
@@ -21,9 +22,9 @@ use crate::{Dismiss, app::BrowserApp};
 use drag::DraggedEdge;
 use gpui::{
     AnyView, App, AppContext, Bounds, BoxShadow, Context, Div, DragMoveEvent, FontWeight,
-    InteractiveElement, IntoElement, ModifiersChangedEvent, MouseButton, ParentElement, Pixels,
-    Render, SharedString, StatefulInteractiveElement, Styled, Window, div, point,
-    prelude::FluentBuilder, px, size,
+    InteractiveElement, IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseButton,
+    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    point, prelude::FluentBuilder, px, size,
 };
 use theme::Theme;
 
@@ -136,6 +137,7 @@ impl Render for BrowserApp {
         self.sync_find_bar(card, window, cx);
         self.sync_toast_window(card, window, cx);
         self.sync_link_status(card, window, cx);
+        self.sync_traffic_lights();
         let sidebar = self
             .sidebar_width()
             .map(|width| self.render_sidebar(width, &theme, frame, cx));
@@ -150,6 +152,9 @@ impl Render for BrowserApp {
             .key_context("Browser")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &Dismiss, _, cx| this.dismiss(cx)))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.tab_through_card(event, window, cx)
+            }))
             .on_modifiers_changed(
                 cx.listener(|this, event: &ModifiersChangedEvent, window, cx| {
                     if !event.modifiers.control {
@@ -254,6 +259,9 @@ pub struct Tooltip {
     width: f32,
     /// The pointer's x when the tooltip opened.
     pointer: f32,
+    /// The whole text, over as many lines as it takes: names and addresses
+    /// shown cut short elsewhere.
+    wraps: bool,
 }
 
 impl Tooltip {
@@ -264,7 +272,26 @@ impl Tooltip {
         theme: &Theme,
         width: f32,
     ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
-        let (text, theme) = (text.into(), *theme);
+        Self::with(text.into(), shortcut, *theme, width, false)
+    }
+
+    /// A tooltip that shows all of a long `text`, such as a full address
+    /// or file name, across the sidebar's width.
+    pub fn build_wrapping(
+        text: impl Into<SharedString>,
+        theme: &Theme,
+        width: f32,
+    ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+        Self::with(text.into(), "", *theme, width, true)
+    }
+
+    fn with(
+        text: SharedString,
+        shortcut: &'static str,
+        theme: Theme,
+        width: f32,
+        wraps: bool,
+    ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
         move |window, cx| {
             let pointer = f32::from(window.mouse_position().x);
             let text = text.clone();
@@ -274,6 +301,7 @@ impl Tooltip {
                 theme,
                 width,
                 pointer,
+                wraps,
             })
             .into()
         }
@@ -288,7 +316,6 @@ impl Render for Tooltip {
             .font_family(UI_FONT)
             .flex()
             .gap(px(6.))
-            .h(px(TOOLTIP_HEIGHT))
             .items_center()
             .px(px(8.))
             .rounded(px(6.))
@@ -297,10 +324,22 @@ impl Render for Tooltip {
             .border_color(gpui::black().opacity(0.1))
             .shadow(vec![shadow(2., 8., 0.12)])
             .flex_none()
-            .max_w(px(TOOLTIP_MAX_WIDTH.min(span)))
             .text_size(px(12.))
             .text_color(theme.title())
-            .child(truncated(self.text.clone()).min_w_0())
+            .map(|bubble| {
+                if self.wraps {
+                    bubble
+                        .py(px(5.))
+                        .max_w(px(span))
+                        .line_height(px(16.))
+                        .child(div().min_w_0().child(self.text.clone()))
+                } else {
+                    bubble
+                        .h(px(TOOLTIP_HEIGHT))
+                        .max_w(px(TOOLTIP_MAX_WIDTH.min(span)))
+                        .child(truncated(self.text.clone()).min_w_0())
+                }
+            })
             .when(!self.shortcut.is_empty(), |bubble| {
                 bubble.child(
                     div()
@@ -315,12 +354,17 @@ impl Render for Tooltip {
         // that shrinks first keeps it from running past either edge.
         let origin = self.pointer + 1.;
         let spacer = |width: f32| div().min_w_0().w(px(width.max(0.)));
-        let row = div()
-            .absolute()
-            .top(px(TOOLTIP_GAP))
-            .left(px(TOOLTIP_EDGE - origin))
-            .w(px(span))
-            .flex();
+        // A wrapping bubble's height is known only after layout, and GPUI
+        // moves a tooltip above the pointer by the height it measures: the
+        // row stays in the flow, so the tooltip is as tall as the bubble.
+        let row = if self.wraps {
+            div().relative().mt(px(TOOLTIP_GAP))
+        } else {
+            div().absolute().top(px(TOOLTIP_GAP))
+        }
+        .left(px(TOOLTIP_EDGE - origin))
+        .w(px(span))
+        .flex();
         let row = if self.pointer > self.width / 2. {
             row.justify_end()
                 .child(bubble)
@@ -328,6 +372,11 @@ impl Render for Tooltip {
         } else {
             row.child(spacer(origin - TOOLTIP_EDGE)).child(bubble)
         };
-        div().w_0().h(px(TOOLTIP_GAP + TOOLTIP_HEIGHT)).child(row)
+        div()
+            .w_0()
+            .when(!self.wraps, |tooltip| {
+                tooltip.h(px(TOOLTIP_GAP + TOOLTIP_HEIGHT))
+            })
+            .child(row)
     }
 }
