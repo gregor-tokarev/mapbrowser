@@ -114,7 +114,7 @@ impl BrowserApp {
             .child(match active {
                 // With the sidebar hidden, nothing else on screen says how
                 // to get it back.
-                None if self.state.sidebar_hidden => hint(
+                None if self.sidebar_width().is_none() => hint(
                     theme,
                     "Press ⌘T to open a tab",
                     Some("⌘S shows the sidebar"),
