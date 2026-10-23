@@ -5,6 +5,7 @@ pub mod command_bar;
 mod content;
 pub mod downloads;
 pub mod drag;
+pub mod elide;
 pub mod find_bar;
 pub mod icons;
 pub mod link_status;
@@ -22,9 +23,10 @@ use crate::{Dismiss, app::BrowserApp};
 use drag::DraggedEdge;
 use gpui::{
     AnyView, App, AppContext, Bounds, BoxShadow, Context, Div, DragMoveEvent, Font, FontWeight,
-    InteractiveElement, IntoElement, LineFragment, ModifiersChangedEvent, MouseButton,
-    MouseMoveEvent, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement,
-    Styled, TextRun, Window, div, font, point, prelude::FluentBuilder, px, size,
+    InteractiveElement, IntoElement, KeyDownEvent, LineFragment, ModifiersChangedEvent,
+    MouseButton, MouseMoveEvent, ParentElement, Pixels, Render, SharedString,
+    StatefulInteractiveElement, Styled, TextRun, Window, div, font, point, prelude::FluentBuilder,
+    px, size,
 };
 use theme::Theme;
 
@@ -148,6 +150,7 @@ impl Render for BrowserApp {
         if let Some(width) = self.sidebar_width() {
             self.fit_toast(width, window);
         }
+        self.sync_traffic_lights();
         let sidebar = self
             .sidebar_width()
             .map(|width| self.render_sidebar(width, &theme, frame, cx));
@@ -168,6 +171,9 @@ impl Render for BrowserApp {
                     this.peek_pointer_moved(event.position.x, cx)
                 }))
             })
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.tab_through_card(event, window, cx)
+            }))
             .on_modifiers_changed(
                 cx.listener(|this, event: &ModifiersChangedEvent, window, cx| {
                     if !event.modifiers.control {

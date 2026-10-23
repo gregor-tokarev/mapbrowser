@@ -3,9 +3,10 @@
 //! there too but reports nothing to the app, and holds files it would ask
 //! about in a download bubble Alloy browsers don't have.
 
-use super::{BrowserLink, frame_url};
+use super::{BrowserLink, Engine, frame_url};
 use crate::engine::{
-    EngineEvent, download_file_name, download_progress_worth_reporting, unique_file_name,
+    CANCELLED_BY_USER, DownloadEnd, EngineEvent, download_failure, download_file_name,
+    download_progress_worth_reporting, unique_file_name,
 };
 use cef::*;
 use std::{
@@ -34,6 +35,9 @@ struct Active {
     reported: Option<(Instant, u64)>,
     /// The latest callback, which can still cancel the download.
     callback: Option<DownloadItemCallback>,
+    /// Cancelled before Chromium handed over a callback: it cancels with
+    /// the first one.
+    cancel: bool,
 }
 
 impl Downloads {
@@ -60,6 +64,7 @@ impl Downloads {
                 path: path.clone(),
                 reported: None,
                 callback: None,
+                cancel: false,
             },
         );
         (id, path)
@@ -74,17 +79,37 @@ impl Downloads {
         let mut state = self.state();
         let active = state.active.get_mut(&key)?;
         let id = active.id;
-        if item.is_complete() != 0 || item.is_canceled() != 0 || item.is_interrupted() != 0 {
+        let received = u64::try_from(item.received_bytes()).unwrap_or(0);
+        let end = if item.is_complete() != 0 {
+            Some(DownloadEnd::Complete { size: received })
+        } else if item.is_canceled() != 0 {
+            Some(DownloadEnd::Cancelled)
+        } else if item.is_interrupted() != 0 {
+            let reason = item.interrupt_reason().get_raw();
+            Some(if reason == CANCELLED_BY_USER {
+                DownloadEnd::Cancelled
+            } else {
+                DownloadEnd::Failed {
+                    reason: download_failure(reason),
+                }
+            })
+        } else {
+            None
+        };
+        if let Some(end) = end {
             state.active.remove(&key);
-            return Some(EngineEvent::DownloadFinished {
-                id,
-                ok: item.is_complete() != 0,
-            });
+            return Some(EngineEvent::DownloadFinished { id, end });
         }
         if let Some(callback) = callback {
+            if active.cancel {
+                // Cancelling can call back in here: not with the lock held.
+                let callback = callback.clone();
+                drop(state);
+                callback.cancel();
+                return None;
+            }
             active.callback = Some(callback.clone());
         }
-        let received = u64::try_from(item.received_bytes()).unwrap_or(0);
         let total = u64::try_from(item.total_bytes())
             .ok()
             .filter(|&total| total > 0);
@@ -98,6 +123,22 @@ impl Downloads {
             received,
             total,
         })
+    }
+
+    /// Cancels download `id`. Chromium deletes what it saved so far, and
+    /// `DownloadFinished` follows.
+    fn cancel(&self, id: u64) {
+        let callback = {
+            let mut state = self.state();
+            let Some(active) = state.active.values_mut().find(|active| active.id == id) else {
+                return;
+            };
+            active.cancel = true;
+            active.callback.take()
+        };
+        if let Some(callback) = callback {
+            callback.cancel();
+        }
     }
 
     /// Cancels every download in progress, for quitting: Chromium would
@@ -114,6 +155,23 @@ impl Downloads {
         for callback in callbacks {
             callback.cancel();
         }
+    }
+}
+
+impl Engine {
+    /// Cancels a download in progress (the library's ×).
+    pub fn cancel_download(&self, id: u64) {
+        self.downloads.cancel(id);
+    }
+
+    /// Downloads `url` again through the tab's browser, so with its space's
+    /// profile, as a new download. False when the tab has no browser.
+    pub fn start_download(&self, tab_id: u64, url: &str) -> bool {
+        let Some(host) = self.live_browser(tab_id).and_then(|browser| browser.host()) else {
+            return false;
+        };
+        host.start_download(Some(&CefString::from(url)));
+        true
     }
 }
 
@@ -134,6 +192,17 @@ fn path_string(path: &Path) -> CefString {
     CefString::from(path.to_string_lossy().as_ref())
 }
 
+/// Where a download comes from, before redirects: signed links that
+/// redirect expire, the address that hands them out doesn't.
+fn source_url(item: &DownloadItem) -> String {
+    let original = CefString::from(&item.original_url()).to_string();
+    if original.is_empty() {
+        CefString::from(&item.url()).to_string()
+    } else {
+        original
+    }
+}
+
 wrap_download_handler! {
     pub(super) struct TabDownloads { link: BrowserLink }
     impl DownloadHandler {
@@ -150,6 +219,7 @@ wrap_download_handler! {
                 tab_id: self.link.tab_id,
                 name: path.file_name().map_or(name, |name| name.to_string_lossy().into_owned()),
                 path,
+                url: source_url(item),
                 blank_tab: shows_no_page(browser.as_deref()),
             });
             1

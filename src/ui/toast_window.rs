@@ -342,7 +342,8 @@ impl BrowserApp {
     }
 
     /// The toast, or the failed save's notice, if the sidebar that shows
-    /// them is hidden. Pages in HTML fullscreen (videos) show none.
+    /// them is hidden, else the progress of running downloads, which its
+    /// ring would show. Pages in HTML fullscreen (videos) show none.
     fn toast_over_card(&self) -> Option<Shown> {
         if self.sidebar_width().is_some() || self.fullscreen {
             return None;
@@ -351,6 +352,10 @@ impl BrowserApp {
             .as_ref()
             .map(|toast| (toast.kind, toast.text.clone()))
             .or_else(|| self.save_notice())
+            .or_else(|| {
+                self.downloads_over_card()
+                    .map(|text| (ToastKind::Info, text))
+            })
     }
 
     /// Called on every frame of the browser window: the pop-up opens,

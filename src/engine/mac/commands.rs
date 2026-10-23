@@ -17,6 +17,13 @@ impl Engine {
         Some(zoom_percent(host.zoom_level()))
     }
 
+    /// The tab's page zoom in percent, as Chromium applies it to the site
+    /// (also after a navigation); `None` without a browser.
+    pub fn zoom_percent(&self, tab_id: u64) -> Option<u32> {
+        let host = self.live_browser(tab_id)?.host()?;
+        Some(zoom_percent(host.zoom_level()))
+    }
+
     /// Opens the system print panel for the page, as File > Print… or a
     /// page's `window.print()` does.
     pub fn print(&self, tab_id: u64) {

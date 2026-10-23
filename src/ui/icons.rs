@@ -51,6 +51,7 @@ icons! {
     Globe => "globe",
     History => "history",
     Link => "link",
+    LockOpen => "lock-open",
     MapPin => "map-pin",
     Mic => "mic",
     Minus => "minus",

@@ -8,6 +8,7 @@ use super::{
     beside_pointer,
     command_bar::CommandMode,
     drag::{DraggedEdge, DraggedTab, EDGE_HANDLE, TabDrag, TabPreview},
+    elide::{Cut, elided},
     icons::{Icon, icon},
     menu::MenuKind,
     placeholder_favicon, press_only, shadow, text_width,
@@ -16,7 +17,7 @@ use super::{
 };
 use crate::{
     app::BrowserApp,
-    engine::Shortcut,
+    engine::{Shortcut, is_insecure, site_origin},
     favicons::host_of,
     model::{Pin, Space, SpaceId, Tab, TabId},
     recent::TabSwitch,
@@ -950,15 +951,45 @@ impl BrowserApp {
         let tab = space.selected_tab();
         let host = tab.and_then(|tab| host_of(&tab.url));
         let label = tab.map(|tab| host.clone().unwrap_or_else(|| tab.url.clone()));
+        // The whole origin, scheme included, on hover: the pill shows the
+        // end of a long host.
+        let origin = tab.map(|tab| site_origin(&tab.url).unwrap_or_else(|| tab.url.clone()));
+        let insecure = tab.is_some_and(|tab| is_insecure(&tab.url));
         let blocking_off = host
             .as_deref()
             .is_some_and(|host| self.state.is_blocking_disabled(host));
+        let site_menu_open = tab.is_some_and(|tab| {
+            self.menu.as_ref().is_some_and(|menu| {
+                matches!(menu.kind, MenuKind::Site(id) | MenuKind::ClearSiteData(id) if id == tab.id)
+            })
+        });
         // Buttons show on hover only (Arc), so at rest the host has the
-        // whole pill; the shield stays while blocking is off for the site.
+        // whole pill. The shield, which opens the site menu, stays while
+        // blocking is off for the site, something was blocked for it this
+        // session, or its menu is open.
         let hovered = interactive && self.url_pill_hovered;
         let copy = tab.filter(|_| hovered).map(|tab| tab.id);
-        let shield = host.filter(|_| interactive && (hovered || blocking_off));
-        let buttons = copy.is_some() || shield.is_some();
+        let site = tab
+            .filter(|tab| {
+                interactive
+                    && host.is_some()
+                    && (hovered
+                        || blocking_off
+                        || site_menu_open
+                        || self.site_blocked_something(tab.id))
+            })
+            .map(|tab| tab.id);
+        let zoom = tab
+            .filter(|_| interactive)
+            .and_then(|tab| self.engine.borrow().zoom_percent(tab.id))
+            .filter(|&percent| percent != 100);
+        // Pressed while ⌘L edits the address, as "+ New Tab" is for ⌘T.
+        let editing = interactive
+            && self
+                .command_bar
+                .as_ref()
+                .is_some_and(|bar| bar.mode == CommandMode::EditAddress);
+        let buttons = copy.is_some() || site.is_some() || zoom.is_some();
         let (control, control_hover) = (theme.control(), theme.control_hover());
         let hover = theme.hover();
         let pill_button = |id: &'static str, glyph: Icon, tooltip, shortcut| {
@@ -966,6 +997,7 @@ impl BrowserApp {
                 div()
                     .id(id)
                     .flex()
+                    .flex_none()
                     .items_center()
                     .justify_center()
                     .size(px(26.))
@@ -975,6 +1007,14 @@ impl BrowserApp {
             )
             .maybe_tooltip(self.tooltip(tooltip, shortcut, theme, width))
         };
+        let open_site_menu = |tab_id: TabId| {
+            cx.listener(move |this: &mut Self, _: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                // Below the pill, level with its left edge.
+                let anchor = point(px(8.), px(URL_PILL_TOP + 40.));
+                this.open_menu(MenuKind::Site(tab_id), anchor, window, cx);
+            })
+        };
         div()
             .id(("url-pill", space.id))
             .flex()
@@ -983,11 +1023,50 @@ impl BrowserApp {
             .h(px(36.))
             .mx(px(8.))
             .mt(px(URL_PILL_TOP - PAGES_TOP))
-            .pl(px(13.))
+            .pl(px(if insecure && interactive { 7. } else { 13. }))
             .pr(px(if buttons { 5. } else { 13. }))
             .gap(px(2.))
             .rounded(px(10.))
-            .bg(control)
+            .map(|pill| {
+                if editing {
+                    pill.bg(theme.selected())
+                        .when(!theme.dark, |pill| pill.shadow(selected_shadow()))
+                } else if site_menu_open {
+                    pill.bg(control_hover)
+                } else {
+                    pill.bg(control)
+                }
+            })
+            // Plain HTTP: "Not Secure" before the host, as in Safari and
+            // Chrome; with little room, the open lock alone.
+            .when_some(
+                tab.filter(|_| insecure && interactive).map(|tab| tab.id),
+                |pill, tab_id| {
+                    let muted = theme.muted();
+                    pill.child(
+                        press_only(
+                            div()
+                                .id("not-secure")
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .gap(px(4.))
+                                .h(px(24.))
+                                .px(px(6.))
+                                .mr(px(4.))
+                                .rounded(px(6.))
+                                .hover(move |style| style.bg(hover))
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(muted)
+                                .child(icon(Icon::LockOpen, 13., muted))
+                                .when(width >= 220., |chip| chip.child("Not Secure")),
+                        )
+                        .maybe_tooltip(self.tooltip("Connection Isn't Secure", "", theme, width))
+                        .on_click(open_site_menu(tab_id)),
+                    )
+                },
+            )
             .when(interactive, |pill| {
                 pill.cursor_pointer()
                     .hover(move |style| style.bg(control_hover))
@@ -1007,12 +1086,24 @@ impl BrowserApp {
                     )
             })
             .map(|pill| match &label {
+                // The host loses its start, never the domain that owns it.
                 Some(label) => pill.child(
-                    truncated(label.clone())
+                    div()
+                        .id("url-host")
                         .flex_1()
                         .min_w_0()
-                        .text_size(px(13.5))
-                        .text_color(theme.url_text()),
+                        .when_some(origin.filter(|_| interactive), |host, origin| {
+                            host.maybe_tooltip(
+                                self.menu
+                                    .is_none()
+                                    .then(|| Tooltip::build_wrapping(origin, "", theme, width)),
+                            )
+                        })
+                        .child(
+                            elided(label.clone(), Cut::Start, 20.)
+                                .text_size(px(13.5))
+                                .text_color(theme.url_text()),
+                        ),
                 ),
                 None => pill
                     .gap(px(7.))
@@ -1026,6 +1117,32 @@ impl BrowserApp {
                             .text_color(theme.tertiary()),
                     ),
             })
+            // The page isn't at 100%: a click resets it.
+            .when_some(zoom, |pill, percent| {
+                pill.child(
+                    press_only(
+                        div()
+                            .id("zoom")
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .h(px(22.))
+                            .px(px(6.))
+                            .rounded(px(6.))
+                            .bg(control_hover)
+                            .hover(move |style| style.bg(hover))
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.muted())
+                            .child(format!("{percent}%")),
+                    )
+                    .maybe_tooltip(self.tooltip("Actual Size", "⌘0", theme, width))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.shortcut(Shortcut::ZoomReset, window, cx);
+                    })),
+                )
+            })
             .when_some(copy, |pill, id| {
                 pill.child(
                     pill_button("copy-url", Icon::Link, "Copy URL", "⇧⌘C").on_click(cx.listener(
@@ -1036,26 +1153,20 @@ impl BrowserApp {
                     )),
                 )
             })
-            .when_some(shield, |pill, host| {
+            .when_some(site, |pill, tab_id| {
                 pill.child(
                     pill_button(
-                        "blocking",
+                        "site-menu",
                         if blocking_off {
                             Icon::ShieldOff
                         } else {
                             Icon::Shield
                         },
-                        if blocking_off {
-                            "Content Blocking Off"
-                        } else {
-                            "Content Blocking On"
-                        },
+                        "Site Settings",
                         "",
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.toggle_blocking(&host, cx);
-                    })),
+                    .when(site_menu_open, |button| button.bg(hover))
+                    .on_click(open_site_menu(tab_id)),
                 )
             })
     }
@@ -1810,7 +1921,14 @@ impl BrowserApp {
                     .absolute()
                     .left(px(9.5))
                     .top(px(10.))
-                    .maybe_tooltip(self.tooltip("Library", "", theme, width))
+                    .maybe_tooltip(self.menu.is_none().then(|| {
+                        Tooltip::build_wrapping(
+                            "Library — Downloads and Recently Closed",
+                            "",
+                            theme,
+                            width,
+                        )
+                    }))
                     .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                         let anchor = event.position() - point(px(14.), px(18.));
                         this.open_menu(MenuKind::Library, anchor, window, cx)
