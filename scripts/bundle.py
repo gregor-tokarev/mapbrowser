@@ -360,7 +360,7 @@ def main():
             # them under its display name and icon.
             "CFBundleDisplayName": args.name if alerts else name,
             "CFBundleExecutable": name,
-            "CFBundleIdentifier": args.identifier + ".helper" + ("." + kind if kind else ""),
+            "CFBundleIdentifier": args.identifier + ".helper" + suffix.strip().replace("(", "").replace(")", "").lower(),
             "LSUIElement": True,
         })
         helper_info.pop("NSPrincipalClass")
