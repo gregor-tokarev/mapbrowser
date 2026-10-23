@@ -179,6 +179,8 @@ impl Engine {
     pub fn focus_shell(&self) {}
     pub fn undo_in_page(&self) {}
     pub fn redo_in_page(&self) {}
+    /// Previews have no Mail or FaceTime to hand the address to.
+    pub fn open_in_app(&self, _url: &str) {}
 
     pub fn navigate(&self, tab_id: u64, url: &str) {
         {

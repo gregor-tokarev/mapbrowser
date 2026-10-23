@@ -4,14 +4,15 @@
 use crate::{
     engine::{Engine, EngineEvent, Navigation, Shortcut, ZoomStep, navigation_for},
     favicons::{FaviconStore, host_of},
+    history::{self, History},
     input::{InputEvent, InputStyle, TextInput},
-    model::{self, BrowserState, ClosedTab, Pin, Space, SpaceId, Tab, TabId},
+    model::{self, BrowserState, ClosedTab, Pin, SearchEngine, Space, SpaceId, Tab, TabId},
     native,
     recent::{RecentTabs, TabSwitch},
     ui::{
         command_bar::{
-            self, ActiveTab, Command, CommandBar, CommandBarEvent, CommandContext, CommandMode,
-            TabEntry,
+            self, ActiveTab, BarInput, ClosedEntry, Command, CommandBar, CommandBarEvent,
+            CommandContext, CommandMode, HistoryEntry, TabEntry,
         },
         downloads::Downloads,
         drag::{self, DropZones, TabDrag},
@@ -27,14 +28,15 @@ use crate::{
     },
 };
 use gpui::{
-    App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, MouseDownEvent,
-    Pixels, Point, ScrollWheelEvent, SharedString, Subscription, Task, Window, WindowAppearance,
-    WindowHandle, http_client::Url, px,
+    App, AppContext, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, Image,
+    MouseDownEvent, Pixels, Point, PromptLevel, ScrollWheelEvent, SharedString, Subscription, Task,
+    Window, WindowAppearance, WindowHandle, http_client::Url, px,
 };
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     rc::Rc,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -44,6 +46,9 @@ const SAVE_DELAY: Duration = Duration::from_millis(500);
 /// tickers), in every space: those changes alone are saved this rarely.
 const PAGE_SAVE_DELAY: Duration = Duration::from_secs(10);
 const TOAST_DURATION: Duration = Duration::from_millis(1500);
+/// Favicons of visited pages the command bar reads from the disk cache
+/// when it opens, the most recent first.
+const HISTORY_ICONS: usize = 100;
 
 /// Navigation state of a loaded tab, for the toolbar and the progress bar.
 #[derive(Clone, Copy, Debug, Default)]
@@ -73,6 +78,8 @@ pub struct Toast {
 pub struct CommandBarWindow {
     pub mode: CommandMode,
     handle: WindowHandle<CommandBar>,
+    /// The card the window was placed over.
+    card: Bounds<Pixels>,
     /// The pop-up's NSView, attached to the browser window as a child.
     #[cfg(target_os = "macos")]
     native_view: Option<*mut std::ffi::c_void>,
@@ -128,6 +135,14 @@ pub struct BrowserApp {
     /// The toast over the card while the sidebar is hidden.
     pub(crate) toast_window: Option<ToastWindow>,
     pub link_status: LinkStatus,
+    history: History,
+    history_save_task: Option<Task<()>>,
+    history_save_due: Option<Instant>,
+    /// Tabs whose page started a new document: its next address is a visit.
+    new_documents: HashSet<TabId>,
+    /// Tabs from the last session that haven't loaded yet: loading them
+    /// again is no new visit.
+    restored: HashSet<TabId>,
 }
 
 /// OS open-URL events are web addresses, never address-bar search queries.
@@ -197,6 +212,13 @@ impl BrowserApp {
     ) -> Self {
         let rename_input = cx.new(|cx| TextInput::new(window, cx));
         let favicons = FaviconStore::new(state.root_dir());
+        let history = History::load(state.root_dir());
+        let restored = state
+            .spaces
+            .iter()
+            .flat_map(|space| &space.tabs)
+            .map(|tab| tab.id)
+            .collect();
         let mut this = Self {
             state,
             engine,
@@ -233,6 +255,11 @@ impl BrowserApp {
             find: Find::default(),
             toast_window: None,
             link_status: LinkStatus::default(),
+            history,
+            history_save_task: None,
+            history_save_due: None,
+            new_documents: HashSet::new(),
+            restored,
         };
         this._subscriptions.extend([
             cx.subscribe_in(
@@ -278,6 +305,8 @@ impl BrowserApp {
                     this.state.rename_space(id, name);
                 }
                 this.save_now();
+                this.history_save_task = None;
+                this.history.save();
                 async {}
             }),
             // ⌃ can be let go of in another app.
@@ -831,6 +860,10 @@ impl BrowserApp {
         }
         self.show_toast(format!("Deleted {}", space.name), cx);
         self.persist_later(cx);
+        // The space's history goes with it.
+        if self.history.forget_space(space_id) {
+            self.schedule_history_save(SAVE_DELAY, cx);
+        }
     }
 
     pub fn set_space_theme(&mut self, space_id: SpaceId, theme: u8, cx: &mut Context<Self>) {
@@ -1093,8 +1126,8 @@ impl BrowserApp {
         window.start_window_move();
     }
 
-    /// ⌘T / ⌘L: opens the command bar in `mode`, or closes it if it is open
-    /// in that mode already.
+    /// ⌘T / ⌘L / ⌘Y / ⌘,: opens the command bar in `mode`, or closes it if
+    /// it is open in that mode already.
     pub fn toggle_command_bar(
         &mut self,
         mode: CommandMode,
@@ -1112,37 +1145,57 @@ impl BrowserApp {
     }
 
     fn open_command_bar(&mut self, mode: CommandMode, window: &mut Window, cx: &mut Context<Self>) {
-        // The bar taking key status would end it too, but only later.
-        self.end_rename(window, cx);
-        self.menu = None;
-        self.finish_slide();
         let prefill = match mode {
             CommandMode::EditAddress => self
                 .state
                 .active_tab()
                 .map(|tab| tab.url.clone())
                 .unwrap_or_default(),
-            CommandMode::NewTab => String::new(),
+            CommandMode::NewTab | CommandMode::History | CommandMode::Settings => String::new(),
         };
+        self.show_command_bar(mode, BarInput::Text(prefill), window, cx);
+    }
+
+    /// Opens the bar's window over the card, its field starting with `input`.
+    fn show_command_bar(
+        &mut self,
+        mode: CommandMode,
+        input: BarInput,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The bar taking key status would end it too, but only later.
+        self.end_rename(window, cx);
+        self.menu = None;
+        self.finish_slide();
         let context = self.command_context();
-        let icons = context
-            .tabs
-            .iter()
-            .filter_map(|tab| host_of(&tab.url))
-            .filter_map(|host| Some((host.clone(), self.favicons.get(&host)?)))
-            .collect();
+        let icons = self.command_bar_icons(&context);
         let theme = self.theme();
-        let bounds = command_bar::window_bounds(
-            self.card_bounds(window.viewport_size()),
-            window.bounds().origin,
-        );
+        let card = self.card_bounds(window.viewport_size());
+        let bounds = command_bar::window_bounds(card, window.bounds().origin);
+        let rows = command_bar::visible_rows(card);
         let display = window.display(cx).map(|display| display.id());
+        // Visited pages' icons not read yet come from the disk cache.
+        let hosts: Vec<String> = context
+            .closed
+            .iter()
+            .map(|closed| closed.url.as_str())
+            .chain(
+                context
+                    .history
+                    .iter()
+                    .take(HISTORY_ICONS)
+                    .map(|page| page.url.as_str()),
+            )
+            .filter_map(host_of)
+            .collect();
         let mut bar = None;
         let opened = cx.open_window(
             command_bar::window_options(bounds, display),
             |window, cx| {
-                let entity =
-                    cx.new(|cx| CommandBar::new(mode, &prefill, context, theme, icons, window, cx));
+                let entity = cx.new(|cx| {
+                    CommandBar::new(mode, input, context, theme, icons, rows, window, cx)
+                });
                 bar = Some(entity.clone());
                 entity
             },
@@ -1166,11 +1219,85 @@ impl BrowserApp {
         self.command_bar = Some(CommandBarWindow {
             mode,
             handle,
+            card,
             #[cfg(target_os = "macos")]
             native_view,
             _subscription: subscription,
         });
+        let task = self.favicons.load_for(hosts, cx.background_executor());
+        cx.spawn(async move |this, cx| {
+            let loaded = task.await;
+            this.update(cx, |this, cx| {
+                let icons = loaded.iter().cloned().collect();
+                this.favicons.insert_loaded(loaded);
+                if let Some(bar) = &this.command_bar {
+                    let _ = bar.handle.update(cx, |bar, _, cx| bar.add_icons(icons, cx));
+                }
+            })
+        })
+        .detach();
         cx.notify();
+    }
+
+    /// The favicons the bar can show at once: those already read.
+    fn command_bar_icons(&self, context: &CommandContext) -> HashMap<String, Arc<Image>> {
+        let tabs = context.tabs.iter().map(|tab| tab.url.as_str());
+        let closed = context.closed.iter().map(|closed| closed.url.as_str());
+        let pages = context.history.iter().map(|page| page.url.as_str());
+        tabs.chain(closed)
+            .chain(pages)
+            .filter_map(host_of)
+            .filter_map(|host| Some((host.clone(), self.favicons.get(&host)?)))
+            .collect()
+    }
+
+    /// Called on every frame of the browser window: a card that moved or
+    /// changed size (the sidebar shown or hidden, the window resized) gets
+    /// the bar centred over it again, with what was typed. GPUI can move a
+    /// window only on some platforms, so the bar's window is replaced.
+    pub(crate) fn sync_command_bar(
+        &mut self,
+        card: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .command_bar
+            .as_ref()
+            .is_some_and(|bar| bar.card != card)
+        {
+            cx.defer_in(window, |this, window, cx| {
+                this.replace_command_bar(window, cx)
+            });
+        }
+    }
+
+    fn replace_command_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let card = self.card_bounds(window.viewport_size());
+        let Some(bar) = self.command_bar.as_ref().filter(|bar| bar.card != card) else {
+            return;
+        };
+        let mode = bar.mode;
+        let Ok(field) = bar.handle.read(cx).map(CommandBar::field) else {
+            return;
+        };
+        self.close_command_bar(cx);
+        if !self.fullscreen {
+            self.show_command_bar(mode, BarInput::Field(field), window, cx);
+        }
+    }
+
+    /// The open bar's results again, after a shortcut changed what they
+    /// offer: ⌘D pinned the tab, ⇧⌘K cleared Today.
+    fn refresh_command_bar(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = self.command_bar.as_ref().map(|bar| bar.handle) else {
+            return;
+        };
+        let context = self.command_context();
+        let icons = self.command_bar_icons(&context);
+        let _ = handle.update(cx, |bar, window, cx| {
+            bar.set_context(context, icons, window, cx)
+        });
     }
 
     fn close_command_bar(&mut self, cx: &mut Context<Self>) {
@@ -1239,9 +1366,22 @@ impl BrowserApp {
                 host,
             }
         });
+        let closed = self
+            .state
+            .closed_tabs()
+            .iter()
+            .rev()
+            .map(|closed| ClosedEntry {
+                id: closed.tab.id,
+                space_id: closed.space_id,
+                title: closed.tab.title.clone(),
+                url: closed.tab.url.clone(),
+            })
+            .collect();
         CommandContext {
             space_id: active_space.id,
             tabs,
+            recent: self.recent.order(active_space),
             active,
             spaces: self
                 .state
@@ -1249,25 +1389,57 @@ impl BrowserApp {
                 .iter()
                 .map(|space| (space.id, space.name.clone()))
                 .collect(),
-            can_reopen: !self.state.closed_tabs().is_empty(),
+            closed,
+            history: self
+                .history
+                .pages()
+                .into_iter()
+                .map(HistoryEntry::from)
+                .collect(),
+            now: history::now(),
             sidebar_hidden: self.state.sidebar_hidden,
             has_today: active_space.section(Pin::Today).next().is_some(),
+            search_engine: self.state.search_engine(),
         }
     }
 
     fn run_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
         let active = self.active_tab_id();
+        let space_id = self.state.selected_space_id;
         match command {
             Command::Open(input) => self.open_url(&input, cx),
             Command::Navigate(input) => self.navigate_active(&input, cx),
+            Command::OpenInApp(url) => self.engine.borrow().open_in_app(&url),
             Command::SwitchToTab(id) => self.select_tab(id, window, cx),
             Command::SwitchToSpace(id) => self.switch_space(id, window, cx),
             Command::ToggleSidebar => self.toggle_sidebar(cx),
             Command::ClearToday => self.clear_today(cx),
             Command::NewSpace => self.new_space(window, cx),
             Command::ReopenClosedTab => self.reopen_closed(None, window, cx),
+            Command::ReopenTab(id) => {
+                let closed = self.state.closed_tabs();
+                if let Some(index) = closed.iter().position(|closed| closed.tab.id == id) {
+                    self.reopen_closed(Some(index), window, cx);
+                }
+            }
             Command::ToggleBlocking(host) => self.toggle_blocking(&host, cx),
-            Command::Reload | Command::TogglePin | Command::ToggleFavorite | Command::CopyUrl => {
+            Command::RenameSpace => {
+                // The name is edited in the sidebar's title row.
+                self.set_sidebar_hidden(false, cx);
+                self.start_rename(space_id, window, cx);
+            }
+            Command::UnloadSpace => self.unload_space(space_id, cx),
+            Command::Shortcut(shortcut) => self.shortcut(shortcut, window, cx),
+            Command::ShowHistory => self.toggle_command_bar(CommandMode::History, window, cx),
+            Command::ShowSettings => self.toggle_command_bar(CommandMode::Settings, window, cx),
+            Command::ClearHistory => self.ask_to_clear_history(window, cx),
+            Command::SearchWith(engine) => self.set_search_engine(engine, cx),
+            Command::Reload
+            | Command::TogglePin
+            | Command::ToggleFavorite
+            | Command::CopyUrl
+            | Command::DuplicateTab
+            | Command::MoveTab(_) => {
                 let Some(id) = active else {
                     return;
                 };
@@ -1275,18 +1447,137 @@ impl BrowserApp {
                     Command::Reload => self.reload(id, cx),
                     Command::TogglePin => self.toggle_pin(id, cx),
                     Command::ToggleFavorite => self.toggle_favorite(id, cx),
+                    Command::DuplicateTab => self.duplicate_tab(id, window, cx),
+                    Command::MoveTab(space_id) => self.move_tab_to_space(id, space_id, cx),
                     _ => self.copy_url(id, cx),
                 }
             }
         }
     }
 
+    /// Asks before forgetting the history: nothing brings it back.
+    pub fn ask_to_clear_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.activate_window();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Clear all history?",
+            Some(
+                "Map Browser forgets the pages you visited and your recently closed tabs, \
+                 in every space.",
+            ),
+            &["Clear History", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if answer.await == Ok(0) {
+                let _ = this.update(cx, |this, cx| this.clear_history(cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Forgets every visited page and closed tab, in every space.
+    fn clear_history(&mut self, cx: &mut Context<Self>) {
+        if self.history.clear() {
+            self.schedule_history_save(SAVE_DELAY, cx);
+        }
+        if self.state.clear_closed() {
+            self.persist_later(cx);
+        }
+        self.show_toast("Cleared history", cx);
+        self.refresh_command_bar(cx);
+    }
+
+    fn set_search_engine(&mut self, engine: SearchEngine, cx: &mut Context<Self>) {
+        if self.state.set_search_engine(engine) {
+            self.persist_later(cx);
+        }
+        // Short: the sidebar's toast is narrow.
+        self.show_toast(format!("Using {}", engine.name()), cx);
+    }
+
+    /// A tab's page committed a new document at `url`: a visit, in the
+    /// history of the tab's space.
+    fn record_visit(&mut self, tab_id: TabId, url: &str, cx: &mut Context<Self>) {
+        let Some(space_id) = self.state.space_of_tab(tab_id) else {
+            return;
+        };
+        let restored = self.restored.remove(&tab_id);
+        if self
+            .history
+            .visit(tab_id, space_id, url, restored, history::now())
+        {
+            self.schedule_history_save(PAGE_SAVE_DELAY, cx);
+        }
+    }
+
+    /// Like `schedule_save`, for the history's own file: never put off by
+    /// later changes, and written on a background thread.
+    fn schedule_history_save(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        let due = Instant::now() + delay;
+        if self.history_save_due.is_some_and(|pending| pending <= due) {
+            return;
+        }
+        self.history_save_due = Some(due);
+        self.history_save_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let Ok(Some(snapshot)) = this.update(cx, |this, _| {
+                this.history_save_due = None;
+                this.history.snapshot()
+            }) else {
+                return;
+            };
+            cx.background_executor()
+                .spawn(async move {
+                    if let Err(error) = snapshot.write() {
+                        eprintln!("Couldn't save the browsing history: {error}");
+                    }
+                })
+                .detach();
+        }));
+    }
+
     pub fn shortcut(&mut self, shortcut: Shortcut, window: &mut Window, cx: &mut Context<Self>) {
         self.end_rename(window, cx);
+        // Shortcuts that act on the page, or open something of their own,
+        // close the bar and run with the page in focus. The others leave it
+        // open, with its results brought up to date.
+        let bar_open = self.command_bar.is_some();
+        if bar_open
+            && matches!(
+                shortcut,
+                Shortcut::Reload
+                    | Shortcut::Stop
+                    | Shortcut::Back
+                    | Shortcut::Forward
+                    | Shortcut::Find
+                    | Shortcut::FindNext
+                    | Shortcut::FindPrevious
+                    | Shortcut::Print
+                    | Shortcut::DevTools
+            )
+        {
+            self.close_command_bar(cx);
+            window.activate_window();
+            self.focus_page();
+        }
         let active = self.active_tab_id();
         let tabs = &self.state.active_space().tabs;
         match shortcut {
             Shortcut::CommandBar => self.toggle_command_bar(CommandMode::NewTab, window, cx),
+            // ⌘L again selects the whole address, as in Chrome.
+            Shortcut::EditAddress
+                if self
+                    .command_bar
+                    .as_ref()
+                    .is_some_and(|bar| bar.mode == CommandMode::EditAddress) =>
+            {
+                if let Some(bar) = &self.command_bar {
+                    let _ = bar
+                        .handle
+                        .update(cx, |bar, window, cx| bar.select_all(window, cx));
+                }
+            }
             Shortcut::EditAddress => self.toggle_command_bar(CommandMode::EditAddress, window, cx),
             Shortcut::CloseTab if self.command_bar.is_some() => self.close_command_bar(cx),
             Shortcut::CloseTab => {
@@ -1383,6 +1674,10 @@ impl BrowserApp {
                 }
             }
         }
+        // ⌘T and ⌘L open, close or keep the bar themselves.
+        if bar_open && !matches!(shortcut, Shortcut::CommandBar | Shortcut::EditAddress) {
+            self.refresh_command_bar(cx);
+        }
     }
 
     /// ⌃Tab (`back`) and ⌃⇧Tab: a step through the space's recently used
@@ -1428,6 +1723,10 @@ impl BrowserApp {
                 }
             }
             EngineEvent::Title { tab_id, title } => {
+                // Also when the tab's title stays: its new page has one.
+                if self.history.set_title(tab_id, &title) {
+                    self.schedule_history_save(PAGE_SAVE_DELAY, cx);
+                }
                 let Some(tab) = self.state.tab(tab_id) else {
                     return;
                 };
@@ -1445,6 +1744,11 @@ impl BrowserApp {
                 // error shown is over (Back, a link on the error page).
                 if self.is_active(tab_id) && self.error.take().is_some() {
                     cx.notify();
+                }
+                // A new document's first address is a visit; addresses the
+                // page changes itself (History API, fragments) aren't.
+                if self.new_documents.remove(&tab_id) {
+                    self.record_visit(tab_id, &url, cx);
                 }
                 let Some(tab) = self.state.tab(tab_id) else {
                     return;
@@ -1524,6 +1828,8 @@ impl BrowserApp {
                 if let Some(page) = self.pages.get_mut(&tab_id) {
                     page.loading = false;
                 }
+                // A failed page is no visit.
+                self.new_documents.remove(&tab_id);
                 self.page_replaced(tab_id, cx);
                 // The tab shows the address that failed, as Chrome's address
                 // bar does, so ⌘L can fix a typo and Reload tries it again.
@@ -1559,6 +1865,7 @@ impl BrowserApp {
                 // window.close()) leaves the tab unloaded.
                 if !self.engine.borrow().has_tab(tab_id) && self.loaded.remove(&tab_id) {
                     self.pages.remove(&tab_id);
+                    self.new_documents.remove(&tab_id);
                     if self.is_active(tab_id) {
                         // Hides the emptied web container and gives keyboard
                         // focus back to the shell; the tab loads again when
@@ -1608,7 +1915,10 @@ impl BrowserApp {
                 permissions,
             } => self.permission_requested(id, tab_id, origin, permissions, window, cx),
             EngineEvent::PermissionDismissed { id } => self.permission_dismissed(id, cx),
-            EngineEvent::NewDocument { tab_id } => self.page_replaced(tab_id, cx),
+            EngineEvent::NewDocument { tab_id } => {
+                self.new_documents.insert(tab_id);
+                self.page_replaced(tab_id, cx);
+            }
             EngineEvent::Status { tab_id, text } => self.show_link_status(tab_id, text, window, cx),
         }
     }

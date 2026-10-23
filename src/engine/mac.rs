@@ -1114,6 +1114,11 @@ impl Engine {
             window.makeFirstResponder(Some(parent));
         }
     }
+    /// A mail, phone or messages address typed in the command bar opens in
+    /// its app, as a click on such a link does.
+    pub fn open_in_app(&self, url: &str) {
+        protocols::open_in_app(url);
+    }
     /// Edit > Undo and Redo chosen in the menu bar, for the active page if
     /// it has keyboard focus in the key window. ⌘Z and ⇧⌘Z go to the page
     /// first, and `PageKeys` undoes or redoes only if the page doesn't.
