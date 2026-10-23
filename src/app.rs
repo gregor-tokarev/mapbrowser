@@ -631,7 +631,7 @@ impl BrowserApp {
                 // Without the sidebar only the window's colour would change.
                 if self.state.sidebar_hidden && self.sidebar_width().is_none() {
                     let name = self.state.active_space().name.clone();
-                    self.show_toast(name, cx);
+                    self.show_toast_kind(ToastKind::Info, name, cx);
                 }
             }
             None => self.show_selected(),
