@@ -312,6 +312,8 @@ impl BrowserApp {
         if self.shortcuts.is_some() {
             return self.close_shortcuts(true, window, cx);
         }
+        // The panel taking key status would close the bar too, but only later.
+        self.close_command_bar(cx);
         let card = self.card_bounds(window.viewport_size());
         let bounds = window_bounds(card, window.bounds().origin);
         let display = window.display(cx).map(|display| display.id());
@@ -349,7 +351,12 @@ impl BrowserApp {
         });
     }
 
-    fn close_shortcuts(&mut self, refocus: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn close_shortcuts(
+        &mut self,
+        refocus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(shortcuts) = self.shortcuts.take() else {
             return;
         };

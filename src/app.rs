@@ -1236,8 +1236,9 @@ impl BrowserApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // The bar taking key status would end it too, but only later.
+        // The bar taking key status would end them too, but only later.
         self.end_rename(window, cx);
+        self.close_shortcuts(false, window, cx);
         self.menu = None;
         self.finish_slide();
         let context = self.command_context();
@@ -1372,7 +1373,7 @@ impl BrowserApp {
         });
     }
 
-    fn close_command_bar(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn close_command_bar(&mut self, cx: &mut Context<Self>) {
         let Some(bar) = self.command_bar.take() else {
             return;
         };
