@@ -167,7 +167,7 @@ impl Render for BrowserApp {
             .font_family(UI_FONT)
             .key_context(self.key_context())
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|this, _: &Dismiss, _, cx| this.dismiss(cx)))
+            .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
             .map(|root| menu::handle_menu_keys(root, cx))
             .when(self.sidebar_peek, |root| {
                 root.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {

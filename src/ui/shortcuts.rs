@@ -370,7 +370,7 @@ impl BrowserApp {
             .update(cx, |_, window, _| window.remove_window());
         if refocus {
             window.activate_window();
-            self.focus_page();
+            self.focus_page(window, cx);
         }
     }
 }

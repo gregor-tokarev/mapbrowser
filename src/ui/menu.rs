@@ -959,11 +959,11 @@ impl BrowserApp {
                 .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, _, _, cx| this.close_menu(cx)),
+                    cx.listener(|this, _, window, cx| this.close_menu(window, cx)),
                 )
                 .on_mouse_down(
                     MouseButton::Right,
-                    cx.listener(|this, _, _, cx| this.close_menu(cx)),
+                    cx.listener(|this, _, window, cx| this.close_menu(window, cx)),
                 )
                 .child(panel),
         )
@@ -1479,8 +1479,9 @@ impl BrowserApp {
                     .gap(px(6.))
                     .px(px(3.))
                     .child(
-                        highlights(cancel, target(0), cx)
-                            .on_click(cx.listener(|this, _, _, cx| this.close_menu(cx))),
+                        highlights(cancel, target(0), cx).on_click(
+                            cx.listener(|this, _, window, cx| this.close_menu(window, cx)),
+                        ),
                     )
                     .child(highlights(confirm, target(1), cx).on_click(cx.listener(
                         move |this, _, window, cx| this.run_menu_action(action, window, cx),
@@ -1567,7 +1568,7 @@ impl BrowserApp {
             Action::Zoom(step) => return self.zoom_page(step, cx),
             _ => {}
         }
-        self.close_menu(cx);
+        self.close_menu(window, cx);
         match action {
             Action::TogglePin(id) => self.toggle_pin(id, cx),
             Action::ToggleFavorite(id) => self.toggle_favorite(id, cx),
@@ -1776,7 +1777,7 @@ impl BrowserApp {
             .and_then(|entry| entry.action(at.part))
         {
             Some(Action::AskMoveTab(id)) => self.enter_submenu(MenuKind::MoveTab(id), cx),
-            Some(Action::Cancel) => self.close_menu(cx),
+            Some(Action::Cancel) => self.close_menu(window, cx),
             Some(action) => self.run_menu_action(action, window, cx),
             None => {}
         }

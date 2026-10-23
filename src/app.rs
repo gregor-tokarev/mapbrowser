@@ -605,8 +605,16 @@ impl BrowserApp {
         self.recent.visit(self.state.active_space());
     }
 
-    pub(crate) fn focus_page(&self) {
-        if let Some(id) = self.active_tab_id() {
+    /// Gives the active tab's page keyboard focus. A page the card covers
+    /// with a notice (`ui::page_notice`) is hidden: the notice takes it, so
+    /// Return and Esc answer it again after a menu or bar closes.
+    pub(crate) fn focus_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.active_tab_id() else {
+            return;
+        };
+        if self.notices.covers(id) {
+            self.focus_page_notice(window, cx);
+        } else {
             self.engine.borrow().focus_tab(id);
         }
     }
@@ -1146,7 +1154,7 @@ impl BrowserApp {
         window.focus(&self.focus_handle);
         // A menu opening ended the rename; it keeps keyboard focus.
         if self.menu.is_none() {
-            self.focus_page();
+            self.focus_page(window, cx);
         }
         cx.notify();
     }
@@ -1394,7 +1402,7 @@ impl BrowserApp {
         window.focus(&self.focus_handle);
         // A menu opening ended the rename; it keeps keyboard focus.
         if self.menu.is_none() {
-            self.focus_page();
+            self.focus_page(window, cx);
         }
         cx.notify();
     }
@@ -1616,9 +1624,9 @@ impl BrowserApp {
         cx.notify();
     }
 
-    pub fn close_menu(&mut self, cx: &mut Context<Self>) {
+    pub fn close_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.menu.take().is_some() {
-            self.focus_page();
+            self.focus_page(window, cx);
             cx.notify();
         }
     }
@@ -1657,7 +1665,7 @@ impl BrowserApp {
             self.open_command_bar(mode, window, cx);
         } else {
             window.activate_window();
-            self.focus_page();
+            self.focus_page(window, cx);
         }
     }
 
@@ -1840,13 +1848,13 @@ impl BrowserApp {
         match event {
             CommandBarEvent::Run(command) => {
                 window.activate_window();
-                self.focus_page();
+                self.focus_page(window, cx);
                 self.run_command(command.clone(), window, cx);
             }
             CommandBarEvent::Dismiss { refocus } => {
                 if *refocus {
                     window.activate_window();
-                    self.focus_page();
+                    self.focus_page(window, cx);
                 }
             }
         }
@@ -2072,7 +2080,7 @@ impl BrowserApp {
         self.end_rename(window, cx);
         // As with a macOS menu, a key closes an open menu first; the menu
         // would otherwise stay over a tab that moved or closed.
-        self.close_menu(cx);
+        self.close_menu(window, cx);
         // Shortcuts that act on the page, or open something of their own,
         // close the bar and run with the page in focus. The others leave it
         // open, with its results brought up to date.
@@ -2093,7 +2101,7 @@ impl BrowserApp {
         {
             self.close_command_bar(cx);
             window.activate_window();
-            self.focus_page();
+            self.focus_page(window, cx);
         }
         let active = self.active_tab_id();
         let tabs = &self.state.active_space().tabs;

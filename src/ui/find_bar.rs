@@ -429,7 +429,7 @@ impl BrowserApp {
             FindBarEvent::Close => {
                 self.close_find_bar(cx);
                 window.activate_window();
-                self.focus_page();
+                self.focus_page(window, cx);
             }
         }
     }
