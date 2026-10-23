@@ -379,7 +379,8 @@ impl BrowserApp {
         }
     }
 
-    /// Tab and ⇧Tab move between the card's buttons while it shows.
+    /// Tab and ⇧Tab move between the card's buttons while it shows. An
+    /// open menu keeps them for its own choices.
     pub(crate) fn tab_through_card(
         &mut self,
         event: &KeyDownEvent,
@@ -391,6 +392,7 @@ impl BrowserApp {
             || modifiers.control
             || modifiers.alt
             || modifiers.platform
+            || self.menu.is_some()
             || self.permission_shown().is_none()
         {
             return;
