@@ -17,7 +17,7 @@ use super::{
 };
 use crate::{
     app::BrowserApp,
-    engine::{Permission, ZoomStep, is_insecure, site_origin},
+    engine::{Permission, ZoomStep, site_origin},
     favicons::host_of,
     model::{Pin, SpaceId, THEME_COUNT, TabId},
     ui::page_notice::Leaving,
@@ -789,7 +789,7 @@ impl BrowserApp {
                     Entry::Site {
                         host: host.clone(),
                         origin: site_origin(&url).unwrap_or_default(),
-                        insecure: is_insecure(&url),
+                        insecure: self.page_insecure(id, &url),
                     },
                     Entry::Separator,
                     Entry::Check {

@@ -20,7 +20,7 @@ use super::{
 };
 use crate::{
     app::BrowserApp,
-    engine::{CrashReason, certificate_error_overridable},
+    engine::{CrashReason, certificate_error_overridable, is_insecure},
     input::{InputEvent, InputStyle, TextInput},
     model::{SpaceId, TabId},
 };
@@ -217,8 +217,6 @@ impl PageNotices {
 
     /// Whether the user continued past a certificate error on the site the
     /// tab shows.
-    // Kept for the URL pill, which doesn't mark such sites yet.
-    #[allow(dead_code)]
     pub fn certificate_bypassed(&self, tab_id: TabId) -> bool {
         self.tabs
             .get(&tab_id)
@@ -406,6 +404,13 @@ fn button(
 }
 
 impl BrowserApp {
+    /// Whether others could read or change the tab's page: it came over
+    /// plain HTTP, or the user continued past its certificate error. The
+    /// URL pill and the site menu say so, as Chrome's address bar does.
+    pub(crate) fn page_insecure(&self, tab_id: TabId, url: &str) -> bool {
+        is_insecure(url) || self.notices.certificate_bypassed(tab_id)
+    }
+
     /// The active tab's page state over the card, if it has one.
     pub(super) fn render_page_notice(
         &self,

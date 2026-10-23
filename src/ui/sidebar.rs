@@ -18,7 +18,7 @@ use super::{
 };
 use crate::{
     app::BrowserApp,
-    engine::{Shortcut, is_insecure, site_origin},
+    engine::{Shortcut, site_origin},
     favicons::host_of,
     model::{Pin, Space, SpaceId, Tab, TabId},
     recent::TabSwitch,
@@ -957,7 +957,7 @@ impl BrowserApp {
         // The whole origin, scheme included, on hover: the pill shows the
         // end of a long host.
         let origin = tab.map(|tab| site_origin(&tab.url).unwrap_or_else(|| tab.url.clone()));
-        let insecure = tab.is_some_and(|tab| is_insecure(&tab.url));
+        let insecure = tab.is_some_and(|tab| self.page_insecure(tab.id, &tab.url));
         let blocking_off = host
             .as_deref()
             .is_some_and(|host| self.state.is_blocking_disabled(host));
