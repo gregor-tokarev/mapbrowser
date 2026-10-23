@@ -372,7 +372,12 @@ impl TextInput {
         self.select_to(self.content.len(), cx);
     }
 
+    /// Where ⌥← goes. A password is one word, as in AppKit's secure
+    /// fields: moving by its words would show where its spaces are.
     fn previous_word(&self) -> usize {
+        if self.masked {
+            return 0;
+        }
         self.content[..self.cursor_offset()]
             .unicode_word_indices()
             .next_back()
@@ -380,6 +385,9 @@ impl TextInput {
     }
 
     fn next_word(&self) -> usize {
+        if self.masked {
+            return self.content.len();
+        }
         let cursor = self.cursor_offset();
         self.content[cursor..]
             .unicode_word_indices()
