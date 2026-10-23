@@ -451,7 +451,14 @@ impl BrowserApp {
             .list(self.state.selected_space_id, &self.state.spaces)
             .tabs
             .bounds();
-        let speed = autoscroll_speed(pointer.y, list).filter(|_| sidebar.contains(&pointer));
+        // Over the space switcher, just past the list's bottom edge, a drop
+        // moves the tab to another space: the list stays where it is.
+        let over_switcher = self.state.spaces.len() > 1
+            && pointer.y >= sidebar.bottom() - px(BOTTOM_BAR)
+            && pointer.x >= sidebar.left() + px(SWITCHER_INSET)
+            && pointer.x < sidebar.right() - px(SWITCHER_INSET);
+        let speed = autoscroll_speed(pointer.y, list)
+            .filter(|_| sidebar.contains(&pointer) && !over_switcher);
         let scrolling = self.tab_lists.drag.is_some();
         self.tab_lists.drag = speed.map(|speed| DragScroll {
             speed,
