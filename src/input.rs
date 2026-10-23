@@ -1088,10 +1088,12 @@ impl Render for TextInput {
 /// Pasted text on one line. Line breaks go, with the spaces around them,
 /// when the lines then make one address, as a link wrapped by a mail or
 /// chat app does ("https://example.com/very/long/", "path/to/page");
-/// between words they become spaces.
+/// between words they become spaces. So do tabs, which a field would show
+/// as a wide gap.
 fn one_line(text: &str) -> String {
+    let text = text.replace('\t', " ");
     if !text.contains(['\r', '\n']) {
-        return text.to_owned();
+        return text;
     }
     let lines: Vec<&str> = text
         .split(['\r', '\n'])
