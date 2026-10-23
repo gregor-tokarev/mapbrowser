@@ -52,6 +52,7 @@ const COLUMNS: [&[Group]; 2] = [
                 ("Edit the address", &["⌘L"]),
                 ("Close the tab", &["⌘W"]),
                 ("Reopen a closed tab", &["⇧⌘T"]),
+                ("Search the history", &["⌘Y"]),
                 ("Go to tab 1–8", &["⌘1–⌘8"]),
                 ("Go to the last tab", &["⌘9"]),
                 ("Back to recent tabs, hold ⌃", &["⌃Tab"]),
@@ -95,7 +96,11 @@ const COLUMNS: [&[Group]; 2] = [
         },
         Group {
             title: "Map Browser",
-            rows: &[("Minimise the window", &["⌘M"]), ("Quit", &["⌘Q"])],
+            rows: &[
+                ("Settings", &["⌘,"]),
+                ("Minimise the window", &["⌘M"]),
+                ("Quit", &["⌘Q"]),
+            ],
         },
     ],
 ];
