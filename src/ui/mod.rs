@@ -21,10 +21,10 @@ pub mod window_frame;
 use crate::{Dismiss, app::BrowserApp};
 use drag::DraggedEdge;
 use gpui::{
-    AnyView, App, AppContext, Bounds, BoxShadow, Context, Div, DragMoveEvent, FontWeight,
-    InteractiveElement, IntoElement, ModifiersChangedEvent, MouseButton, MouseMoveEvent,
-    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
-    point, prelude::FluentBuilder, px, size,
+    AnyView, App, AppContext, Bounds, BoxShadow, Context, Div, DragMoveEvent, Font, FontWeight,
+    InteractiveElement, IntoElement, LineFragment, ModifiersChangedEvent, MouseButton,
+    MouseMoveEvent, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement,
+    Styled, TextRun, Window, div, font, point, prelude::FluentBuilder, px, size,
 };
 use theme::Theme;
 
@@ -49,11 +49,14 @@ pub struct SlideFrame {
 
 impl BrowserApp {
     /// The sidebar's width, unless it is hidden or a page is fullscreen. A
-    /// hidden sidebar shows while the page on screen asks for a permission:
-    /// the question is in it. It also peeks out from the window's edge.
+    /// hidden sidebar shows while the page on screen asks for a permission,
+    /// and while a space is named: the question and the name are in it. It
+    /// also peeks out from the window's edge.
     pub fn sidebar_width(&self) -> Option<f32> {
-        let shown =
-            !self.state.sidebar_hidden || self.sidebar_peek || self.permission_shown().is_some();
+        let shown = !self.state.sidebar_hidden
+            || self.sidebar_peek
+            || self.permission_shown().is_some()
+            || self.renaming.is_some();
         (shown && !self.fullscreen).then(|| self.state.sidebar_width())
     }
 
@@ -250,12 +253,30 @@ pub fn placeholder_favicon(host: Option<&str>, theme: &Theme) -> Div {
         .child(initial)
 }
 
+/// How many lines `text` takes in `font` at `size`, wrapped at `width`
+/// the way GPUI lays out text.
+pub fn wrapped_lines(text: &str, font: Font, size: f32, width: f32, cx: &App) -> usize {
+    let mut wrapper = cx.text_system().line_wrapper(font, px(size));
+    wrapper
+        .wrap_line(&[LineFragment::text(text)], px(width))
+        .count()
+        + 1
+}
+
 /// Gap between the pointer and a tooltip, a tooltip's height, and the room
 /// it keeps from the sidebar's edges.
 const TOOLTIP_GAP: f32 = 6.;
 const TOOLTIP_HEIGHT: f32 = 26.;
 const TOOLTIP_EDGE: f32 = 6.;
 const TOOLTIP_MAX_WIDTH: f32 = 180.;
+const TOOLTIP_TEXT_SIZE: f32 = 12.;
+/// Wrapping tooltips: the line height, and the most lines shown.
+const TOOLTIP_LINE: f32 = 16.;
+const TOOLTIP_MAX_LINES: usize = 4;
+/// A tooltip's padding and border on each side, and the gap before its
+/// shortcut.
+const TOOLTIP_PADDING: f32 = 8. + 1.;
+const TOOLTIP_SHORTCUT_GAP: f32 = 6.;
 
 /// Small text tooltips with the control's shortcut, like Arc's. Anything
 /// drawn over the card is hidden behind the page on macOS, so they stay
@@ -269,6 +290,8 @@ pub struct Tooltip {
     width: f32,
     /// The pointer's x when the tooltip opened.
     pointer: f32,
+    /// For text that wraps rather than ending in "…": its lines and width.
+    wrapped: Option<(usize, f32)>,
 }
 
 impl Tooltip {
@@ -279,9 +302,41 @@ impl Tooltip {
         theme: &Theme,
         width: f32,
     ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
-        let (text, theme) = (text.into(), *theme);
+        Self::builder(text.into(), shortcut, *theme, width, false)
+    }
+
+    /// Like `build`, for text that should show in full, such as a long
+    /// space name: it wraps onto a few lines instead of ending in "…".
+    pub fn build_wrapping(
+        text: impl Into<SharedString>,
+        shortcut: &'static str,
+        theme: &Theme,
+        width: f32,
+    ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+        Self::builder(text.into(), shortcut, *theme, width, true)
+    }
+
+    fn builder(
+        text: SharedString,
+        shortcut: &'static str,
+        theme: Theme,
+        width: f32,
+        wrap: bool,
+    ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
         move |window, cx| {
             let pointer = f32::from(window.mouse_position().x);
+            // Measured when it opens, so drawing the sidebar costs nothing.
+            let wrapped = wrap
+                .then(|| {
+                    let mut room = Self::max_width(width) - 2. * TOOLTIP_PADDING;
+                    if !shortcut.is_empty() {
+                        room -=
+                            text_width(shortcut, TOOLTIP_TEXT_SIZE, window) + TOOLTIP_SHORTCUT_GAP;
+                    }
+                    let lines = wrapped_lines(&text, font(UI_FONT), TOOLTIP_TEXT_SIZE, room, cx);
+                    (lines.min(TOOLTIP_MAX_LINES), room)
+                })
+                .filter(|&(lines, _)| lines > 1);
             let text = text.clone();
             cx.new(|_| Self {
                 text,
@@ -289,22 +344,48 @@ impl Tooltip {
                 theme,
                 width,
                 pointer,
+                wrapped,
             })
             .into()
         }
     }
+
+    /// The widest a tooltip gets in a sidebar `width` wide.
+    fn max_width(width: f32) -> f32 {
+        TOOLTIP_MAX_WIDTH.min((width - 2. * TOOLTIP_EDGE).max(0.))
+    }
+}
+
+/// The width of one line of `text` in the UI font at `size`.
+fn text_width(text: &str, size: f32, window: &Window) -> f32 {
+    let run = TextRun {
+        len: text.len(),
+        font: font(UI_FONT),
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let width = window
+        .text_system()
+        .layout_line(text, px(size), &[run], None)
+        .width;
+    f32::from(width).ceil()
 }
 
 impl Render for Tooltip {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &self.theme;
         let span = (self.width - 2. * TOOLTIP_EDGE).max(0.);
+        let height = match self.wrapped {
+            Some((lines, _)) => lines as f32 * TOOLTIP_LINE + 2. * 5. + 2.,
+            None => TOOLTIP_HEIGHT,
+        };
         let bubble = div()
             .font_family(UI_FONT)
             .flex()
-            .gap(px(6.))
-            .h(px(TOOLTIP_HEIGHT))
-            .items_center()
+            .gap(px(TOOLTIP_SHORTCUT_GAP))
+            .h(px(height))
             .px(px(8.))
             .rounded(px(6.))
             .bg(theme.surface())
@@ -312,14 +393,29 @@ impl Render for Tooltip {
             .border_color(gpui::black().opacity(0.1))
             .shadow(vec![shadow(2., 8., 0.12)])
             .flex_none()
-            .max_w(px(TOOLTIP_MAX_WIDTH.min(span)))
-            .text_size(px(12.))
+            .max_w(px(Self::max_width(self.width)))
+            .text_size(px(TOOLTIP_TEXT_SIZE))
             .text_color(theme.title())
-            .child(truncated(self.text.clone()).min_w_0())
+            .map(|bubble| match self.wrapped {
+                Some((lines, room)) => bubble.items_start().py(px(5.)).child(
+                    div()
+                        .w(px(room))
+                        .line_height(px(TOOLTIP_LINE))
+                        .line_clamp(lines)
+                        .text_ellipsis()
+                        .child(self.text.clone()),
+                ),
+                None => bubble
+                    .items_center()
+                    .child(truncated(self.text.clone()).min_w_0()),
+            })
             .when(!self.shortcut.is_empty(), |bubble| {
                 bubble.child(
                     div()
                         .flex_none()
+                        .when(self.wrapped.is_some(), |shortcut| {
+                            shortcut.line_height(px(TOOLTIP_LINE))
+                        })
                         .text_color(theme.tertiary())
                         .child(self.shortcut),
                 )
@@ -343,6 +439,6 @@ impl Render for Tooltip {
         } else {
             row.child(spacer(origin - TOOLTIP_EDGE)).child(bubble)
         };
-        div().w_0().h(px(TOOLTIP_GAP + TOOLTIP_HEIGHT)).child(row)
+        div().w_0().h(px(TOOLTIP_GAP + height)).child(row)
     }
 }
