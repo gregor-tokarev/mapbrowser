@@ -3,7 +3,7 @@
 PYTHON ?= python3
 
 # Resolve Cargo's actual output directory, including CARGO_TARGET_DIR overrides.
-APP_BUNDLE = $$(cargo metadata --no-deps --format-version=1 | $(PYTHON) -c 'import json, sys; from pathlib import Path; print(Path(json.load(sys.stdin)["target_directory"]) / "bundle" / "Mapbrowser.app")')
+APP_BUNDLE = $$(cargo metadata --no-deps --format-version=1 | $(PYTHON) -c 'import json, sys; from pathlib import Path; print(Path(json.load(sys.stdin)["target_directory"]) / "bundle" / "Map Browser.app")')
 
 .PHONY: help build run dev test check fmt test-server quit-running
 

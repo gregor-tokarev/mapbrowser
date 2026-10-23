@@ -136,7 +136,7 @@ impl BrowserApp {
                         .border_1()
                         .border_color(theme.ink(0.1))
                         .text_size(px(12.5))
-                        .text_color(gpui::rgb(0xc4322b))
+                        .text_color(theme.error())
                         .child(error),
                 )
             })

@@ -92,7 +92,7 @@ unsafe fn build_classes() {
             );
             decl.add_method(
                 sel!(applicationShouldHandleReopen:hasVisibleWindows:),
-                should_handle_reopen as extern "C" fn(&mut Object, Sel, id, bool),
+                should_handle_reopen as extern "C" fn(&mut Object, Sel, id, bool) -> BOOL,
             );
             decl.add_method(
                 sel!(applicationWillTerminate:),
@@ -283,6 +283,11 @@ impl MacPlatform {
                 if menu_config.name == "Window" {
                     let app: id = msg_send![APP_CLASS, sharedApplication];
                     app.setWindowsMenu_(menu);
+                }
+                // AppKit puts its menu search field in the Help menu.
+                if menu_config.name == "Help" {
+                    let app: id = msg_send![APP_CLASS, sharedApplication];
+                    let _: () = msg_send![app, setHelpMenu: menu];
                 }
             }
 
@@ -1443,10 +1448,17 @@ extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
     }
 }
 
-extern "C" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_windows: bool) {
+/// AppKit reads the BOOL this returns: YES lets it do its usual reopen work,
+/// such as bringing back a minimized window.
+extern "C" fn should_handle_reopen(
+    this: &mut Object,
+    _: Sel,
+    _: id,
+    has_open_windows: bool,
+) -> BOOL {
     if !has_open_windows {
         let Some(platform) = (unsafe { get_mac_platform(this) }) else {
-            return;
+            return YES;
         };
         let mut lock = platform.0.lock();
         if let Some(mut callback) = lock.reopen.take() {
@@ -1455,6 +1467,7 @@ extern "C" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_wi
             platform.0.lock().reopen.get_or_insert(callback);
         }
     }
+    YES
 }
 
 extern "C" fn will_terminate(this: &mut Object, _: Sel, _: id) {

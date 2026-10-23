@@ -13,6 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use block2::RcBlock;
 use objc2::{
     Encode, MainThreadMarker, MainThreadOnly, define_class, ffi, msg_send,
     rc::Retained,
@@ -25,7 +26,8 @@ use objc2_app_kit::{
 };
 use objc2_core_graphics::CGMutablePath;
 use objc2_foundation::{
-    NSArray, NSNotification, NSObject, NSPoint, NSRect, NSSize, NSString, NSURL,
+    NSArray, NSBundle, NSDictionary, NSError, NSNotification, NSObject, NSPoint, NSRect, NSSize,
+    NSString, NSURL,
 };
 use objc2_quartz_core::{CAShapeLayer, CATransaction};
 
@@ -385,11 +387,84 @@ pub fn begin_window_drag() {
     }
 }
 
-/// The standard About panel, with the bundle's name, version and icon.
+/// The standard About panel with the bundle's icon, under the product's
+/// name and its version from Cargo.toml.
 pub fn show_about_panel() {
-    if let Some(mtm) = MainThreadMarker::new() {
-        NSApplication::sharedApplication(mtm).orderFrontStandardAboutPanel(None);
+    use objc2_app_kit::{
+        NSAboutPanelOptionApplicationName, NSAboutPanelOptionApplicationVersion,
+        NSAboutPanelOptionVersion,
+    };
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let name = NSString::from_str("Map Browser");
+    let version = NSString::from_str(env!("CARGO_PKG_VERSION"));
+    // Without a separate build number, not "Version 0.1.0 (0.1.0)".
+    let build = NSString::from_str("");
+    let values: [&AnyObject; 3] = [&name, &version, &build];
+    // SAFETY: The keys are AppKit's About panel option constants, which are
+    // NSStrings, and each value is the NSString those options take.
+    unsafe {
+        let options = NSDictionary::from_slices(
+            &[
+                NSAboutPanelOptionApplicationName,
+                NSAboutPanelOptionApplicationVersion,
+                NSAboutPanelOptionVersion,
+            ],
+            &values,
+        );
+        NSApplication::sharedApplication(mtm).orderFrontStandardAboutPanelWithOptions(&options);
     }
+}
+
+/// Whether macOS opens web links with this app, or another copy of it.
+pub fn is_default_browser() -> bool {
+    let Some(probe) = NSURL::URLWithString(&NSString::from_str("https://example.com/")) else {
+        return false;
+    };
+    let Some(ours) = NSBundle::mainBundle().bundleIdentifier() else {
+        return false;
+    };
+    NSWorkspace::sharedWorkspace()
+        .URLForApplicationToOpenURL(&probe)
+        .and_then(|handler| NSBundle::bundleWithURL(&handler))
+        .and_then(|handler| handler.bundleIdentifier())
+        .is_some_and(|handler| handler.isEqualToString(&ours))
+}
+
+/// Asks macOS to open web links with this app (macOS 12 and later). macOS
+/// asks the user to confirm, and changes https along with http.
+pub fn set_as_default_browser() {
+    let app = NSBundle::mainBundle().bundleURL();
+    // Called on a queue of AppKit's choosing: it only logs.
+    let done = RcBlock::new(|error: *mut NSError| {
+        // SAFETY: AppKit passes a valid NSError or null.
+        if let Some(error) = unsafe { error.as_ref() } {
+            eprintln!(
+                "Couldn't become the default browser: {}",
+                error.localizedDescription()
+            );
+        }
+    });
+    NSWorkspace::sharedWorkspace()
+        .setDefaultApplicationAtURL_toOpenURLsWithScheme_completionHandler(
+            &app,
+            &NSString::from_str("http"),
+            Some(&done),
+        );
+}
+
+/// The address in a .webloc file. Foundation reads both the XML and the
+/// binary form Finder and Safari write.
+pub fn webloc_address(path: &std::path::Path) -> Option<String> {
+    let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+    // SAFETY: A documented class method, reading a property list file on
+    // the main thread; the result is checked below.
+    let plist =
+        unsafe { NSDictionary::<NSString, AnyObject>::dictionaryWithContentsOfURL_error(&url) }
+            .ok()?;
+    let address = plist.objectForKey(&NSString::from_str("URL"))?;
+    Some(address.downcast::<NSString>().ok()?.to_string())
 }
 
 /// Shows `path` selected in a Finder window.

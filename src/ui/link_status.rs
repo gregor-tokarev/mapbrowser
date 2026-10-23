@@ -18,9 +18,9 @@ use gpui::{
     point, prelude::FluentBuilder, px, size,
 };
 
-const HEIGHT: f32 = 22.;
+pub(super) const HEIGHT: f32 = 22.;
 /// The pill's distance from the card's left and bottom edges.
-const INSET: f32 = 6.;
+pub(super) const INSET: f32 = 6.;
 const PADDING: f32 = 8.;
 const FONT_SIZE: f32 = 12.;
 /// The widest the pill gets; on narrow cards, half the card.
@@ -36,7 +36,7 @@ fn shown_address(address: &str) -> &str {
 
 /// `text`, or as much of its start and end around a "…" (`elide_middle`)
 /// as fits in `max_width`, measured with `width`.
-fn fit_middle(text: &str, max_width: f32, width: impl Fn(&str) -> f32) -> String {
+pub(super) fn fit_middle(text: &str, max_width: f32, width: impl Fn(&str) -> f32) -> String {
     if width(text) <= max_width {
         return text.to_owned();
     }
@@ -126,6 +126,19 @@ struct PillWindow {
 }
 
 impl BrowserApp {
+    /// Whether the pill shows; a toast over the card stands above it then.
+    pub(super) fn link_status_shown(&self) -> bool {
+        self.link_status.tab_id.is_some()
+    }
+
+    /// The pill came or went: a toast over the card moves out of its way
+    /// (`sync_toast_window`), which takes a frame of the browser window.
+    fn link_status_moved_toast(&self, cx: &mut Context<Self>) {
+        if self.toast_window.is_some() {
+            cx.notify();
+        }
+    }
+
     /// Whether the pill may show the hovered link of `tab_id`'s page.
     fn shows_link_status(&self, tab_id: TabId) -> bool {
         self.active_tab_id() == Some(tab_id)
@@ -169,9 +182,11 @@ impl BrowserApp {
         let width = (measure(&text) + 2. * PADDING + 1.).ceil();
         let size = size(px(width + 2. * MARGIN), px(HEIGHT + 2. * MARGIN));
         let theme = self.theme();
-        #[cfg(target_os = "macos")]
         let shown = self.link_status.tab_id.is_some();
         self.link_status.tab_id = Some(tab_id);
+        if !shown {
+            self.link_status_moved_toast(cx);
+        }
         let Some(pill) = &mut self.link_status.pill else {
             let bounds = Bounds::new(window.bounds().origin + window_origin(card), size);
             let display = window.display(cx).map(|display| display.id());
@@ -238,13 +253,11 @@ impl BrowserApp {
         });
     }
 
-    fn hide_link_status(
-        &mut self,
-        #[cfg_attr(target_os = "macos", allow(unused_variables))] cx: &mut Context<Self>,
-    ) {
+    fn hide_link_status(&mut self, cx: &mut Context<Self>) {
         if self.link_status.tab_id.take().is_none() {
             return;
         }
+        self.link_status_moved_toast(cx);
         // macOS keeps the window for next time; previews can't hide one.
         #[cfg(target_os = "macos")]
         if let Some(view) = self

@@ -166,6 +166,12 @@ impl BrowserApp {
             .on_drop(cx.listener(|this, dragged: &DraggedTab, window, cx| {
                 this.drop_tab(dragged.0, window, cx)
             }))
+            // Files from Finder open as tabs.
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
+                    this.open_dropped(paths, cx)
+                }),
+            )
             .child(
                 div()
                     .absolute()
@@ -936,7 +942,8 @@ impl BrowserApp {
         };
         let error = self.error_text().filter(|_| self.page_covers_card());
         let permission = self.render_permission_card(width, theme, cx);
-        if self.toast.is_none() && error.is_none() && permission.is_none() {
+        let toasts = self.render_toasts(width, theme, cx);
+        if toasts.is_empty() && error.is_none() && permission.is_none() {
             return None;
         }
         Some(
@@ -949,25 +956,14 @@ impl BrowserApp {
                 .flex_col()
                 .gap(px(6.))
                 .children(permission)
-                .when_some(self.toast.as_ref(), |notice, toast| {
-                    notice.child(
-                        card(div())
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.title())
-                            .child(icon(Icon::Check, 14., theme.focus()).flex_none())
-                            .child(truncated(toast.text.clone()).min_w_0()),
-                    )
-                })
+                .children(toasts)
                 .when_some(error, |notice, error| {
                     notice.child(
                         card(div())
                             .flex()
                             .items_center()
                             .gap(px(8.))
-                            .child(div().flex_1().text_color(gpui::rgb(0xc4322b)).child(error))
+                            .child(div().flex_1().text_color(theme.error()).child(error))
                             .child(
                                 press_only(
                                     div()

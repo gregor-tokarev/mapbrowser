@@ -2,6 +2,13 @@
 //! colours Arc tints per theme (titles, focus, command bar surface), taken
 //! from rendered Arc windows rather than its picker colours. Everything else
 //! is black or white at a fixed alpha, so it takes the gradient's hue.
+//!
+//! Every tone is checked against WCAG 2 contrast over all eight gradients,
+//! light and dark, wherever the sidebar can reach on them, and over the
+//! surfaces: text at least 4.5:1, icons and the inactive space dots at least
+//! 3:1. White text on a focus fill (the command bar's selected row, a menu's
+//! highlight, Allow) reaches 4.5:1 too, so the focus tones are deeper than
+//! Arc's own.
 
 use crate::model::THEME_COUNT;
 use gpui::{
@@ -37,36 +44,36 @@ const fn tones(from: u32, to: u32, title: u32, focus: u32, surface: u32) -> Tone
 /// green, peach, pink, teal, grey and amber.
 const PALETTES: [[Tones; 2]; THEME_COUNT as usize] = [
     [
-        tones(0xe2e3fa, 0xf9eded, 0x0a0d4e, 0x8d92fb, 0xfdfdff),
+        tones(0xe2e3fa, 0xf9eded, 0x0a0d4e, 0x5b62f9, 0xfdfdff),
         tones(0x26273c, 0x2d2633, 0xdcdefd, 0x5d63f0, 0x1d1e30),
     ],
     [
-        tones(0xd6e3fb, 0xe4e6fd, 0x000c33, 0x6f8cf0, 0xfcfdff),
-        tones(0x1e2642, 0x262843, 0xdde4fd, 0x5a73e6, 0x1a2037),
+        tones(0xd6e3fb, 0xe4e6fd, 0x000c33, 0x456bec, 0xfcfdff),
+        tones(0x1e2642, 0x262843, 0xdde4fd, 0x506be5, 0x1a2037),
     ],
     [
-        tones(0xd3efd8, 0xcbe7d5, 0x001e17, 0x5cb978, 0xfbfefb),
-        tones(0x1c2c23, 0x1a2a26, 0xd7f2df, 0x3f9a5c, 0x17241d),
+        tones(0xd3efd8, 0xcbe7d5, 0x001e17, 0x38834f, 0xfbfefb),
+        tones(0x1c2c23, 0x1a2a26, 0xd7f2df, 0x36844f, 0x17241d),
     ],
     [
-        tones(0xfbd2b8, 0xf4b5a3, 0x320e03, 0xd39778, 0xfefaf7),
-        tones(0x3b2920, 0x36211f, 0xfbe2d6, 0xb8704f, 0x2d201a),
+        tones(0xfbd2b8, 0xf4b5a3, 0x320e03, 0xa85a35, 0xfefaf7),
+        tones(0x3b2920, 0x36211f, 0xfbe2d6, 0xa86344, 0x2d201a),
     ],
     [
-        tones(0xf9d3e0, 0xeec6e5, 0x3b0b25, 0xdf7aa6, 0xfffafc),
-        tones(0x3b2230, 0x322036, 0xfadbe8, 0xc0567f, 0x2e1b26),
+        tones(0xf9d3e0, 0xeec6e5, 0x3b0b25, 0xd03a7b, 0xfffafc),
+        tones(0x3b2230, 0x322036, 0xfadbe8, 0xbd4f79, 0x2e1b26),
     ],
     [
-        tones(0xc9eef0, 0xc2e2ea, 0x002a2e, 0x3aa6b3, 0xf9feff),
-        tones(0x182d31, 0x172629, 0xd3f1f3, 0x2c8c98, 0x142427),
+        tones(0xc9eef0, 0xc2e2ea, 0x002a2e, 0x2d7f89, 0xf9feff),
+        tones(0x182d31, 0x172629, 0xd3f1f3, 0x28808b, 0x142427),
     ],
     [
-        tones(0xededed, 0xe5e5e6, 0x18181b, 0x7f7f87, 0xfafafa),
+        tones(0xededed, 0xe5e5e6, 0x18181b, 0x74747c, 0xfafafa),
         tones(0x2b2b2e, 0x232326, 0xececef, 0x6c6c74, 0x222225),
     ],
     [
-        tones(0xf7e6b8, 0xf1d39b, 0x2d1d00, 0xc49a3a, 0xfffcf3),
-        tones(0x362d19, 0x2f2617, 0xf6ebcf, 0xa8822c, 0x2a2314),
+        tones(0xf7e6b8, 0xf1d39b, 0x2d1d00, 0x8f712a, 0xfffcf3),
+        tones(0x362d19, 0x2f2617, 0xf6ebcf, 0x917026, 0x2a2314),
     ],
 ];
 
@@ -159,27 +166,29 @@ impl Theme {
 
     /// Toolbar glyphs.
     pub fn icon(&self) -> Hsla {
-        self.by_mode(0.58, 0.62)
+        self.by_mode(0.64, 0.68)
     }
 
     /// The URL pill's hostname.
     pub fn url_text(&self) -> Hsla {
-        self.by_mode(0.62, 0.70)
+        self.by_mode(0.66, 0.72)
     }
 
     /// The space title.
     pub fn muted(&self) -> Hsla {
-        self.by_mode(0.45, 0.50)
+        self.by_mode(0.62, 0.56)
     }
 
-    /// "New Tab", "Clear", placeholders.
+    /// "New Tab", "Clear", placeholders, menu headers, hosts: the faintest
+    /// text, still 4.5:1.
     pub fn tertiary(&self) -> Hsla {
-        self.by_mode(0.32, 0.42)
+        self.by_mode(0.59, 0.51)
     }
 
-    /// Unavailable navigation buttons, inactive space dots.
+    /// Unavailable navigation buttons, inactive space dots: 3:1, so the dots
+    /// stay visible, yet clearly fainter than `icon`.
     pub fn disabled(&self) -> Hsla {
-        self.by_mode(0.22, 0.25)
+        self.by_mode(0.46, 0.37)
     }
 
     /// The URL pill and favorite tiles.
@@ -209,7 +218,8 @@ impl Theme {
         self.by_mode(0.14, 0.12)
     }
 
-    /// Highlights: the command bar's selected row, a selected favorite's border.
+    /// Highlights: the command bar's selected row, a selected favorite's
+    /// border. Text on it is white.
     pub fn focus(&self) -> Hsla {
         self.focus.into()
     }
@@ -217,6 +227,11 @@ impl Theme {
     /// Buttons that delete something, with white text.
     pub fn danger(&self) -> Hsla {
         rgb(0xd13b33).into()
+    }
+
+    /// Error text on a surface: the light red reads on dark surfaces.
+    pub fn error(&self) -> Hsla {
+        rgb(if self.dark { 0xff6b5e } else { 0xc4322b }).into()
     }
 
     /// The command bar and menus.
