@@ -15,6 +15,7 @@
 use super::{
     UI_FONT,
     command_bar::{self, TRANSPARENT},
+    elide::{self, Cut},
     icons::{Icon, icon},
     link_status, press_only, shadow,
     theme::Theme,
@@ -117,7 +118,7 @@ fn text_width(text: &str, window: &Window) -> f32 {
 
 /// `text`, elided in the middle to fit `room` points.
 fn fit(text: &str, room: f32, window: &Window) -> SharedString {
-    link_status::fit_middle(text, room, |text| text_width(text, window)).into()
+    elide::fit(text, room, Cut::Middle, |text| text_width(text, window)).into()
 }
 
 pub struct ToastView {

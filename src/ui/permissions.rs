@@ -12,10 +12,10 @@
 //! can't answer a request that appears under the fingers.
 
 use super::{
-    Tooltip,
-    elide::{Cut, elided, text_width},
+    Tooltip, UI_FONT,
+    elide::{Cut, elided},
     icons::{Icon, icon},
-    press_only, shadow,
+    press_only, shadow, text_width,
     theme::Theme,
 };
 use crate::{
@@ -25,8 +25,8 @@ use crate::{
     model::{SpaceId, TabId},
 };
 use gpui::{
-    Context, Div, FontWeight, InteractiveElement, KeyDownEvent, ParentElement,
-    StatefulInteractiveElement, Styled, Window, div, px,
+    Context, Div, Font, FontWeight, InteractiveElement, KeyDownEvent, ParentElement,
+    StatefulInteractiveElement, Styled, Window, div, font, px,
 };
 use std::collections::HashMap;
 
@@ -480,6 +480,7 @@ impl BrowserApp {
         &self,
         width: f32,
         theme: &Theme,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<Div> {
         let request = self.permission_shown()?;
@@ -497,10 +498,14 @@ impl BrowserApp {
         // A host too long for its line splits in two: as much of its start
         // as fits, cut from the left, above the domain that owns it
         // ("attacker.example"), which is always shown whole.
+        let bold = Font {
+            weight: FontWeight::SEMIBOLD,
+            ..font(UI_FONT)
+        };
         let (first_line, domain) = match psl::domain_str(&host) {
             Some(domain)
                 if domain.len() < host.len()
-                    && text_width(&host, 13., FontWeight::SEMIBOLD, cx) > host_room =>
+                    && text_width(&host, bold, 13., window) > host_room =>
             {
                 let domain = domain.to_owned();
                 (host[..host.len() - domain.len()].to_owned(), Some(domain))

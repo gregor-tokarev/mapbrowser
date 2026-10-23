@@ -5,29 +5,9 @@
 //! end, and the room a line gets is known only once it is laid out, so the
 //! text is measured and painted then, in the parent's text style.
 
-use super::UI_FONT;
 use gpui::{
-    App, Bounds, Div, Font, FontWeight, ParentElement, Pixels, SharedString, Styled, Window,
-    canvas, div, font, point, px,
+    App, Bounds, Div, ParentElement, Pixels, SharedString, Styled, Window, canvas, div, point, px,
 };
-
-/// How wide `text` is in the UI font at `size` and `weight`, from the
-/// advances of its characters: without kerning, but close enough to choose
-/// a layout before the text is laid out.
-pub fn text_width(text: &str, size: f32, weight: FontWeight, cx: &App) -> f32 {
-    let system = cx.text_system();
-    let font_id = system.resolve_font(&Font {
-        weight,
-        ..font(UI_FONT)
-    });
-    text.chars()
-        .map(|ch| {
-            system
-                .advance(font_id, px(size), ch)
-                .map_or(0., |advance| f32::from(advance.width))
-        })
-        .sum()
-}
 
 /// Where a line too long for its box loses characters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,8 +56,9 @@ fn paint(text: &str, cut: Cut, bounds: Bounds<Pixels>, window: &mut Window, cx: 
 }
 
 /// `text`, or as much of it as fits in `room` with an ellipsis where `cut`
-/// says, measured with `width`.
-fn fit(text: &str, room: f32, cut: Cut, width: impl Fn(&str) -> f32) -> String {
+/// says, measured with `width`. Toasts and the link pill fit their text
+/// with it too.
+pub(super) fn fit(text: &str, room: f32, cut: Cut, width: impl Fn(&str) -> f32) -> String {
     if width(text) <= room {
         return text.to_owned();
     }

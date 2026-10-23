@@ -341,6 +341,7 @@ impl BrowserApp {
         width: f32,
         theme: &Theme,
         frame: Option<SlideFrame>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let active = self.state.active_space();
@@ -429,7 +430,7 @@ impl BrowserApp {
             )
             .child(self.render_top_row(width, theme, cx))
             .children(
-                self.render_notice(width, theme, cx)
+                self.render_notice(width, theme, window, cx)
                     .map(|notice| self.measure_notice(notice, cx)),
             )
             .child(self.render_bottom_bar(width, theme, cx))
@@ -1731,7 +1732,13 @@ impl BrowserApp {
 
     /// A permission request, the toast and, while a page view covers the
     /// card, its load error.
-    fn render_notice(&self, width: f32, theme: &Theme, cx: &mut Context<Self>) -> Option<Div> {
+    fn render_notice(
+        &self,
+        width: f32,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
         let card = |div: Div| {
             div.mx(px(8.))
                 .px(px(12.))
@@ -1744,7 +1751,7 @@ impl BrowserApp {
                 .text_size(px(12.5))
         };
         let error = self.error_text().filter(|_| self.page_covers_card());
-        let permission = self.render_permission_card(width, theme, cx);
+        let permission = self.render_permission_card(width, theme, window, cx);
         let toasts = self.render_toasts(width, theme, cx);
         if toasts.is_empty() && error.is_none() && permission.is_none() {
             return None;

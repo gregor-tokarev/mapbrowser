@@ -8,14 +8,15 @@
 use super::{
     UI_FONT,
     command_bar::{self, TRANSPARENT},
-    shadow,
+    elide::{Cut, fit},
+    shadow, text_width,
     theme::Theme,
 };
-use crate::{app::BrowserApp, engine::page::elide_middle, model::TabId};
+use crate::{app::BrowserApp, model::TabId};
 use gpui::{
     AppContext, Bounds, Context, DisplayId, Entity, IntoElement, ParentElement, Pixels, Point,
-    Render, SharedString, Size, Styled, TextRun, Window, WindowHandle, WindowOptions, div, font,
-    point, prelude::FluentBuilder, px, size,
+    Render, SharedString, Size, Styled, Window, WindowHandle, WindowOptions, div, font, point,
+    prelude::FluentBuilder, px, size,
 };
 
 pub(super) const HEIGHT: f32 = 22.;
@@ -32,25 +33,6 @@ const MARGIN: f32 = if TRANSPARENT { 6. } else { 0. };
 /// The address as the pill shows it: secure links without their scheme.
 fn shown_address(address: &str) -> &str {
     address.strip_prefix("https://").unwrap_or(address)
-}
-
-/// `text`, or as much of its start and end around a "…" (`elide_middle`)
-/// as fits in `max_width`, measured with `width`.
-pub(super) fn fit_middle(text: &str, max_width: f32, width: impl Fn(&str) -> f32) -> String {
-    if width(text) <= max_width {
-        return text.to_owned();
-    }
-    // The most characters that fit, assuming fewer never take more room.
-    let (mut fits, mut too_many) = (1, text.chars().count());
-    while too_many - fits > 1 {
-        let kept = (fits + too_many) / 2;
-        if width(&elide_middle(text, kept)) <= max_width {
-            fits = kept;
-        } else {
-            too_many = kept;
-        }
-    }
-    elide_middle(text, fits)
 }
 
 /// The pill window's top-left corner in the browser window, for `card`.
@@ -162,22 +144,9 @@ impl BrowserApp {
             return;
         }
         let card = self.card_bounds(window.viewport_size());
-        let measure = |text: &str| {
-            let run = TextRun {
-                len: text.len(),
-                font: font(UI_FONT),
-                color: gpui::black(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            let line = window
-                .text_system()
-                .layout_line(text, px(FONT_SIZE), &[run], None);
-            f32::from(line.width)
-        };
+        let measure = |text: &str| text_width(text, font(UI_FONT), FONT_SIZE, window);
         let room = (f32::from(card.size.width) / 2.).min(MAX_WIDTH) - 2. * PADDING;
-        let text = fit_middle(shown_address(&address), room, measure);
+        let text = fit(shown_address(&address), room, Cut::Middle, measure);
         // A point to spare for rounding, so the text is never clipped.
         let width = (measure(&text) + 2. * PADDING + 1.).ceil();
         let size = size(px(width + 2. * MARGIN), px(HEIGHT + 2. * MARGIN));
@@ -323,10 +292,11 @@ mod tests {
     #[test]
     fn long_addresses_keep_their_start_and_end() {
         let width = |text: &str| text.chars().count() as f32;
-        assert_eq!(fit_middle("example.com/a", 20., width), "example.com/a");
-        assert_eq!(fit_middle("abcdefghij", 5., width), "ab…ij");
-        assert_eq!(fit_middle("abcdefghij", 9.5, width), "abcd…ghij");
-        assert_eq!(fit_middle("abcdefghij", 0.5, width), "…");
+        let fit_middle = |text, room| fit(text, room, Cut::Middle, width);
+        assert_eq!(fit_middle("example.com/a", 20.), "example.com/a");
+        assert_eq!(fit_middle("abcdefghij", 5.), "ab…ij");
+        assert_eq!(fit_middle("abcdefghij", 9.5), "abcd…ghij");
+        assert_eq!(fit_middle("abcdefghij", 0.5), "…");
         assert_eq!(shown_address("https://a.test/b"), "a.test/b");
         assert_eq!(shown_address("http://a.test/b"), "http://a.test/b");
         assert_eq!(shown_address("mailto:a@b.test"), "mailto:a@b.test");

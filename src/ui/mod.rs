@@ -156,7 +156,7 @@ impl Render for BrowserApp {
         self.sync_traffic_lights();
         let sidebar = self
             .sidebar_width()
-            .map(|width| self.render_sidebar(width, &theme, frame, cx));
+            .map(|width| self.render_sidebar(width, &theme, frame, window, cx));
         let menu = self
             .menu
             .as_ref()
