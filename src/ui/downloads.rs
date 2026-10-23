@@ -9,6 +9,7 @@ use super::{
     icons::{Icon, icon},
     shadow,
     theme::Theme,
+    toast_window::ToastKind,
 };
 use crate::{
     app::BrowserApp,
@@ -426,7 +427,9 @@ impl BrowserApp {
         self.save_downloads(cx);
         match end {
             DownloadEnd::Complete { .. } => self.show_toast(format!("Downloaded {name}"), cx),
-            DownloadEnd::Failed { .. } => self.show_toast(format!("Couldn't download {name}"), cx),
+            DownloadEnd::Failed { .. } => {
+                self.show_toast_kind(ToastKind::Failed, format!("Couldn't download {name}"), cx)
+            }
             // Cancelled from the library, which shows it.
             DownloadEnd::Cancelled => self.downloads_changed(cx),
         }
@@ -455,7 +458,7 @@ impl BrowserApp {
             .space_id
             .filter(|&space_id| self.state.space(space_id).is_some())
         else {
-            return self.show_toast("Its space was deleted", cx);
+            return self.show_toast_kind(ToastKind::Failed, "Its space was deleted", cx);
         };
         let open_tab = origin_tab
             .filter(|&tab| self.state.space_of_tab(tab) == Some(space_id))
