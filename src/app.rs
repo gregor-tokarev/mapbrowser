@@ -1345,13 +1345,11 @@ impl BrowserApp {
         cx.notify();
     }
 
-    /// On macOS the traffic lights show with the sidebar, also while a
-    /// rename shows a hidden one.
+    /// On macOS the traffic lights show with the sidebar: also while a
+    /// hidden one peeks, or shows for a name being edited.
     fn sync_traffic_lights(&self) {
-        if self.state.sidebar_hidden {
-            let hidden = self.sidebar_width().is_none();
-            self.engine.borrow().set_traffic_lights_hidden(hidden);
-        }
+        let hidden = self.state.sidebar_hidden && self.sidebar_width().is_none();
+        self.engine.borrow().set_traffic_lights_hidden(hidden);
     }
 
     /// Ends a rename, keeping the name typed so far. Shortcuts, presses on
@@ -1379,7 +1377,7 @@ impl BrowserApp {
         self.sidebar_peek = false;
         self.peek_task = None;
         self.menu = None;
-        self.engine.borrow().set_traffic_lights_hidden(hidden);
+        self.sync_traffic_lights();
         self.persist_later(cx);
         cx.notify();
     }
@@ -1404,7 +1402,7 @@ impl BrowserApp {
                     this.sidebar_peek = true;
                     // It shows under the pointer, which only moving would report.
                     this.sidebar_hovered = true;
-                    this.engine.borrow().set_traffic_lights_hidden(false);
+                    this.sync_traffic_lights();
                     cx.notify();
                 }
             });
@@ -1415,9 +1413,7 @@ impl BrowserApp {
     pub(crate) fn end_peek(&mut self) {
         if std::mem::take(&mut self.sidebar_peek) {
             self.sidebar_hovered = false;
-            self.engine
-                .borrow()
-                .set_traffic_lights_hidden(self.state.sidebar_hidden);
+            self.sync_traffic_lights();
         }
     }
 
