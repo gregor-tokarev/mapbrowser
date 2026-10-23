@@ -2,21 +2,23 @@
 //! GPUI and kept inside the sidebar, where no native web view covers them.
 
 use super::{
+    UI_FONT,
     downloads::DownloadState,
     icons::{Icon, icon},
     press_only, shadow,
-    sidebar::space_icons,
+    sidebar::{space_icons, space_shortcut},
     theme::Theme,
-    truncated,
+    truncated, wrapped_lines,
 };
 use crate::{
     app::BrowserApp,
     model::{Pin, SpaceId, THEME_COUNT, TabId},
 };
 use gpui::{
-    AnyElement, Bounds, Context, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, Point, SharedString, Size, StatefulInteractiveElement, StyleRefinement,
-    Styled, Window, deferred, div, point, prelude::FluentBuilder, px,
+    AnyElement, App, Bounds, Context, Font, FontWeight, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, Pixels, Point, SharedString, Size, StatefulInteractiveElement,
+    StyleRefinement, Styled, Window, deferred, div, font, point, prelude::FluentBuilder, px,
+    relative,
 };
 
 const PADDING: f32 = 5.;
@@ -26,8 +28,17 @@ const HEADER_HEIGHT: f32 = 22.;
 const SWATCH_ROW_HEIGHT: f32 = 30.;
 const ICON_ROW_HEIGHT: f32 = 28.;
 const ICONS_PER_ROW: usize = 7;
-/// A question: its title line and two lines of explanation.
-const PROMPT_HEIGHT: f32 = 64.;
+/// A question: a title, which for a long space name wraps onto as many as
+/// `PROMPT_TITLE_LINES` lines, and its explanation. Its padding above,
+/// between and below them, and their sizes.
+const PROMPT_SPACING: f32 = 4. + 2. + 8.;
+const PROMPT_PADDING: f32 = 9.;
+const PROMPT_TITLE_LINE: f32 = 18.;
+const PROMPT_TITLE_LINES: usize = 4;
+const PROMPT_TITLE_SIZE: f32 = 13.;
+const PROMPT_DETAIL_LINE: f32 = 16.;
+const PROMPT_DETAIL_SIZE: f32 = 12.;
+const SPACE_NAME_HEIGHT: f32 = 28.;
 const CONFIRM_HEIGHT: f32 = 32.;
 const CLOSED_LIMIT: usize = 10;
 /// Distance the menu keeps from the sidebar's edges.
@@ -39,6 +50,8 @@ const ROW_GAP: f32 = 3.;
 pub enum MenuKind {
     Tab(TabId),
     Space(SpaceId),
+    /// Every space, from the "…" ending a switcher too crowded for them all.
+    Spaces,
     /// The bottom bar's "+".
     Plus,
     /// This session's downloads and the recently closed tabs, from the
@@ -70,6 +83,7 @@ enum Action {
     Rename(SpaceId),
     Theme(SpaceId, u8),
     SpaceIcon(SpaceId, Option<&'static str>),
+    SwitchSpace(SpaceId),
     NewSpace,
     UnloadSpace(SpaceId),
     NewTab,
@@ -92,16 +106,27 @@ enum Entry {
     },
     Separator,
     Header(&'static str),
+    /// Which space a space menu is for: its icon or dot, and its name.
+    SpaceName {
+        name: SharedString,
+        icon: Option<String>,
+        theme: u8,
+    },
     Swatches(SpaceId, u8),
-    Icons(SpaceId, Option<String>),
+    /// The icon choices for a space, and its theme, whose dot is the
+    /// choice of no icon.
+    Icons(SpaceId, Option<String>, u8),
     Closed {
         index: usize,
         title: SharedString,
     },
     Empty(&'static str),
+    /// A question; its title and its explanation wrap onto `lines` lines
+    /// each (`fit_prompts`).
     Prompt {
         title: SharedString,
         detail: &'static str,
+        lines: (usize, usize),
     },
     /// Cancel, and a red button that runs `action`.
     Confirm {
@@ -115,11 +140,14 @@ enum Entry {
         status: Option<String>,
         failed: bool,
     },
-    /// A space, with its icon or its theme's dot.
+    /// A space, with its icon or its theme's dot; `current` marks the
+    /// active one.
     Space {
         name: SharedString,
         icon: Option<String>,
         theme: u8,
+        shortcut: &'static str,
+        current: bool,
         action: Action,
     },
     /// A line of explanation.
@@ -154,12 +182,61 @@ impl Entry {
             | Entry::Note(_) => ITEM_HEIGHT,
             Entry::Separator => SEPARATOR_HEIGHT,
             Entry::Header(_) => HEADER_HEIGHT,
+            Entry::SpaceName { .. } => SPACE_NAME_HEIGHT,
             Entry::Swatches(..) => SWATCH_ROW_HEIGHT,
             Entry::Icons(..) => {
                 ICON_ROW_HEIGHT * (space_icons().len() + 1).div_ceil(ICONS_PER_ROW) as f32
             }
-            Entry::Prompt { .. } => PROMPT_HEIGHT,
+            Entry::Prompt {
+                lines: (title, detail),
+                ..
+            } => {
+                PROMPT_SPACING
+                    + *title as f32 * PROMPT_TITLE_LINE
+                    + *detail as f32 * PROMPT_DETAIL_LINE
+            }
             Entry::Confirm { .. } => CONFIRM_HEIGHT,
+        }
+    }
+}
+
+/// A space's icon, or a dot in its colour as the switcher shows it, in a
+/// 16 pt slot.
+fn space_mark(icon: Option<String>, theme: u8, dark: bool) -> gpui::Div {
+    let dot = Theme::new(theme, dark).focus();
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(16.))
+        .map(|slot| match icon {
+            Some(emoji) => slot.text_size(px(13.)).child(emoji),
+            None => slot.child(div().size(px(7.)).rounded_full().bg(dot)),
+        })
+}
+
+/// Counts the lines of each question in a menu `width` wide, so the whole
+/// name of a space to delete shows, and the menu is placed by its real
+/// height.
+fn fit_prompts(entries: &mut [Entry], width: f32, cx: &App) {
+    let room = width - 2. * PADDING - 2. * PROMPT_PADDING;
+    let bold = Font {
+        weight: FontWeight::SEMIBOLD,
+        ..font(UI_FONT)
+    };
+    for entry in entries {
+        if let Entry::Prompt {
+            title,
+            detail,
+            lines,
+        } = entry
+        {
+            *lines = (
+                wrapped_lines(title, bold.clone(), PROMPT_TITLE_SIZE, room, cx)
+                    .min(PROMPT_TITLE_LINES),
+                wrapped_lines(detail, font(UI_FONT), PROMPT_DETAIL_SIZE, room, cx),
+            );
         }
     }
 }
@@ -199,6 +276,25 @@ impl BrowserApp {
         if let (Some(menu), Some(row)) = (&mut self.menu, row) {
             menu.anchor.y = row.bottom() + px(ROW_GAP);
             menu.above = row.top() - px(ROW_GAP);
+        }
+    }
+
+    /// The space menu from the title row opens below the row, like a tab's
+    /// menu below its own, leaving the name in sight.
+    pub fn open_space_title_menu(
+        &mut self,
+        space_id: SpaceId,
+        pointer: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = self.drop_zones.borrow().title;
+        self.open_menu(MenuKind::Space(space_id), pointer, window, cx);
+        if let Some(menu) = &mut self.menu
+            && !title.is_empty()
+        {
+            menu.anchor.y = title.bottom() + px(ROW_GAP);
+            menu.above = title.top() - px(ROW_GAP);
         }
     }
 
@@ -258,20 +354,24 @@ impl BrowserApp {
                 let Some(space) = self.state.space(id) else {
                     return Vec::new();
                 };
-                let mut entries = Vec::new();
                 // Names are edited in the title row, which only the active
-                // space has on screen.
-                if id == self.state.selected_space_id {
-                    entries.extend([
-                        Entry::item("Rename Space", "", Action::Rename(id)),
-                        Entry::Separator,
-                    ]);
-                }
+                // space has on screen. Another space's menu, from its small
+                // dot, says which space it is for.
+                let mut entries = vec![if id == self.state.selected_space_id {
+                    Entry::item("Rename Space", "", Action::Rename(id))
+                } else {
+                    Entry::SpaceName {
+                        name: space.name.clone().into(),
+                        icon: space.icon.clone(),
+                        theme: space.theme(),
+                    }
+                }];
                 entries.extend([
+                    Entry::Separator,
                     Entry::Header("Theme"),
                     Entry::Swatches(id, space.theme()),
                     Entry::Header("Icon"),
-                    Entry::Icons(id, space.icon.clone()),
+                    Entry::Icons(id, space.icon.clone(), space.theme()),
                     Entry::Separator,
                     Entry::item("New Space", "", Action::NewSpace),
                     Entry::item("Unload Space", "", Action::UnloadSpace(id)),
@@ -280,6 +380,29 @@ impl BrowserApp {
                         .enabled(self.state.spaces.len() > 1),
                 ]);
                 entries
+            }
+            MenuKind::Spaces => {
+                let selected = self.state.selected_space_id;
+                let spaces =
+                    self.state
+                        .spaces
+                        .iter()
+                        .enumerate()
+                        .map(|(index, space)| Entry::Space {
+                            name: space.name.clone().into(),
+                            icon: space.icon.clone(),
+                            theme: space.theme(),
+                            shortcut: space_shortcut(index),
+                            current: space.id == selected,
+                            action: Action::SwitchSpace(space.id),
+                        });
+                std::iter::once(Entry::Header("Spaces"))
+                    .chain(spaces)
+                    .chain([
+                        Entry::Separator,
+                        Entry::item("New Space", "", Action::NewSpace),
+                    ])
+                    .collect()
             }
             MenuKind::Plus => vec![
                 Entry::item("New Tab", "⌘T", Action::NewTab),
@@ -318,7 +441,12 @@ impl BrowserApp {
                 vec![
                     Entry::Prompt {
                         title: format!("Delete {}?", space.name).into(),
-                        detail: "Its tabs and site data will be removed.",
+                        detail: if space.tabs.is_empty() {
+                            "Its site data will be removed."
+                        } else {
+                            "Its tabs and site data will be removed."
+                        },
+                        lines: (1, 2),
                     },
                     Entry::Confirm {
                         label: "Delete",
@@ -336,6 +464,8 @@ impl BrowserApp {
                         name: space.name.clone().into(),
                         icon: space.icon.clone(),
                         theme: space.theme(),
+                        shortcut: "",
+                        current: false,
                         action: Action::MoveTab(id, space.id),
                     }))
                     // Each space is a profile of its own.
@@ -358,10 +488,14 @@ impl BrowserApp {
         let sidebar = self.sidebar_width().unwrap_or(f32::from(viewport.width));
         let width: f32 = match menu.kind {
             MenuKind::Tab(_) | MenuKind::Plus | MenuKind::MoveTab(_) => 200.,
-            MenuKind::Space(_) | MenuKind::Library | MenuKind::DeleteSpace(_) => 212.,
+            MenuKind::Space(_)
+            | MenuKind::Spaces
+            | MenuKind::Library
+            | MenuKind::DeleteSpace(_) => 212.,
         };
         let width = width.min(sidebar - 2. * EDGE);
-        let entries = self.menu_entries(menu.kind);
+        let mut entries = self.menu_entries(menu.kind);
+        fit_prompts(&mut entries, width, cx);
         let height = 2. * PADDING + entries.iter().map(Entry::height).sum::<f32>();
         let origin = place(
             menu.anchor,
@@ -420,6 +554,7 @@ impl BrowserApp {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let height = entry.height();
         let focus = theme.focus();
         let item = |id: usize, enabled: bool| {
             div()
@@ -527,6 +662,22 @@ impl BrowserApp {
                 .text_color(theme.tertiary())
                 .child(text)
                 .into_any_element(),
+            Entry::SpaceName {
+                name,
+                icon: space_icon,
+                theme: space_theme,
+            } => div()
+                .h(px(SPACE_NAME_HEIGHT))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(9.))
+                .text_size(px(13.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.title())
+                .child(space_mark(space_icon, space_theme, theme.dark))
+                .child(truncated(name).flex_1().min_w_0())
+                .into_any_element(),
             Entry::Empty(text) => div()
                 .h(px(ITEM_HEIGHT))
                 .flex()
@@ -563,58 +714,80 @@ impl BrowserApp {
                     }))
                 }))
                 .into_any_element(),
-            Entry::Icons(space, current) => {
+            Entry::Icons(space, current, space_theme) => {
                 let hover = theme.hover();
-                let choices = std::iter::once(None).chain(space_icons().iter().copied().map(Some));
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .px(px(2.))
-                    .children(choices.enumerate().map(|(index, choice)| {
-                        let selected = current.as_deref() == choice;
-                        press_only(
-                            div()
-                                .id(("space-icon", index))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .w(px(26.))
-                                .h(px(ICON_ROW_HEIGHT))
-                                .rounded(px(6.))
-                                .when(selected, |cell| cell.bg(theme.control_hover()))
-                                .hover(move |style| style.bg(hover))
-                                .text_size(px(15.))
-                                .map(|cell| match choice {
-                                    Some(emoji) => cell.child(emoji),
-                                    None => cell
-                                        .child(div().size(px(7.)).rounded_full().bg(theme.focus())),
-                                }),
-                        )
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.run_menu_action(Action::SpaceIcon(space, choice), window, cx)
-                            },
-                        ))
+                // No icon shows the space's own dot, whichever space's
+                // colours the menu has.
+                let dot = Theme::new(space_theme, theme.dark).focus();
+                let choices: Vec<_> = std::iter::once(None)
+                    .chain(space_icons().iter().copied().map(Some))
+                    .collect();
+                let cell = |index: usize, choice: Option<&'static str>| {
+                    let selected = current.as_deref() == choice;
+                    press_only(
+                        div()
+                            .id(("space-icon", index))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(relative(1. / ICONS_PER_ROW as f32))
+                            .h(px(ICON_ROW_HEIGHT))
+                            .rounded(px(6.))
+                            .when(selected, |cell| cell.bg(theme.control_hover()))
+                            .hover(move |style| style.bg(hover))
+                            .text_size(px(15.))
+                            .map(|cell| match choice {
+                                Some(emoji) => cell.child(emoji),
+                                None => cell.child(div().size(px(7.)).rounded_full().bg(dot)),
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.run_menu_action(Action::SpaceIcon(space, choice), window, cx)
                     }))
+                };
+                // Always this many to a row, as `height` counts them, also
+                // in a menu narrowed by a narrow sidebar.
+                div()
+                    .px(px(2.))
+                    .children(
+                        choices
+                            .chunks(ICONS_PER_ROW)
+                            .enumerate()
+                            .map(|(row, chunk)| {
+                                div().flex().children(chunk.iter().enumerate().map(
+                                    |(column, &choice)| cell(row * ICONS_PER_ROW + column, choice),
+                                ))
+                            }),
+                    )
                     .into_any_element()
             }
-            Entry::Prompt { title, detail } => div()
-                .h(px(PROMPT_HEIGHT))
+            Entry::Prompt {
+                title,
+                detail,
+                lines: (title_lines, _),
+            } => div()
+                .h(px(height))
                 .flex()
                 .flex_col()
                 .gap(px(2.))
-                .px(px(9.))
+                .px(px(PROMPT_PADDING))
                 .pt(px(4.))
                 .child(
-                    truncated(title)
-                        .text_size(px(13.))
+                    // The whole name, question mark and all, unless it is
+                    // longer than a few lines.
+                    div()
+                        .line_clamp(title_lines)
+                        .text_ellipsis()
+                        .line_height(px(PROMPT_TITLE_LINE))
+                        .text_size(px(PROMPT_TITLE_SIZE))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.title()),
+                        .text_color(theme.title())
+                        .child(title),
                 )
                 .child(
                     div()
-                        .text_size(px(12.))
-                        .line_height(px(16.))
+                        .text_size(px(PROMPT_DETAIL_SIZE))
+                        .line_height(px(PROMPT_DETAIL_LINE))
                         .text_color(theme.muted())
                         .child(detail),
                 )
@@ -660,26 +833,39 @@ impl BrowserApp {
             }
             Entry::Space {
                 name,
-                icon,
+                icon: space_icon,
                 theme: space_theme,
+                shortcut,
+                current,
                 action,
             } => {
-                let dot = Theme::new(space_theme, theme.dark).swatch();
                 item(3000 + index, true)
                     .gap(px(8.))
+                    .child(space_mark(space_icon, space_theme, theme.dark))
                     .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .size(px(16.))
-                            .map(|slot| match icon {
-                                Some(emoji) => slot.text_size(px(13.)).child(emoji),
-                                None => slot.child(div().size(px(7.)).rounded_full().bg(dot)),
-                            }),
+                        truncated(name)
+                            .flex_1()
+                            .min_w_0()
+                            .when(current, |name| name.font_weight(FontWeight::SEMIBOLD)),
                     )
-                    .child(truncated(name).flex_1().min_w_0())
+                    .when(current, |row| {
+                        row.child(
+                            icon(Icon::Check, 13., theme.title())
+                                .flex_none()
+                                .group_hover("menu-item", |style| style.text_color(gpui::white())),
+                        )
+                    })
+                    .when(!shortcut.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .text_color(theme.tertiary())
+                                .group_hover("menu-item", |style| {
+                                    style.text_color(gpui::white().opacity(0.8))
+                                })
+                                .child(shortcut),
+                        )
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.run_menu_action(action, window, cx)
                     }))
@@ -708,6 +894,13 @@ impl BrowserApp {
             menu.kind = kind;
             return cx.notify();
         }
+        // Colours and icons apply at once and the menu stays, so several
+        // can be tried; Esc or a press elsewhere closes it.
+        match action {
+            Action::Theme(id, theme) => return self.set_space_theme(id, theme, cx),
+            Action::SpaceIcon(id, icon) => return self.set_space_icon(id, icon, cx),
+            _ => {}
+        }
         self.close_menu(cx);
         match action {
             Action::TogglePin(id) => self.toggle_pin(id, cx),
@@ -718,8 +911,8 @@ impl BrowserApp {
             Action::Close(id) => self.close_tab(id, cx),
             Action::Delete(id) => self.remove_tab(id, cx),
             Action::Rename(id) => self.start_rename(id, window, cx),
-            Action::Theme(id, theme) => self.set_space_theme(id, theme, cx),
-            Action::SpaceIcon(id, icon) => self.set_space_icon(id, icon, cx),
+            Action::Theme(..) | Action::SpaceIcon(..) => {}
+            Action::SwitchSpace(id) => self.switch_space(id, window, cx),
             Action::NewSpace => self.new_space(window, cx),
             Action::UnloadSpace(id) => self.unload_space(id, cx),
             Action::NewTab => {

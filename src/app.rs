@@ -32,7 +32,7 @@ use gpui::{
     WindowHandle, http_client::Url, px,
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     rc::Rc,
     time::{Duration, Instant},
@@ -98,10 +98,16 @@ pub struct BrowserApp {
     /// The URL pill shows its buttons only under the pointer.
     pub url_pill_hovered: bool,
     pub tab_drag: Option<TabDrag>,
+    /// Whether a dragged tab is over the space switcher, where its preview
+    /// makes way for the space buttons.
+    pub tab_over_spaces: Rc<Cell<bool>>,
     /// Measured while drawing the sidebar, for dropping dragged tabs.
     pub drop_zones: Rc<RefCell<DropZones>>,
     swipe: SwipeTracker,
     pub renaming: Option<SpaceId>,
+    /// While a new space is being named, the space it was created from:
+    /// Esc means it was never wanted, and goes back there.
+    new_space_from: Option<SpaceId>,
     pub rename_input: Entity<TextInput>,
     pub command_bar: Option<CommandBarWindow>,
     pub dark: bool,
@@ -211,9 +217,11 @@ impl BrowserApp {
             hovered_tab: None,
             url_pill_hovered: false,
             tab_drag: None,
+            tab_over_spaces: Rc::default(),
             drop_zones: Rc::default(),
             swipe: SwipeTracker::default(),
             renaming: None,
+            new_space_from: None,
             rename_input: rename_input.clone(),
             command_bar: None,
             dark: is_dark(window.appearance()),
@@ -471,7 +479,14 @@ impl BrowserApp {
         }
         self.error = None;
         match self.state.space(from).filter(|_| from != space_id).cloned() {
-            Some(from) => self.begin_slide(from, window),
+            Some(from) => {
+                self.begin_slide(from, window);
+                // Without the sidebar only the window's colour would change.
+                if self.state.sidebar_hidden && self.sidebar_width().is_none() {
+                    let name = self.state.active_space().name.clone();
+                    self.show_toast(name, cx);
+                }
+            }
             None => self.show_selected(),
         }
         self.persist_later(cx);
@@ -513,6 +528,49 @@ impl BrowserApp {
     pub fn switch_space(&mut self, space_id: SpaceId, window: &mut Window, cx: &mut Context<Self>) {
         if space_id != self.state.selected_space_id {
             self.go_to(space_id, None, window, cx);
+        }
+    }
+
+    /// ⌥⌘→ and a swipe to the left go to the next space, ⌥⌘← and a swipe
+    /// to the right to the previous one, wrapping around at the ends. The
+    /// slide always runs the way of the key or the fingers.
+    fn step_space(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let spaces = &self.state.spaces;
+        let count = spaces.len();
+        let Some(index) = spaces
+            .iter()
+            .position(|space| space.id == self.state.selected_space_id)
+        else {
+            return;
+        };
+        let next = if forward {
+            (index + 1) % count
+        } else {
+            (index + count - 1) % count
+        };
+        let id = spaces[next].id;
+        self.switch_space(id, window, cx);
+        if let Some(slide) = &mut self.slide {
+            slide.direction = if forward { 1. } else { -1. };
+        }
+    }
+
+    /// Puts a space dragged along the switcher in the place of `onto`, drawn
+    /// at `index`. Moves the pointer makes before the switcher is drawn
+    /// again carry old places, and are ignored.
+    pub fn move_space(
+        &mut self,
+        space_id: SpaceId,
+        onto: SpaceId,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.spaces.get(index).map(|space| space.id) != Some(onto) {
+            return;
+        }
+        if self.state.move_space(space_id, index) {
+            self.persist_later(cx);
+            cx.notify();
         }
     }
 
@@ -765,7 +823,8 @@ impl BrowserApp {
         }
     }
 
-    /// Creates an empty space, switches to it and starts naming it.
+    /// Creates an empty space, switches to it and starts naming it, in the
+    /// sidebar even if it is hidden.
     pub fn new_space(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.end_rename(window, cx);
         self.finish_slide();
@@ -773,10 +832,43 @@ impl BrowserApp {
         let from = self.state.active_space().clone();
         let id = self.state.create_space("");
         self.error = None;
-        self.begin_slide(from, window);
+        self.begin_slide(from.clone(), window);
         self.start_rename(id, window, cx);
+        if self.renaming == Some(id) {
+            self.new_space_from = Some(from.id);
+        }
         self.persist_later(cx);
         cx.notify();
+    }
+
+    /// Esc while a new space is named: the space goes again, if nothing was
+    /// opened in it, and the sidebar slides back to where it came from.
+    fn discard_new_space(
+        &mut self,
+        space_id: SpaceId,
+        back_to: SpaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let unused = self
+            .state
+            .space(space_id)
+            .is_some_and(|space| space.tabs.is_empty());
+        if !unused || space_id != self.state.selected_space_id {
+            return;
+        }
+        self.finish_slide();
+        let Some(space) = self.state.remove_space(space_id) else {
+            return;
+        };
+        self.engine.borrow_mut().forget_space(space_id);
+        self.recent.forget_space(space_id);
+        self.state.select_space(back_to);
+        self.begin_slide(space, window);
+        if let Some(slide) = &mut self.slide {
+            slide.direction = -1.;
+        }
+        self.persist_later(cx);
     }
 
     /// Closes every browser of the space but keeps its tabs. In the active
@@ -853,9 +945,10 @@ impl BrowserApp {
     }
 
     /// Edits the space's name in place, in its title row. Only the active
-    /// space's title row is drawn, and only with the sidebar shown.
+    /// space's title row is drawn; a hidden sidebar shows until the rename
+    /// ends (`sidebar_width`), but a page in fullscreen covers it.
     pub fn start_rename(&mut self, space_id: SpaceId, window: &mut Window, cx: &mut Context<Self>) {
-        if space_id != self.state.selected_space_id || self.sidebar_width().is_none() {
+        if space_id != self.state.selected_space_id || self.fullscreen {
             return;
         }
         let Some(name) = self.state.space(space_id).map(|space| space.name.clone()) else {
@@ -866,6 +959,8 @@ impl BrowserApp {
             self.dark,
         );
         self.renaming = Some(space_id);
+        self.new_space_from = None;
+        self.sync_traffic_lights();
         self.engine.borrow().focus_shell();
         self.rename_input.update(cx, |input, cx| {
             input.set_style(
@@ -879,6 +974,7 @@ impl BrowserApp {
                 },
                 cx,
             );
+            input.set_placeholder("Space name", cx);
             input.set_text_and_select_all(&name, window, cx);
         });
         cx.notify();
@@ -888,17 +984,33 @@ impl BrowserApp {
         let Some(space_id) = self.renaming.take() else {
             return;
         };
+        let new_space_from = self.new_space_from.take();
         if let Some(name) = name
             && self.state.rename_space(space_id, name)
         {
             self.persist_later(cx);
         }
+        if name.is_none()
+            && let Some(back_to) = new_space_from
+        {
+            self.discard_new_space(space_id, back_to, window, cx);
+        }
+        self.sync_traffic_lights();
         window.focus(&self.focus_handle);
         // A menu opening ended the rename; it keeps keyboard focus.
         if self.menu.is_none() {
             self.focus_page();
         }
         cx.notify();
+    }
+
+    /// On macOS the traffic lights show with the sidebar, also while a
+    /// rename shows a hidden one.
+    fn sync_traffic_lights(&self) {
+        if self.state.sidebar_hidden {
+            let hidden = self.sidebar_width().is_none();
+            self.engine.borrow().set_traffic_lights_hidden(hidden);
+        }
     }
 
     /// Ends a rename, keeping the name typed so far. Shortcuts, presses on
@@ -956,24 +1068,8 @@ impl BrowserApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(next) = self.swipe.update(event.touch_phase, event.delta) else {
-            return;
-        };
-        let spaces = &self.state.spaces;
-        let index = spaces
-            .iter()
-            .position(|space| space.id == self.state.selected_space_id)
-            .unwrap_or(0);
-        let index = if next {
-            Some(index + 1)
-        } else {
-            index.checked_sub(1)
-        };
-        if let Some(id) = index
-            .and_then(|index| spaces.get(index))
-            .map(|space| space.id)
-        {
-            self.switch_space(id, window, cx);
+        if let Some(next) = self.swipe.update(event.touch_phase, event.delta) {
+            self.step_space(next, window, cx);
         }
     }
 
@@ -1282,6 +1378,9 @@ impl BrowserApp {
     }
 
     pub fn shortcut(&mut self, shortcut: Shortcut, window: &mut Window, cx: &mut Context<Self>) {
+        // A hidden sidebar shows only while a new space is named; ending
+        // that hides it again, which is all ⌘S should do then.
+        let naming_in_hidden_sidebar = self.renaming.is_some() && self.state.sidebar_hidden;
         self.end_rename(window, cx);
         let active = self.active_tab_id();
         let tabs = &self.state.active_space().tabs;
@@ -1321,18 +1420,7 @@ impl BrowserApp {
                 }
             }
             Shortcut::PreviousSpace | Shortcut::NextSpace => {
-                let spaces = &self.state.spaces;
-                let index = spaces
-                    .iter()
-                    .position(|space| space.id == self.state.selected_space_id)
-                    .unwrap_or(0);
-                let next = if shortcut == Shortcut::NextSpace {
-                    (index + 1) % spaces.len()
-                } else {
-                    (index + spaces.len() - 1) % spaces.len()
-                };
-                let id = spaces[next].id;
-                self.switch_space(id, window, cx);
+                self.step_space(shortcut == Shortcut::NextSpace, window, cx)
             }
             Shortcut::Reload => {
                 if let Some(id) = active {
@@ -1341,6 +1429,7 @@ impl BrowserApp {
             }
             Shortcut::Back => self.back(),
             Shortcut::Forward => self.forward(),
+            Shortcut::ToggleSidebar if naming_in_hidden_sidebar => {}
             Shortcut::ToggleSidebar => self.toggle_sidebar(cx),
             Shortcut::TogglePin => {
                 if let Some(id) = active {

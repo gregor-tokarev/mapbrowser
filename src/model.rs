@@ -540,17 +540,34 @@ impl BrowserState {
     /// New spaces start empty and selected, with the least-used theme.
     pub fn create_space(&mut self, name: impl Into<String>) -> SpaceId {
         let id = self.allocate_id();
-        let name = name.into();
-        let name = name.trim();
+        let name = space_name(&name.into());
         let name = if name.is_empty() {
-            format!("Space {}", self.spaces.len() + 1)
+            self.unused_space_name()
         } else {
-            name.to_owned()
+            name
         };
         let theme = self.least_used_theme();
         self.spaces.push(Space::new(id, name, theme));
         self.selected_space_id = id;
         id
+    }
+
+    /// "Space N" for a space without a name: N counts on from the number of
+    /// spaces, past any name already taken, so two spaces never share one.
+    fn unused_space_name(&self) -> String {
+        let taken = |name: &str| {
+            self.spaces
+                .iter()
+                .any(|space| space.name.eq_ignore_ascii_case(name))
+        };
+        let mut number = self.spaces.len() + 1;
+        loop {
+            let name = format!("Space {number}");
+            if !taken(&name) {
+                return name;
+            }
+            number += 1;
+        }
     }
 
     fn least_used_theme(&self) -> u8 {
@@ -563,15 +580,31 @@ impl BrowserState {
             .unwrap_or(0)
     }
 
+    /// Names a space; text with nothing but blanks keeps the old name.
     pub fn rename_space(&mut self, id: SpaceId, name: impl AsRef<str>) -> bool {
-        let name = name.as_ref().trim();
+        let name = space_name(name.as_ref());
         if name.is_empty() {
             return false;
         }
         let Some(space) = self.space_mut(id) else {
             return false;
         };
-        space.name = name.to_owned();
+        space.name = name;
+        true
+    }
+
+    /// Moves a space to `index` in the switcher, the order that ⌃1–9,
+    /// ⌥⌘←/→ and swipes follow. Returns whether the order changed.
+    pub fn move_space(&mut self, id: SpaceId, index: usize) -> bool {
+        let Some(from) = self.spaces.iter().position(|space| space.id == id) else {
+            return false;
+        };
+        let to = index.min(self.spaces.len() - 1);
+        if from == to {
+            return false;
+        }
+        let space = self.spaces.remove(from);
+        self.spaces.insert(to, space);
         true
     }
 
@@ -878,7 +911,9 @@ impl BrowserState {
             let position_theme = (index % usize::from(THEME_COUNT)) as u8;
             space.theme = Some(space.theme.unwrap_or(position_theme) % THEME_COUNT);
             space.icon = space.icon.as_deref().and_then(sanitize_icon);
-            if space.name.trim().is_empty() {
+            // Older versions kept pasted tabs and line breaks.
+            space.name = space_name(&space.name);
+            if space.name.is_empty() {
                 space.name = format!("Space {}", index + 1);
             }
         }
@@ -941,6 +976,20 @@ fn orphaned_profiles(profiles: &Path, spaces: &HashSet<SpaceId>) -> io::Result<V
         }
     }
     Ok(orphans)
+}
+
+/// A space's name on one line: tabs and line breaks from a paste, and runs
+/// of blanks, become single spaces; other control characters go.
+fn space_name(name: &str) -> String {
+    name.split_whitespace()
+        .map(|word| {
+            word.chars()
+                .filter(|ch| !ch.is_control())
+                .collect::<String>()
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn sanitize_icon(icon: &str) -> Option<String> {

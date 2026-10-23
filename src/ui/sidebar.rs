@@ -4,26 +4,26 @@
 //! under the fixed navigation row and bottom bar.
 
 use super::{
-    MaybeTooltip, SlideFrame, Tooltip,
+    MaybeTooltip, SlideFrame, Tooltip, UI_FONT,
     command_bar::CommandMode,
     drag::{DraggedEdge, DraggedTab, EDGE_HANDLE, TabDrag, TabPreview},
     icons::{Icon, icon},
     menu::MenuKind,
     placeholder_favicon, press_only, shadow,
     theme::Theme,
-    truncated,
+    truncated, wrapped_lines,
 };
 use crate::{
     app::BrowserApp,
     engine::Shortcut,
     favicons::host_of,
-    model::{Pin, Space, Tab, TabId},
+    model::{Pin, Space, SpaceId, Tab, TabId},
 };
 use gpui::{
     AnyElement, App, AppContext, BoxShadow, ClickEvent, Context, Div, DragMoveEvent, EmptyView,
-    FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    Pixels, ScrollWheelEvent, Size, Stateful, StatefulInteractiveElement, Styled, Window, div, img,
-    point, prelude::FluentBuilder, px, size,
+    Font, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Pixels, Render, ScrollWheelEvent, Size, Stateful, StatefulInteractiveElement,
+    Styled, Window, div, font, img, point, prelude::FluentBuilder, px, size,
 };
 
 /// The navigation row's centre, level with the traffic lights.
@@ -41,9 +41,131 @@ const DRAGGED_OPACITY: f32 = 0.4;
 const SPACE_ICONS: [&str; 12] = [
     "🏠", "💼", "🔬", "🎨", "🎵", "📚", "✈️", "🛒", "🎮", "⭐", "🌱", "☕",
 ];
+/// The space title's text size, and what its row takes beside the name:
+/// margins, padding, the icon and its gap, the "…" button.
+const TITLE_SIZE: f32 = 13.5;
+const TITLE_CHROME: f32 = 2. * 8. + 9. + 4. + 16. + 12. + 24.;
+/// The space switcher sits between the library button and "+".
+const SWITCHER_INSET: f32 = 40.;
+/// A space's button and the gap after it while every space fits. Then the
+/// gaps close and the buttons narrow, down to `MIN_SPACE_BUTTON`, before a
+/// "…" button lists the spaces that don't fit.
+const SPACE_BUTTON: f32 = 28.;
+const SPACE_GAP: f32 = 6.;
+const MIN_SPACE_BUTTON: f32 = 18.;
+const MORE_BUTTON: f32 = 24.;
+/// The highlight behind a space's button: the active space, hover, a tab
+/// dragged over it.
+const SPACE_CHIP: f32 = 24.;
 
 pub fn space_icons() -> &'static [&'static str] {
     &SPACE_ICONS
+}
+
+/// ⌃1–⌃9 go to the first nine spaces.
+pub fn space_shortcut(index: usize) -> &'static str {
+    const SHORTCUTS: [&str; 9] = ["⌃1", "⌃2", "⌃3", "⌃4", "⌃5", "⌃6", "⌃7", "⌃8", "⌃9"];
+    SHORTCUTS.get(index).copied().unwrap_or("")
+}
+
+/// How the space switcher shows its spaces.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Switcher {
+    /// The width of a space's button, and the gap between two.
+    button: f32,
+    gap: f32,
+    /// How many spaces have a button; "…" lists them all.
+    shown: usize,
+}
+
+/// The switcher for `count` spaces in `room` points: full-size buttons
+/// with shrinking gaps, then narrower buttons side by side, then as many
+/// as fit and "…". Every button keeps a usable size and the switcher never
+/// runs under its neighbours.
+fn switcher(count: usize, room: f32) -> Switcher {
+    let n = count.max(1) as f32;
+    if n * SPACE_BUTTON <= room {
+        let gap = if count > 1 {
+            ((room - n * SPACE_BUTTON) / (n - 1.))
+                .min(SPACE_GAP)
+                .floor()
+        } else {
+            0.
+        };
+        return Switcher {
+            button: SPACE_BUTTON,
+            gap,
+            shown: count,
+        };
+    }
+    if n * MIN_SPACE_BUTTON <= room {
+        return Switcher {
+            button: (room / n).floor(),
+            gap: 0.,
+            shown: count,
+        };
+    }
+    let room = room - MORE_BUTTON;
+    let shown = ((room / MIN_SPACE_BUTTON) as usize).max(1);
+    Switcher {
+        button: (room / shown as f32).floor().min(SPACE_BUTTON),
+        gap: 0.,
+        shown,
+    }
+}
+
+/// A space being dragged along the switcher to another place.
+struct DraggedSpace(SpaceId);
+
+/// A dragged space's button under the pointer, lifted.
+#[derive(Clone)]
+struct SpacePreview {
+    icon: Option<String>,
+    dot: Hsla,
+    theme: Theme,
+    width: f32,
+}
+
+impl Render for SpacePreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .font_family(UI_FONT)
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(self.width))
+            .h(px(SPACE_BUTTON))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(SPACE_CHIP))
+                    .rounded(px(6.))
+                    .bg(self.theme.surface())
+                    .border_1()
+                    .border_color(self.theme.ink(0.08))
+                    .shadow(vec![shadow(3., 10., 0.16)])
+                    .child(space_mark(self.icon.clone(), self.dot, true)),
+            )
+    }
+}
+
+/// A space's icon, or a dot in its colour, as the switcher shows it.
+fn space_mark(icon: Option<String>, dot: Hsla, active: bool) -> Div {
+    let mark = div().flex().items_center().justify_center();
+    match icon {
+        Some(emoji) => mark
+            .text_size(px(14.))
+            .opacity(if active { 1. } else { 0.55 })
+            .child(emoji),
+        None => mark.child(
+            div()
+                .size(px(if active { 8. } else { 7. }))
+                .rounded_full()
+                .bg(dot),
+        ),
+    }
 }
 
 fn selected_shadow() -> Vec<BoxShadow> {
@@ -617,16 +739,33 @@ impl BrowserApp {
                     .flex_1()
                     .min_w_0()
                     .ml(px(12.))
-                    .text_size(px(13.5))
+                    .text_size(px(TITLE_SIZE))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.muted())
             })
             .when(interactive && !renaming, |row| {
+                // The full name, when the title ends in "…".
+                let width = self.sidebar_width().unwrap_or(self.state.sidebar_width());
+                let room = width - TITLE_CHROME;
+                let name_font = Font {
+                    weight: FontWeight::SEMIBOLD,
+                    ..font(UI_FONT)
+                };
+                let cut = wrapped_lines(&space.name, name_font, TITLE_SIZE, room, cx) > 1;
+                let tooltip = (cut && self.menu.is_none())
+                    .then(|| Tooltip::build_wrapping(space.name.clone(), "", theme, width));
                 press_only(row)
+                    .maybe_tooltip(tooltip)
+                    // Arc renames on a double click.
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        if event.click_count() == 2 {
+                            this.start_rename(id, window, cx);
+                        }
+                    }))
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            this.open_menu(MenuKind::Space(id), event.position, window, cx)
+                            this.open_space_title_menu(id, event.position, window, cx)
                         }),
                     )
                     .child(
@@ -646,8 +785,8 @@ impl BrowserApp {
                         )
                         .on_click(cx.listener(
                             move |this, event: &ClickEvent, window, cx| {
-                                let anchor = event.position() + point(px(-12.), px(14.));
-                                this.open_menu(MenuKind::Space(id), anchor, window, cx)
+                                let anchor = event.position() - point(px(12.), px(0.));
+                                this.open_space_title_menu(id, anchor, window, cx)
                             },
                         )),
                     )
@@ -802,9 +941,15 @@ impl BrowserApp {
             theme: *theme,
             size,
             tile,
+            cursor: point(px(0.), px(0.)),
+            over_spaces: self.tab_over_spaces.clone(),
         };
-        element.on_drag(DraggedTab(tab.id), move |_, _, _, cx| {
-            cx.new(|_| preview.clone())
+        element.on_drag(DraggedTab(tab.id), move |_, cursor, _, cx| {
+            preview.over_spaces.set(false);
+            cx.new(|_| TabPreview {
+                cursor,
+                ..preview.clone()
+            })
         })
     }
 
@@ -996,57 +1141,159 @@ impl BrowserApp {
         )
     }
 
-    fn render_bottom_bar(&self, width: f32, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let hover = theme.hover();
-        let spaces = (self.state.spaces.len() > 1).then(|| {
+    /// The space switcher: a button per space, with its icon or a dot in its
+    /// colour, the active one raised like a selected tab. Press one to go
+    /// there, drag it along to reorder, or drop a tab on it to move the tab.
+    fn render_switcher(&self, width: f32, theme: &Theme, cx: &mut Context<Self>) -> Option<Div> {
+        let spaces = &self.state.spaces;
+        if spaces.len() < 2 {
+            return None;
+        }
+        let layout = switcher(spaces.len(), width - 2. * SWITCHER_INSET);
+        let active_index = spaces
+            .iter()
+            .position(|space| space.id == self.state.selected_space_id)
+            .unwrap_or(0);
+        // Too many to show: the run of spaces that ends at the active one,
+        // or starts at the first.
+        let start = active_index.saturating_sub(layout.shown - 1);
+        let (hover, selected) = (theme.hover(), theme.selected());
+        let buttons = spaces
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(layout.shown)
+            .map(|(index, space)| {
+                let id = space.id;
+                let active = id == self.state.selected_space_id;
+                // The space whose menu is open stays highlighted, like a tab.
+                let menu_open = self.menu.as_ref().is_some_and(|menu| {
+                    matches!(menu.kind, MenuKind::Space(space) | MenuKind::DeleteSpace(space) if space == id)
+                });
+                let dot = Theme::new(space.theme(), theme.dark).focus();
+                let chip = div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(SPACE_CHIP.min(layout.button)))
+                    .rounded(px(6.))
+                    .map(|chip| {
+                        if active {
+                            chip.bg(selected)
+                                .when(!theme.dark, |chip| chip.shadow(selected_shadow()))
+                        } else {
+                            chip.when(menu_open, |chip| chip.bg(hover))
+                                .group_hover("space-button", move |style| style.bg(hover))
+                                // A tab dropped here moves to this space.
+                                .group_drag_over::<DraggedTab>("space-button", |style| {
+                                    style.bg(dot.opacity(0.35))
+                                })
+                        }
+                    })
+                    .child(space_mark(space.icon.clone(), dot, active));
+                let preview = SpacePreview {
+                    icon: space.icon.clone(),
+                    dot,
+                    theme: *theme,
+                    width: layout.button,
+                };
+                let tooltip = self.menu.is_none().then(|| {
+                    Tooltip::build_wrapping(space.name.clone(), space_shortcut(index), theme, width)
+                });
+                press_only(
+                    div()
+                        .id(("space", id))
+                        .group("space-button")
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .w(px(layout.button))
+                        .h(px(SPACE_BUTTON))
+                        .child(chip),
+                )
+                .maybe_tooltip(tooltip)
+                .on_click(cx.listener(move |this, _, window, cx| this.switch_space(id, window, cx)))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        // Above the button, like the library's and "+"'s.
+                        let anchor = event.position - point(px(14.), px(18.));
+                        this.open_menu(MenuKind::Space(id), anchor, window, cx)
+                    }),
+                )
+                .on_drag(DraggedSpace(id), move |_, _, _, cx| {
+                    cx.new(|_| preview.clone())
+                })
+                // The dragged space takes the place of the one under the
+                // pointer, so the order follows the pointer as it moves.
+                .on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<DraggedSpace>, _, cx| {
+                        let (pointer, bounds) = (event.event.position, event.bounds);
+                        let over = pointer.x >= bounds.left()
+                            && pointer.x < bounds.right()
+                            && (pointer.y - bounds.center().y).abs() < px(BOTTOM_BAR);
+                        let dragged = event.drag(cx).0;
+                        if over && dragged != id {
+                            this.move_space(dragged, id, index, cx);
+                        }
+                    },
+                ))
+                .when(!active, |button| {
+                    button.on_drop(cx.listener(move |this, dragged: &DraggedTab, _, cx| {
+                        this.tab_drag = None;
+                        this.tab_over_spaces.set(false);
+                        this.move_tab_to_space(dragged.0, id, cx);
+                    }))
+                })
+            });
+        let more = (layout.shown < spaces.len()).then(|| {
+            press_only(
+                div()
+                    .id("all-spaces")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .w(px(MORE_BUTTON))
+                    .h(px(SPACE_BUTTON))
+                    .rounded(px(6.))
+                    .hover(move |style| style.bg(hover))
+                    .child(icon(Icon::Ellipsis, 16., theme.icon())),
+            )
+            .maybe_tooltip(self.tooltip("All Spaces", "", theme, width))
+            .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                let anchor = event.position() - point(px(14.), px(18.));
+                this.open_menu(MenuKind::Spaces, anchor, window, cx)
+            }))
+        });
+        Some(
             div()
                 .absolute()
-                .left(px(40.))
-                .right(px(40.))
-                .top_0()
-                .bottom_0()
+                .left(px(SWITCHER_INSET))
+                .right(px(SWITCHER_INSET))
+                .top(px(10.))
+                .h(px(SPACE_BUTTON))
                 .flex()
                 .items_center()
                 .justify_center()
-                .gap(px(6.))
-                .children(self.state.spaces.iter().map(|space| {
-                    let id = space.id;
-                    let active = id == self.state.selected_space_id;
-                    press_only(
-                        div()
-                            .id(("space", id))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(28.))
-                            .rounded(px(6.))
-                            .hover(move |style| style.bg(hover))
-                            .map(|item| match &space.icon {
-                                Some(emoji) => item
-                                    .text_size(px(14.))
-                                    .opacity(if active { 1. } else { 0.4 })
-                                    .child(emoji.clone()),
-                                None => {
-                                    item.child(div().size(px(7.)).rounded_full().bg(if active {
-                                        theme.icon()
-                                    } else {
-                                        theme.disabled()
-                                    }))
-                                }
-                            }),
-                    )
-                    .maybe_tooltip(self.tooltip(space.name.clone(), "", theme, width))
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.switch_space(id, window, cx)),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            this.open_menu(MenuKind::Space(id), event.position, window, cx)
-                        }),
-                    )
-                }))
-        });
+                .gap(px(layout.gap))
+                .overflow_hidden()
+                .on_drag_move(
+                    cx.listener(|this, event: &DragMoveEvent<DraggedTab>, _, cx| {
+                        let over = event.bounds.contains(&event.event.position);
+                        if this.tab_over_spaces.replace(over) != over {
+                            cx.notify();
+                        }
+                    }),
+                )
+                .children(buttons)
+                .children(more),
+        )
+    }
+
+    fn render_bottom_bar(&self, width: f32, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let spaces = self.render_switcher(width, theme, cx);
         div()
             .absolute()
             .left_0()
