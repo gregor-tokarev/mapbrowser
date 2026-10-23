@@ -1385,6 +1385,13 @@ impl BrowserApp {
             && (self.renaming.is_some() || self.renaming_tab.is_some())
     }
 
+    /// Whether ⌘S, the sidebar button and the command bar's toggle would
+    /// show the sidebar for good: it is hidden, or only peeks. One that
+    /// shows for a permission card or a name being edited hides again.
+    pub(crate) fn sidebar_toggle_shows(&self) -> bool {
+        self.state.sidebar_hidden && self.permission_shown().is_none() && !self.shown_for_naming()
+    }
+
     /// Ends a rename, keeping the name typed so far. Shortcuts, presses on
     /// the page and sidebar buttons that show another page move keyboard
     /// focus to the page without GPUI noticing, so they end it here, a
@@ -1878,7 +1885,7 @@ impl BrowserApp {
                 .map(HistoryEntry::from)
                 .collect(),
             now: history::now(),
-            sidebar_hidden: self.state.sidebar_hidden,
+            sidebar_hidden: self.sidebar_toggle_shows(),
             has_today: active_space.section(Pin::Today).next().is_some(),
             search_engine: self.state.search_engine(),
         }
