@@ -11,6 +11,7 @@ use super::{
     elide::{Cut, elided},
     icons::{Icon, icon},
     menu::MenuKind,
+    page_notice::Leaving,
     placeholder_favicon, press_only, shadow, text_width,
     theme::Theme,
     tooltip_bubble, truncated, wrapped_lines,
@@ -1876,7 +1877,7 @@ impl BrowserApp {
                     button.on_drop(cx.listener(move |this, dragged: &DraggedTab, _, cx| {
                         this.tab_drag = None;
                         this.tab_over_spaces.set(false);
-                        this.move_tab_to_space(dragged.0, id, cx);
+                        this.leave_tab(dragged.0, Leaving::Move(id), cx);
                     }))
                 })
             });

@@ -1977,7 +1977,8 @@ impl BrowserApp {
                     Command::RenameTab => self.start_tab_rename(id, window, cx),
                     Command::CloseOtherTabs => self.close_today_tabs_around(id, false, cx),
                     Command::CloseTabsBelow => self.close_today_tabs_around(id, true, cx),
-                    Command::MoveTab(space_id) => self.move_tab_to_space(id, space_id, cx),
+                    // A page with unsaved changes asks first.
+                    Command::MoveTab(space_id) => self.leave_tab(id, Leaving::Move(space_id), cx),
                     _ => self.copy_url(id, cx),
                 }
             }
