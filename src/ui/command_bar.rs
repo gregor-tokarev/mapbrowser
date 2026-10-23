@@ -119,6 +119,7 @@ pub enum Command {
     ClearHistory,
     ShowSettings,
     SearchWith(SearchEngine),
+    SetDefaultBrowser,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1134,6 +1135,15 @@ fn settings_results(query: &str, context: &CommandContext) -> Vec<CommandItem> {
     }
     settings.push((sidebar_action(context), "toggle"));
     settings.push((clear_history_action(), "delete forget"));
+    settings.push((
+        action(
+            Command::SetDefaultBrowser,
+            "Set as Default Browser…",
+            Icon::Globe,
+            "",
+        ),
+        "links",
+    ));
     let words = query_words(query);
     let mut settings: Vec<(u32, CommandItem)> = settings
         .into_iter()

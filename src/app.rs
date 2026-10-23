@@ -1506,6 +1506,7 @@ impl BrowserApp {
             Command::ShowSettings => self.toggle_command_bar(CommandMode::Settings, window, cx),
             Command::ClearHistory => self.ask_to_clear_history(window, cx),
             Command::SearchWith(engine) => self.set_search_engine(engine, cx),
+            Command::SetDefaultBrowser => self.set_default_browser(cx),
             Command::Reload
             | Command::TogglePin
             | Command::ToggleFavorite
