@@ -1542,9 +1542,9 @@ impl BrowserApp {
         self.show_toast_kind(
             ToastKind::Info,
             if disabled {
-                format!("Content blocking off for {host}")
+                format!("Ad blocking off for {host}")
             } else {
-                format!("Content blocking on for {host}")
+                format!("Ad blocking on for {host}")
             },
             cx,
         );
