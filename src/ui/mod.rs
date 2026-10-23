@@ -50,13 +50,14 @@ pub struct SlideFrame {
 impl BrowserApp {
     /// The sidebar's width, unless it is hidden or a page is fullscreen. A
     /// hidden sidebar shows while the page on screen asks for a permission,
-    /// and while a space is named: the question and the name are in it. It
-    /// also peeks out from the window's edge.
+    /// and while a space or a tab is named: the question and the name are
+    /// in it. It also peeks out from the window's edge.
     pub fn sidebar_width(&self) -> Option<f32> {
         let shown = !self.state.sidebar_hidden
             || self.sidebar_peek
             || self.permission_shown().is_some()
-            || self.renaming.is_some();
+            || self.renaming.is_some()
+            || self.renaming_tab.is_some();
         (shown && !self.fullscreen).then(|| self.state.sidebar_width())
     }
 

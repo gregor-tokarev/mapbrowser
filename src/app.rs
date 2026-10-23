@@ -1048,13 +1048,16 @@ impl BrowserApp {
         else {
             return;
         };
-        if self.sidebar_width().is_none() {
+        // A hidden sidebar shows until the rename ends (`sidebar_width`),
+        // but a page in fullscreen covers it.
+        if self.fullscreen {
             return;
         }
         let (name, title) = (tab.shown_title().to_owned(), tab.title.clone());
         self.end_rename(window, cx);
         let theme = self.theme();
         self.renaming_tab = Some(tab_id);
+        self.sync_traffic_lights();
         self.engine.borrow().focus_shell();
         self.tab_name_input.update(cx, |input, cx| {
             input.set_style(
@@ -1089,6 +1092,7 @@ impl BrowserApp {
         {
             self.persist_later(cx);
         }
+        self.sync_traffic_lights();
         window.focus(&self.focus_handle);
         // A menu opening ended the rename; it keeps keyboard focus.
         if self.menu.is_none() {
@@ -1350,6 +1354,15 @@ impl BrowserApp {
     fn sync_traffic_lights(&self) {
         let hidden = self.state.sidebar_hidden && self.sidebar_width().is_none();
         self.engine.borrow().set_traffic_lights_hidden(hidden);
+    }
+
+    /// Whether a hidden sidebar shows only because a space or a tab is
+    /// being named in it. Ending that hides it again, which is all ⌘S and
+    /// the sidebar button do then.
+    pub(crate) fn shown_for_naming(&self) -> bool {
+        self.state.sidebar_hidden
+            && !self.sidebar_peek
+            && (self.renaming.is_some() || self.renaming_tab.is_some())
     }
 
     /// Ends a rename, keeping the name typed so far. Shortcuts, presses on
@@ -1860,11 +1873,9 @@ impl BrowserApp {
                 }
             }
             Command::ToggleBlocking(host) => self.toggle_blocking(&host, cx),
-            Command::RenameSpace => {
-                // The name is edited in the sidebar's title row.
-                self.set_sidebar_hidden(false, cx);
-                self.start_rename(space_id, window, cx);
-            }
+            // The name is edited in the sidebar's title row, which a hidden
+            // sidebar shows for that long.
+            Command::RenameSpace => self.start_rename(space_id, window, cx),
             Command::UnloadSpace => self.unload_space(space_id, cx),
             Command::Shortcut(shortcut) => self.shortcut(shortcut, window, cx),
             Command::ShowHistory => self.toggle_command_bar(CommandMode::History, window, cx),
@@ -1889,11 +1900,8 @@ impl BrowserApp {
                     Command::TogglePin => self.toggle_pin(id, cx),
                     Command::ToggleFavorite => self.toggle_favorite(id, cx),
                     Command::DuplicateTab => self.duplicate_tab(id, window, cx),
-                    Command::RenameTab => {
-                        // The name is edited in the tab's row.
-                        self.set_sidebar_hidden(false, cx);
-                        self.start_tab_rename(id, window, cx);
-                    }
+                    // In the tab's row, which a hidden sidebar shows for that long.
+                    Command::RenameTab => self.start_tab_rename(id, window, cx),
                     Command::CloseOtherTabs => self.close_today_tabs_around(id, false, cx),
                     Command::CloseTabsBelow => self.close_today_tabs_around(id, true, cx),
                     Command::MoveTab(space_id) => self.move_tab_to_space(id, space_id, cx),
@@ -1986,9 +1994,7 @@ impl BrowserApp {
     }
 
     pub fn shortcut(&mut self, shortcut: Shortcut, window: &mut Window, cx: &mut Context<Self>) {
-        // A hidden sidebar shows only while a new space is named; ending
-        // that hides it again, which is all ⌘S should do then.
-        let naming_in_hidden_sidebar = self.renaming.is_some() && self.state.sidebar_hidden;
+        let naming_in_hidden_sidebar = self.shown_for_naming();
         self.end_rename(window, cx);
         // As with a macOS menu, a key closes an open menu first; the menu
         // would otherwise stay over a tab that moved or closed.

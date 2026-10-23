@@ -687,16 +687,23 @@ impl BrowserApp {
                     .left(px(72.))
                     .top(button_top)
                     // A hidden sidebar that shows for now (peeking, or for a
-                    // permission card) stays shown.
+                    // permission card) stays shown; one that shows only for
+                    // naming hides again.
                     .maybe_tooltip(tooltip(
-                        if self.state.sidebar_hidden {
+                        if self.state.sidebar_hidden && !self.shown_for_naming() {
                             "Show Sidebar"
                         } else {
                             "Hide Sidebar"
                         },
                         "⌘S",
                     ))
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if this.shown_for_naming() {
+                            this.end_rename(window, cx);
+                        } else {
+                            this.toggle_sidebar(cx);
+                        }
+                    })),
             )
             .child(
                 div()
