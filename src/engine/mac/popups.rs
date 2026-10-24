@@ -12,10 +12,10 @@
 
 use super::{
     BrowserLink, TabRequests, browser_view, context_menu::TabMenu, downloads::TabDownloads,
-    page_keys::PageKeys, permissions::TabPermissions, request_tab,
+    frame_url, page_keys::PageKeys, permissions::TabPermissions, request_tab,
 };
 use crate::engine::{
-    EngineEvent, NewWindow, ScreenRect, WindowRequest, new_window_for, popup_rect,
+    EngineEvent, NewWindow, ScreenRect, WindowRequest, new_window_for, opens_in_tab, popup_rect,
 };
 use cef::*;
 use objc2::{MainThreadMarker, rc::Retained};
@@ -26,8 +26,9 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-/// Popups' browser instance numbers, apart from the tabs' (which count up
-/// from 1), so that their downloads and requests end with them.
+/// Popups' and DevTools windows' browser instance numbers, apart from the
+/// tabs' (which count up from 1), so that their downloads and requests end
+/// with them and never with a tab.
 static NEXT_POPUP_INSTANCE: AtomicU64 = AtomicU64::new(1 << 40);
 
 /// Decides `on_before_popup` for the tab `link` stands for, or for one of
@@ -80,10 +81,21 @@ pub(super) fn before_popup(
         NewWindow::Blocked => {
             link.send(EngineEvent::PopupBlocked {
                 tab_id: link.tab_id,
-                url,
+                url: blocked_url(url, opener),
             });
             true
         }
+    }
+}
+
+/// What a blocked pop-up's notice may offer to open as a tab: `url` if a
+/// tab can show it, else nothing (about:blank pop-ups a script fills,
+/// javascript: and data: addresses).
+pub(super) fn blocked_url(url: String, opener: Option<&Frame>) -> String {
+    if opens_in_tab(&url, &frame_url(opener)) {
+        url
+    } else {
+        String::new()
     }
 }
 
@@ -174,8 +186,14 @@ fn popup_client(link: BrowserLink) -> Client {
     )
 }
 
-/// A tab's DevTools window, which Chromium titles and runs itself.
+/// A tab's DevTools window, which Chromium titles and runs itself. It gets
+/// an instance number of its own: closing it must not end the tab's
+/// questions (sign-ins, permissions, "Leave site?") nor its downloads.
 pub(super) fn tools_client(link: BrowserLink) -> Client {
+    let link = BrowserLink {
+        instance: NEXT_POPUP_INSTANCE.fetch_add(1, Ordering::Relaxed),
+        ..link
+    };
     PopupClient::new(
         PopupLife::new(link.clone()),
         PageKeys::new(link, true),

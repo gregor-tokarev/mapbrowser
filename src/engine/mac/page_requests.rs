@@ -7,6 +7,10 @@
 //! Sign-ins arrive on Chromium's IO thread, the others on the UI thread.
 //! CEF's callbacks may be answered on any thread, and an answer can call
 //! straight back into a handler, so none is answered with the lock held.
+//! Nor is one dropped with it: the last reference to an unanswered
+//! certificate or "Leave site?" callback answers it as it goes, at once on
+//! the UI thread, and a "Leave site?" answered that way resets the page's
+//! dialogs, which comes straight back here.
 
 use super::BrowserLink;
 use crate::engine::EngineEvent;
@@ -34,7 +38,12 @@ struct Pending {
 
 pub(super) enum Answer {
     SignIn(AuthCallback),
-    Certificate(Callback),
+    /// `may_continue`: the card offers Continue for this error and host
+    /// (`certificate_continue_allowed`); without it the load never goes on.
+    Certificate {
+        callback: Callback,
+        may_continue: bool,
+    },
     Leave(JsdialogCallback),
 }
 
@@ -45,7 +54,7 @@ impl Answer {
     fn give_up(self) {
         match self {
             Answer::SignIn(callback) => callback.cancel(),
-            Answer::Certificate(callback) => callback.cancel(),
+            Answer::Certificate { callback, .. } => callback.cancel(),
             Answer::Leave(_) => {}
         }
     }
@@ -95,11 +104,15 @@ impl PageRequests {
 
     pub(super) fn respond_certificate(&self, id: u64, proceed: bool) {
         if let Some(Pending {
-            answer: Answer::Certificate(callback),
+            answer:
+                Answer::Certificate {
+                    callback,
+                    may_continue,
+                },
             ..
         }) = self.take(id)
         {
-            if proceed {
+            if proceed && may_continue {
                 callback.cont();
             } else {
                 callback.cancel();
@@ -139,17 +152,19 @@ impl PageRequests {
     }
 
     /// Ends the page's "Leave site?" without an answer: CEF reset its
-    /// dialogs (the page navigated or closed).
+    /// dialogs (the page navigated or closed). The callbacks go once the
+    /// lock is released: dropping one can reset the dialogs again, and the
+    /// call that brings back here then finds nothing.
     pub(super) fn drop_leave(&self, link: &BrowserLink) {
-        let ended: Vec<u64> = self
+        let ended: Vec<(u64, Pending)> = self
             .requests()
             .pending
             .extract_if(|_, pending| {
                 pending.instance == link.instance && matches!(pending.answer, Answer::Leave(_))
             })
-            .map(|(id, _)| id)
             .collect();
-        for id in ended {
+        for (id, pending) in ended {
+            drop(pending);
             link.send(EngineEvent::RequestDismissed { id });
         }
     }
@@ -166,18 +181,21 @@ impl PageRequests {
     }
 
     /// Keeps, or with `None` drops, the callback of a page that stopped
-    /// responding. True if one was kept before.
+    /// responding. True if one was kept before; it goes once the lock is
+    /// released.
     pub(super) fn set_unresponsive(
         &self,
         instance: u64,
         callback: Option<UnresponsiveProcessCallback>,
     ) -> bool {
-        let mut requests = self.requests();
-        match callback {
-            Some(callback) => requests.unresponsive.insert(instance, callback),
-            None => requests.unresponsive.remove(&instance),
-        }
-        .is_some()
+        let replaced = {
+            let mut requests = self.requests();
+            match callback {
+                Some(callback) => requests.unresponsive.insert(instance, callback),
+                None => requests.unresponsive.remove(&instance),
+            }
+        };
+        replaced.is_some()
     }
 
     /// Waits for the page that stopped responding, or ends it (a crash

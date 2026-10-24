@@ -20,7 +20,7 @@ use super::{
 };
 use crate::{
     app::BrowserApp,
-    engine::{CrashReason, certificate_error_overridable, is_insecure},
+    engine::{CrashReason, certificate_continue_allowed, is_insecure},
     input::{InputEvent, InputStyle, TextInput},
     model::{SpaceId, TabId},
 };
@@ -46,23 +46,71 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-/// A username and password a site or proxy asks for.
+/// Who asks for a sign-in, and how the password would travel.
+#[derive(Clone, PartialEq, Eq)]
+struct SignInSite {
+    host: String,
+    port: u16,
+    realm: String,
+    proxy: bool,
+    /// Whether the password would be sent encrypted (https).
+    secure: bool,
+    /// How it would be sent: "basic", "digest"…
+    auth_scheme: String,
+}
+
+impl SignInSite {
+    /// "host", or "host:port" for a proxy or off the scheme's usual port.
+    fn label(&self) -> String {
+        let usual = if self.secure { 443 } else { 80 };
+        if self.port == 0 || (!self.proxy && self.port == usual) {
+            self.host.clone()
+        } else if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+}
+
+/// A username and password a site or proxy asks for, with fields of its
+/// own: what was typed stays with the request while other tabs show, and
+/// goes, password and all, when the request ends.
 struct SignIn {
     id: u64,
     tab_id: TabId,
-    /// "host", or "host:port" off the scheme's usual port.
-    host: String,
-    realm: String,
-    proxy: bool,
-    secure: bool,
+    site: SignInSite,
+    username: Entity<TextInput>,
+    password: Entity<TextInput>,
+    /// Return in either field signs in; Esc cancels.
+    _subscriptions: [Subscription; 2],
 }
 
 impl SignIn {
     /// Requests that one answer settles: Chromium asks once per load that
-    /// needs the sign-in, and they come together.
+    /// needs the sign-in, and they come together. Only the same tab's, for
+    /// the same scheme, host, port, realm and kind of sign-in, so a
+    /// password typed for https is never sent over http.
     fn same_as(&self, other: &SignIn) -> bool {
-        (self.tab_id, &self.host, &self.realm, self.proxy)
-            == (other.tab_id, &other.host, &other.realm, other.proxy)
+        self.tab_id == other.tab_id && self.site == other.site
+    }
+
+    fn focused(&self, window: &Window, cx: &App) -> bool {
+        [&self.username, &self.password]
+            .iter()
+            .any(|field| field.focus_handle(cx).is_focused(window))
+    }
+}
+
+/// The fields' look in the card's theme.
+fn field_style(theme: &Theme) -> InputStyle {
+    InputStyle {
+        text: theme.title(),
+        placeholder: theme.tertiary(),
+        cursor: theme.focus(),
+        selection: theme.focus().opacity(0.35),
+        font_size: px(13.5),
+        line_height: px(18.),
     }
 }
 
@@ -127,11 +175,13 @@ pub struct PageNotices {
     leaving: HashMap<TabId, Leaving>,
     /// Tabs whose blocked pop-up was reported, until their next document.
     popups_reported: HashSet<TabId>,
-    username: Entity<TextInput>,
-    password: Entity<TextInput>,
-    /// The sign-in the fields were last cleared for, and its site: host,
-    /// realm and whether it is a proxy's.
-    form: Option<(u64, (String, String, bool))>,
+    /// The last pop-up each tab's page had blocked that a tab could show,
+    /// until its next document: "Open" on the notice opens it.
+    blocked_popups: HashMap<TabId, String>,
+    /// The username last signed in with, for the tab and site, until the
+    /// tab shows another document: a wrong password brings the same
+    /// sign-in back, which then starts with it.
+    retry_username: Option<(TabId, SignInSite, String)>,
     /// The card, so that Return and Esc answer it.
     focus_handle: FocusHandle,
     /// "Press Esc to exit full screen", for a few seconds.
@@ -139,44 +189,17 @@ pub struct PageNotices {
 }
 
 impl PageNotices {
-    pub fn new(window: &mut Window, cx: &mut Context<BrowserApp>) -> Self {
-        let field = |placeholder: &str, masked: bool, window: &mut Window, cx: &mut App| {
-            cx.new(|cx| {
-                let mut input = TextInput::new(window, cx);
-                input.set_placeholder(placeholder, cx);
-                input.set_masked(masked, cx);
-                input
-            })
-        };
+    pub fn new(cx: &mut Context<BrowserApp>) -> Self {
         Self {
             tabs: HashMap::new(),
             sign_ins: Vec::new(),
             leaving: HashMap::new(),
             popups_reported: HashSet::new(),
-            username: field("Username", false, window, cx),
-            password: field("Password", true, window, cx),
-            form: None,
+            blocked_popups: HashMap::new(),
+            retry_username: None,
             focus_handle: cx.focus_handle(),
             fullscreen_hint: None,
         }
-    }
-
-    /// Return in either field signs in; Esc cancels.
-    pub fn subscribe(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<BrowserApp>,
-    ) -> Vec<Subscription> {
-        [self.username.clone(), self.password.clone()]
-            .iter()
-            .map(|field| {
-                cx.subscribe_in(field, window, |this, _, event, window, cx| match event {
-                    InputEvent::Submit(_) => this.sign_in(window, cx),
-                    InputEvent::Cancel => this.cancel_sign_in(window, cx),
-                    InputEvent::Changed(_) => {}
-                })
-            })
-            .collect()
     }
 
     fn shown(&self, tab_id: TabId) -> Option<Shown<'_>> {
@@ -554,21 +577,24 @@ impl BrowserApp {
                             }),
                         ),
                     ))
-                    .when(certificate_error_overridable(certificate.code), |column| {
-                        column.child(
-                            div()
-                                .id("continue-unsafe")
-                                .mt(px(6.))
-                                .text_size(px(12.5))
-                                .text_color(theme.tertiary())
-                                .underline()
-                                .hover(move |style| style.text_color(continue_hover))
-                                .child(format!("Continue to {host} (unsafe)"))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.answer_certificate(id, true, window, cx)
-                                })),
-                        )
-                    })
+                    .when(
+                        certificate_continue_allowed(certificate.code, &certificate.url),
+                        |column| {
+                            column.child(
+                                div()
+                                    .id("continue-unsafe")
+                                    .mt(px(6.))
+                                    .text_size(px(12.5))
+                                    .text_color(theme.tertiary())
+                                    .underline()
+                                    .hover(move |style| style.text_color(continue_hover))
+                                    .child(format!("Continue to {host} (unsafe)"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.answer_certificate(id, true, window, cx)
+                                    })),
+                            )
+                        },
+                    )
             }
             Shown::SignIn(request) => self.render_sign_in(request, column, theme, window, cx),
             Shown::Failed(failure) => {
@@ -614,22 +640,22 @@ impl BrowserApp {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Div {
-        let body = match (request.proxy, request.realm.is_empty()) {
-            (true, _) => format!(
-                "The proxy {} asks for a username and password.",
-                request.host
-            ),
-            (false, true) => format!("{} asks for a username and password.", request.host),
+        let site = &request.site;
+        let host = site.label();
+        let body = match (site.proxy, site.realm.is_empty()) {
+            (true, _) => format!("The proxy {host} asks for a username and password."),
+            (false, true) => format!("{host} asks for a username and password."),
             (false, false) => format!(
-                "{} asks for a username and password for “{}”.",
-                request.host, request.realm
+                "{host} asks for a username and password for “{}”.",
+                site.realm
             ),
         };
         let focused = |input: &Entity<TextInput>| input.focus_handle(cx).is_focused(window);
         let fields = [
-            (&self.notices.username, focused(&self.notices.username)),
-            (&self.notices.password, focused(&self.notices.password)),
+            (&request.username, focused(&request.username)),
+            (&request.password, focused(&request.password)),
         ];
+        let tab_fields = (request.username.clone(), request.password.clone());
         let field = |(input, focused): (&Entity<TextInput>, bool)| {
             div()
                 .flex()
@@ -669,7 +695,7 @@ impl BrowserApp {
                     .child("Sign in"),
             )
             .child(div().child(body))
-            .when(!request.secure && !request.proxy, |column| {
+            .when(!site.secure && !site.proxy, |column| {
                 column.child(
                     div()
                         .flex()
@@ -687,18 +713,18 @@ impl BrowserApp {
                     .gap(px(8.))
                     .mt(px(6.))
                     // Tab and ⇧Tab move between the fields.
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    .on_key_down(cx.listener(move |_, event: &KeyDownEvent, window, cx| {
                         let keystroke = &event.keystroke;
                         if keystroke.key == "tab"
                             && !keystroke.modifiers.platform
                             && !keystroke.modifiers.control
                             && !keystroke.modifiers.alt
                         {
-                            let next = if this.notices.username.focus_handle(cx).is_focused(window)
-                            {
-                                this.notices.password.clone()
+                            let (username, password) = &tab_fields;
+                            let next = if username.focus_handle(cx).is_focused(window) {
+                                password.clone()
                             } else {
-                                this.notices.username.clone()
+                                username.clone()
                             };
                             next.update(cx, |input, cx| input.select_all_focus(window, cx));
                             cx.stop_propagation();
@@ -762,8 +788,11 @@ impl BrowserApp {
             if covered {
                 self.focus_page_notice(window, cx);
             } else if self.notices.focus_handle.is_focused(window)
-                || self.notices.username.focus_handle(cx).is_focused(window)
-                || self.notices.password.focus_handle(cx).is_focused(window)
+                || self
+                    .notices
+                    .sign_ins
+                    .iter()
+                    .any(|request| request.focused(window, cx))
             {
                 // The page takes keyboard focus back (`activate_tab`).
                 window.focus(&self.focus_handle);
@@ -773,8 +802,9 @@ impl BrowserApp {
     }
 
     /// Gives the active tab's notice keyboard focus: a sign-in's username,
-    /// else the card, so Return and Esc answer it. A rename or menu in
-    /// progress keeps it.
+    /// or its password once a username is there, else the card, so Return
+    /// and Esc answer it. A rename or menu in progress keeps it, and so
+    /// does a sign-in field being typed in.
     pub(crate) fn focus_page_notice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.renaming.is_some() || self.menu.is_some() {
             return;
@@ -782,45 +812,15 @@ impl BrowserApp {
         let Some(tab_id) = self.active_tab_id() else {
             return;
         };
-        let (sign_in, site) = match self.notices.shown(tab_id) {
+        let (username, password) = match self.notices.shown(tab_id) {
             None => return,
-            Some(Shown::SignIn(request)) => (
-                request.id,
-                (request.host.clone(), request.realm.clone(), request.proxy),
-            ),
+            Some(Shown::SignIn(request)) if request.focused(window, cx) => return,
+            Some(Shown::SignIn(request)) => (request.username.clone(), request.password.clone()),
             Some(_) => return window.focus(&self.notices.focus_handle),
         };
-        let (username, password) = (self.notices.username.clone(), self.notices.password.clone());
-        let theme = self.theme();
-        let style = InputStyle {
-            text: theme.title(),
-            placeholder: theme.tertiary(),
-            cursor: theme.focus(),
-            selection: theme.focus().opacity(0.35),
-            font_size: px(13.5),
-            line_height: px(18.),
-        };
+        let style = field_style(&self.theme());
         for input in [&username, &password] {
             input.update(cx, |input, cx| input.set_style(style.clone(), cx));
-        }
-        if self
-            .notices
-            .form
-            .as_ref()
-            .is_none_or(|(id, _)| *id != sign_in)
-        {
-            // Another sign-in starts with empty fields; the same site asking
-            // again (after a wrong password) keeps the username.
-            let same_site = self
-                .notices
-                .form
-                .as_ref()
-                .is_some_and(|(_, last)| *last == site);
-            if !same_site {
-                username.update(cx, |input, cx| input.set_text("", cx));
-            }
-            password.update(cx, |input, cx| input.set_text("", cx));
-            self.notices.form = Some((sign_in, site));
         }
         let field = if username.read(cx).text().is_empty() {
             username
@@ -830,30 +830,84 @@ impl BrowserApp {
         field.update(cx, |input, cx| input.select_all_focus(window, cx));
     }
 
+    /// Moves keyboard focus off the fields of sign-ins about to go, to the
+    /// window, before they are dropped; the next notice or the page takes
+    /// it from there (`notices_changed`).
+    fn release_sign_ins(&self, requests: &[SignIn], window: &mut Window, cx: &App) {
+        if requests.iter().any(|request| request.focused(window, cx)) {
+            window.focus(&self.focus_handle);
+        }
+    }
+
     // Engine events.
 
+    /// A site or proxy asks the tab's page for a sign-in. It gets fields of
+    /// its own, empty unless the same site asks the tab again after a
+    /// wrong password: then the username stays.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn sign_in_requested(
         &mut self,
         id: u64,
         tab_id: TabId,
         host: String,
+        port: u16,
         realm: String,
         proxy: bool,
         secure: bool,
+        auth_scheme: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.state.tab(tab_id).is_none() {
+        let Some(space) = self
+            .state
+            .space_of_tab(tab_id)
+            .and_then(|space_id| self.state.space(space_id))
+        else {
             return self.engine.borrow().respond_sign_in(id, None);
-        }
-        self.notices.sign_ins.push(SignIn {
-            id,
-            tab_id,
+        };
+        let style = field_style(&Theme::new(space.theme(), self.dark));
+        let site = SignInSite {
             host,
+            port,
             realm,
             proxy,
             secure,
+            auth_scheme,
+        };
+        let retry = self
+            .notices
+            .retry_username
+            .as_ref()
+            .filter(|(retry_tab, retry_site, _)| *retry_tab == tab_id && *retry_site == site)
+            .map(|(_, _, username)| username.clone())
+            .unwrap_or_default();
+        let field =
+            |placeholder: &str, text: &str, masked: bool, window: &mut Window, cx: &mut App| {
+                cx.new(|cx| {
+                    let mut input = TextInput::new(window, cx);
+                    input.set_placeholder(placeholder, cx);
+                    input.set_masked(masked, cx);
+                    input.set_style(style.clone(), cx);
+                    input.set_text(text, cx);
+                    input
+                })
+            };
+        let username = field("Username", &retry, false, window, cx);
+        let password = field("Password", "", true, window, cx);
+        let _subscriptions = [&username, &password].map(|field| {
+            cx.subscribe_in(field, window, |this, _, event, window, cx| match event {
+                InputEvent::Submit(_) => this.sign_in(window, cx),
+                InputEvent::Cancel => this.cancel_sign_in(window, cx),
+                InputEvent::Changed(_) => {}
+            })
+        });
+        self.notices.sign_ins.push(SignIn {
+            id,
+            tab_id,
+            site,
+            username,
+            password,
+            _subscriptions,
         });
         self.notices_changed(tab_id, window, cx);
     }
@@ -916,7 +970,10 @@ impl BrowserApp {
             .iter()
             .position(|request| request.id == id)
         {
-            changed = Some(self.notices.sign_ins.remove(index).tab_id);
+            // What was typed for it goes with it.
+            let request = self.notices.sign_ins.remove(index);
+            self.release_sign_ins(std::slice::from_ref(&request), window, cx);
+            changed = Some(request.tab_id);
         }
         for (&tab_id, notices) in &mut self.notices.tabs {
             if notices
@@ -1001,9 +1058,17 @@ impl BrowserApp {
     ) {
         let notices = self.notices.tab(tab_id);
         notices.certificate = None;
-        if std::mem::take(&mut notices.back_after_failure) && can_go_back {
-            // Back to Safety: the refused page leaves for the one before.
-            self.engine.borrow().back(tab_id);
+        if std::mem::take(&mut notices.back_after_failure) {
+            if can_go_back {
+                // Back to Safety: the refused page leaves for the one before.
+                self.engine.borrow().back(tab_id);
+            } else {
+                // Nothing before it: the tab was opened for the refused
+                // page. It closes, or unloads if pinned, as Chrome leaves
+                // for a new tab, rather than show an error whose Try Again
+                // brings the warning back.
+                self.close_tab(tab_id, cx);
+            }
             return;
         }
         let name = name.trim_start_matches("net::").to_owned();
@@ -1019,6 +1084,8 @@ impl BrowserApp {
         cx: &mut Context<Self>,
     ) {
         self.notices.popups_reported.remove(&tab_id);
+        self.notices.blocked_popups.remove(&tab_id);
+        self.forget_retry_username(tab_id);
         let covered = self.notices.covers(tab_id);
         if let Some(notices) = self.notices.tabs.get_mut(&tab_id) {
             notices.failure = None;
@@ -1045,11 +1112,85 @@ impl BrowserApp {
         }
     }
 
-    /// Reports a blocked pop-up once per page, for the tab on screen.
-    pub(crate) fn popup_blocked(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
-        if self.active_tab_id() == Some(tab_id) && self.notices.popups_reported.insert(tab_id) {
-            // News, not a failure: the page went on without it.
+    /// Reports a blocked pop-up once per page, for the tab on screen, with
+    /// "Open" for the last one a tab can show (`url`, else empty).
+    pub(crate) fn popup_blocked(&mut self, tab_id: TabId, url: String, cx: &mut Context<Self>) {
+        if !url.is_empty() {
+            self.notices.blocked_popups.insert(tab_id, url);
+        }
+        if self.active_tab_id() != Some(tab_id) || !self.notices.popups_reported.insert(tab_id) {
+            return;
+        }
+        // News, not a failure: the page went on without it.
+        if self.notices.blocked_popups.contains_key(&tab_id) {
+            self.show_action_toast(
+                ToastKind::Info,
+                "Pop-up blocked",
+                "Open",
+                move |this, cx| this.open_blocked_popup(tab_id, cx),
+                cx,
+            );
+        } else {
             self.show_toast_kind(ToastKind::Info, "Pop-up blocked", cx);
+        }
+    }
+
+    /// "Open" on the pop-up-blocked notice: the page's last blocked pop-up
+    /// opens as a tab after it, in its space.
+    fn open_blocked_popup(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        self.toast = None;
+        if let Some(url) = self.notices.blocked_popups.remove(&tab_id)
+            && self.state.tab(tab_id).is_some()
+        {
+            self.open_from_page(tab_id, &url, false, cx);
+        }
+        cx.notify();
+    }
+
+    /// Stop (⌘. or the × in Reload's place) ends what the tab's load waits
+    /// on, as in Chrome: its sign-ins are cancelled and a certificate
+    /// warning is refused, so the load fails there and its card says why.
+    pub(crate) fn stop_page_questions(
+        &mut self,
+        tab_id: TabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let sign_ins: Vec<SignIn> = self
+            .notices
+            .sign_ins
+            .extract_if(.., |request| request.tab_id == tab_id)
+            .collect();
+        let certificate = self
+            .notices
+            .tabs
+            .get_mut(&tab_id)
+            .and_then(|notices| notices.certificate.take());
+        if sign_ins.is_empty() && certificate.is_none() {
+            return;
+        }
+        self.release_sign_ins(&sign_ins, window, cx);
+        for request in sign_ins {
+            self.engine.borrow().respond_sign_in(request.id, None);
+        }
+        if let Some(certificate) = certificate {
+            self.engine
+                .borrow()
+                .respond_certificate(certificate.id, false);
+        }
+        self.notices_changed(tab_id, window, cx);
+    }
+
+    /// The tab shows another document, or closes: a wrong password can no
+    /// longer bring its sign-in back.
+    fn forget_retry_username(&mut self, tab_id: TabId) {
+        if self
+            .notices
+            .retry_username
+            .as_ref()
+            .is_some_and(|(retry_tab, ..)| *retry_tab == tab_id)
+        {
+            self.notices.retry_username = None;
         }
     }
 
@@ -1075,7 +1216,10 @@ impl BrowserApp {
         }
         self.notices.leaving.remove(&tab_id);
         self.notices.popups_reported.remove(&tab_id);
+        self.notices.blocked_popups.remove(&tab_id);
         engine.set_page_covered(tab_id, false);
+        drop(engine);
+        self.forget_retry_username(tab_id);
     }
 
     // Answers.
@@ -1091,8 +1235,11 @@ impl BrowserApp {
     /// Signs in with the fields' username and password. Other requests for
     /// the same sign-in get the same answer.
     fn sign_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let username = self.notices.username.read(cx).text().to_owned();
-        let password = self.notices.password.read(cx).text().to_owned();
+        let Some(shown) = self.shown_sign_in() else {
+            return;
+        };
+        let username = shown.username.read(cx).text().to_owned();
+        let password = shown.password.read(cx).text().to_owned();
         self.answer_sign_in(Some((&username, &password)), window, cx);
     }
 
@@ -1100,6 +1247,8 @@ impl BrowserApp {
         self.answer_sign_in(None, window, cx);
     }
 
+    /// Answers the sign-in shown, and the tab's others for the same site.
+    /// Their fields go with them.
     fn answer_sign_in(
         &mut self,
         credentials: Option<(&str, &str)>,
@@ -1117,19 +1266,25 @@ impl BrowserApp {
             .position(|request| request.id == shown_id)
             .expect("the sign-in shown");
         let shown = self.notices.sign_ins.remove(index);
-        let answered: Vec<SignIn> = self
+        let mut answered: Vec<SignIn> = self
             .notices
             .sign_ins
             .extract_if(.., |request| request.same_as(&shown))
             .collect();
-        for request in std::iter::once(shown).chain(answered) {
+        match credentials {
+            Some((username, _)) => {
+                self.notices.retry_username =
+                    Some((tab_id, shown.site.clone(), username.to_owned()));
+            }
+            None => self.forget_retry_username(tab_id),
+        }
+        answered.insert(0, shown);
+        self.release_sign_ins(&answered, window, cx);
+        for request in answered {
             self.engine
                 .borrow()
                 .respond_sign_in(request.id, credentials);
         }
-        self.notices
-            .password
-            .update(cx, |input, cx| input.set_text("", cx));
         self.notices_changed(tab_id, window, cx);
     }
 
@@ -1149,6 +1304,8 @@ impl BrowserApp {
             return;
         };
         let certificate = notices.certificate.take().expect("the certificate shown");
+        // The engine refuses Continue where the card doesn't offer it.
+        let proceed = proceed && certificate_continue_allowed(certificate.code, &certificate.url);
         if proceed {
             notices.unsafe_host = Some(site(&certificate.url));
         } else {

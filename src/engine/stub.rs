@@ -12,11 +12,13 @@
 //!
 //! Page states have demos too, by a word in the address:
 //! - "auth-demo" asks for a username and password ("proxy" as a proxy,
-//!   http: addresses unencrypted) and loads once signed in;
+//!   "digest" with Digest, http: addresses unencrypted) and loads once
+//!   signed in;
 //! - "crash-demo" crashes once loaded ("oom" out of memory), "hang-demo"
 //!   stops responding; either loads normally again after that;
 //! - "cert-demo" has a certificate that doesn't verify ("expired",
-//!   "revoked" or "name" for other errors than an unknown issuer);
+//!   "revoked" or "name" for other errors than an unknown issuer); as on
+//!   macOS, only IP addresses and localhost may continue past it;
 //! - "error-demo" fails to load: "offline", "refused", "timeout", "reset",
 //!   "ssl", "redirects" or "empty" pick the error, else the address isn't
 //!   found; with "once" only the first try fails;
@@ -33,8 +35,8 @@
 //! site menu, as a profile would.
 
 use super::{
-    CrashReason, DownloadEnd, EngineEvent, Permission, PermissionDecision, ZoomStep, site_origin,
-    step_zoom, unique_file_name,
+    CrashReason, DownloadEnd, EngineEvent, Permission, PermissionDecision, ZoomStep,
+    certificate_continue_allowed, site_origin, step_zoom, unique_file_name,
 };
 use crate::blocker::ContentBlocker;
 use anyhow::Result;
@@ -315,8 +317,29 @@ impl Engine {
         }
     }
 
-    /// Loads finish at once here, so there is nothing to stop.
-    pub fn stop(&self, _tab_id: u64) {}
+    /// Loads finish at once here, but for demo pages waiting on a sign-in
+    /// or a certificate: as in Chromium, stopping ends what the load waits
+    /// on, and the tab stops loading.
+    pub fn stop(&self, tab_id: u64) {
+        let mut ids: Vec<u64> = self
+            .page_requests
+            .borrow()
+            .iter()
+            .filter(|(_, request)| {
+                request.tab_id == tab_id && !matches!(request.kind, RequestKind::Leave(_))
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        ids.sort();
+        for id in ids {
+            self.page_requests.borrow_mut().remove(&id);
+            self.send(EngineEvent::RequestDismissed { id });
+        }
+        self.send(self.loading_event(tab_id, false));
+    }
 
     /// The tab's zoom after `step`, in percent, in Chrome's steps.
     pub fn zoom(&self, tab_id: u64, step: ZoomStep) -> Option<u32> {
@@ -510,7 +533,8 @@ impl Engine {
         self.send(self.loading_event(tab_id, false));
     }
 
-    /// Continuing loads the page; refusing fails the load.
+    /// Continuing loads the page, where that is allowed, as on macOS;
+    /// refusing fails the load.
     pub fn respond_certificate(&self, id: u64, proceed: bool) {
         let Some(PageRequest {
             tab_id,
@@ -519,7 +543,7 @@ impl Engine {
         else {
             return;
         };
-        if proceed {
+        if proceed && certificate_continue_allowed(code, &url) {
             let host = host_of(&url);
             self.demo(tab_id, |demo| {
                 demo.certificates_allowed.insert(host);
@@ -675,18 +699,30 @@ impl Engine {
         let host = host_of(url);
         if url.contains("auth-demo") {
             let proxy = url.contains("proxy");
+            let secure = url.starts_with("https:");
+            let port = Url::parse(url)
+                .ok()
+                .and_then(|url| url.port_or_known_default())
+                .unwrap_or(0);
             let id = self.add_request(tab_id, RequestKind::SignIn);
             return self.send(EngineEvent::SignInRequest {
                 id,
                 tab_id,
                 host: if proxy {
-                    "proxy.corp.example:3128".into()
+                    "proxy.corp.example".into()
                 } else {
                     host
                 },
+                port: if proxy { 3128 } else { port },
                 realm: if proxy { "Corporate proxy" } else { "Staging" }.into(),
                 proxy,
-                secure: url.starts_with("https:"),
+                secure,
+                auth_scheme: if url.contains("digest") {
+                    "digest"
+                } else {
+                    "basic"
+                }
+                .into(),
             });
         }
         if url.contains("cert-demo") {

@@ -261,17 +261,20 @@ pub enum EngineEvent {
         text: String,
     },
     /// A site or a proxy asks for a username and password (HTTP Basic or
-    /// Digest sign-in). `host` is "host" or "host:port"; `realm` names what
-    /// the sign-in is for and may be empty; `secure` is false when the
-    /// password would cross the network unencrypted. Answer once with
-    /// `Engine::respond_sign_in`.
+    /// Digest sign-in). `host` and `port` are the server's, or the proxy's;
+    /// `realm` names what the sign-in is for and may be empty; `secure` is
+    /// false when the password would cross the network unencrypted;
+    /// `auth_scheme` is how it is sent ("basic", "digest"). Answer once
+    /// with `Engine::respond_sign_in`.
     SignInRequest {
         id: u64,
         tab_id: u64,
         host: String,
+        port: u16,
         realm: String,
         proxy: bool,
         secure: bool,
+        auth_scheme: String,
     },
     /// The certificate of `url`, which the tab is loading, didn't verify.
     /// `code` is the net error (-202 for ERR_CERT_AUTHORITY_INVALID). The
@@ -313,7 +316,8 @@ pub enum EngineEvent {
         tab_id: u64,
     },
     /// The page tried to open `url` in a pop-up or tab without a click,
-    /// and it was blocked.
+    /// and it was blocked. `url` is empty unless a tab could show it (see
+    /// `opens_in_tab`).
     PopupBlocked {
         tab_id: u64,
         url: String,
@@ -351,6 +355,28 @@ pub fn certificate_error_overridable(code: i32) -> bool {
     // CONTAINS_ERRORS (-203), REVOKED (-206), INVALID (-207) and
     // KNOWN_INTERCEPTION_BLOCKED (-217).
     (-218..=-200).contains(&code) && ![-203, -206, -207, -217].contains(&code)
+}
+
+/// Whether the certificate warning for `url` may offer to continue past the
+/// error `code`. Chrome refuses whenever the host uses HSTS or is pinned,
+/// which CEF 152 doesn't tell its handler (`OnCertificateError` gets no
+/// `strict_enforcement`, and `CefSSLInfo` only the certificate's status), so
+/// only hosts that can never be either may continue: IP addresses, whose
+/// HSTS headers Chromium ignores and which no preload list holds, and
+/// localhost names, whose HSTS headers it ignores too.
+pub fn certificate_continue_allowed(code: i32, url: &str) -> bool {
+    let Some(host) = gpui::http_client::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+    else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let never_strict = host.parse::<std::net::IpAddr>().is_ok() || {
+        let host = host.trim_end_matches('.');
+        host == "localhost" || host.ends_with(".localhost")
+    };
+    never_strict && certificate_error_overridable(code)
 }
 
 /// How a download ended.
