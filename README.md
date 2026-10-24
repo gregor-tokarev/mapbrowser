@@ -56,7 +56,7 @@ Home-network addresses such as `192.168.1.1`, `nas.local` or `router/` open as t
 
 Help > Keyboard Shortcuts shows every shortcut in one panel. Web apps keep their own shortcuts: in an editor such as Figma, VS Code for the web or Google Docs, keys like `⌘Z`, `⌘A`, `⇧⌘K`, `⌘[` or `⌘F` do what the app says. Opening, closing and switching tabs and spaces always works.
 
-Menus in the sidebar work from the keyboard too: the arrow keys move, Return chooses, → opens Move to Space, a letter jumps to an item and Esc closes. When Map Browser asks before deleting, Return means Cancel.
+Menus in the sidebar work from the keyboard too: `⇧F10` opens the selected tab's menu, the arrow keys move, Return chooses, → opens Move to Space, typing the start of a name jumps to it and Esc closes. When Map Browser asks before deleting, Return means Cancel.
 
 Point at a link to see where it goes, at the bottom left of the page. Right-click a link or an image to open it in a new tab, save it to Downloads or copy its address, an image also to copy the picture, selected text to search for it, or the page to go back, reload or inspect it.
 

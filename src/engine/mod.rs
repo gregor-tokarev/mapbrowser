@@ -35,9 +35,9 @@ pub enum Shortcut {
     PreviousTab,
     /// ⌃Esc, while ⌃ is held for a ⌃Tab walk: the walk ends where it began.
     CancelTabSwitch,
-    /// ⌥⌘↓: the next tab in sidebar order.
+    /// ⌥⌘↓ or ⇧⌘]: the next tab in sidebar order.
     NextTabInList,
-    /// ⌥⌘↑: the previous tab in sidebar order.
+    /// ⌥⌘↑ or ⇧⌘[: the previous tab in sidebar order.
     PreviousTabInList,
     /// ⌘1–⌘9, 1-based.
     SelectTab(u8),
@@ -718,6 +718,10 @@ pub fn shortcut_for_key(
         (false, true, false, _, 53) => Shortcut::CancelTabSwitch,
         (true, false, true, false, 125) => Shortcut::NextTabInList,
         (true, false, true, false, 126) => Shortcut::PreviousTabInList,
+        // ⇧⌘] and ⇧⌘[ (kVK_ANSI_RightBracket, kVK_ANSI_LeftBracket), as in
+        // Chrome and Safari.
+        (true, false, false, true, 30) => Shortcut::NextTabInList,
+        (true, false, false, true, 33) => Shortcut::PreviousTabInList,
         (true, false, true, false, 123) => Shortcut::PreviousSpace,
         (true, false, true, false, 124) => Shortcut::NextSpace,
         // ⌘← and ⌘→ as in Chrome and Arc. Pages get them first, so text

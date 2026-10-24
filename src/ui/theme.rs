@@ -224,14 +224,18 @@ impl Theme {
         self.focus.into()
     }
 
-    /// Buttons that delete something, with white text.
+    /// Fills under white text: buttons that delete something. Too dark for
+    /// red text or glyphs on dark surfaces; those use `error`.
     pub fn danger(&self) -> Hsla {
         rgb(0xd13b33).into()
     }
 
-    /// Error text on a surface: the light red reads on dark surfaces.
+    /// Red text and glyphs: errors, a failed download, "Blocked", a plain
+    /// HTTP warning, a tab's camera or microphone badge. Text reaches 4.5:1
+    /// on the surfaces and the page card, glyphs 3:1 on sidebar rows, the
+    /// selected and hovered ones too, over every gradient.
     pub fn error(&self) -> Hsla {
-        rgb(if self.dark { 0xff6b5e } else { 0xc4322b }).into()
+        rgb(if self.dark { 0xff7b70 } else { 0xb3261e }).into()
     }
 
     /// The command bar and menus.
