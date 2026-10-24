@@ -495,6 +495,14 @@ impl BrowserApp {
     /// through a blank tab of its own that closes once the download starts.
     /// The new download takes the old one's place at the top of the list.
     pub fn retry_download(&mut self, id: u64, cx: &mut Context<Self>) {
+        // A retry whose tab closed before its download started is over.
+        let over: Vec<TabId> = (self.downloads.retries.keys())
+            .copied()
+            .filter(|&tab| !self.is_loaded(tab))
+            .collect();
+        for tab in over {
+            self.downloads.retries.remove(&tab);
+        }
         let Some(download) = self
             .downloads
             .get(id)
@@ -539,9 +547,15 @@ impl BrowserApp {
     }
 
     /// A tab's browser is ready: a download again waiting for it starts.
+    /// One that can't start leaves its row to be retried again.
     pub(crate) fn start_retry(&mut self, tab_id: TabId) {
-        if let Some((_, url)) = self.downloads.retries.get(&tab_id) {
-            self.engine.borrow().start_download(tab_id, url);
+        let started = self
+            .downloads
+            .retries
+            .get(&tab_id)
+            .map(|(_, url)| self.engine.borrow().start_download(tab_id, url));
+        if started == Some(false) {
+            self.downloads.retries.remove(&tab_id);
         }
     }
 
