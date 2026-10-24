@@ -26,12 +26,12 @@ Home-network addresses such as `192.168.1.1`, `nas.local` or `router/` open as t
 - Drag tabs to reorder them or move them between sections.
 - `⌘W`, the – or a middle click only puts a pinned tab or favorite to sleep; it stays in the sidebar with a faded icon. **Close Tab** in its right-click menu removes it, and **Go to Pinned Page** takes it back to the page you pinned.
 - `⌘W`, the × or a middle click closes a Today tab, and `⇧⌘T` brings it back where it was. The library button at the bottom left lists recently closed tabs, also after you restart.
-- **Clear** (`⇧⌘K`) closes all Today tabs at once. **Close Other Tabs** and **Close Tabs Below**, in a Today tab's right-click menu, close the rest or the ones below it. One `⇧⌘T` brings the whole lot back, in order.
+- **Clear** (`⇧⌘K`) closes all Today tabs at once. **Close Other Tabs** and **Close Tabs Below**, in a Today tab's right-click menu, close the rest or the ones below it. One `⇧⌘T` brings the whole lot back, in order, and puts you back on the tab you were on.
 - Double-click a tab, or right-click it and choose **Rename Tab**, to give it a name of your own. The same menu duplicates the tab, mutes it and copies its URL.
 - To send a tab to another space, drag it onto that space's button, or right-click it and choose **Move to Space**. It opens there with that space's logins.
 
 **Spaces.**
-- Spaces appear as buttons at the bottom of the sidebar, each in its own colour or with its icon; the one you're in is raised. With many spaces, a … button lists them all.
+- Spaces appear as buttons at the bottom of the sidebar, each in its own colour or with its icon; the one you're in is raised. With many spaces, a … button lists them all; drag a tab onto it to send the tab to any of them.
 - To switch, click a button, swipe sideways with two fingers on the sidebar, or use `⌃1`–`⌃9` or `⌥⌘←` / `⌥⌘→`, which go round from the last space to the first.
 - Drag the buttons to put your spaces in the order you want.
 - Double-click a space's name to rename it. Right-click the name, or use the … beside it, to set its colour and icon; try as many as you like before closing the menu. **Unload Space** puts all of its pages to sleep when you're done with them.
@@ -43,7 +43,7 @@ Home-network addresses such as `192.168.1.1`, `nas.local` or `router/` open as t
 |---|---|
 | `⌘S` | Hide or show the sidebar |
 | `⌘1`–`⌘9` | Go to a tab |
-| `⌃Tab` | Back to the tab you were on. Hold `⌃` and press `Tab` again to go further back; the sidebar outlines the tab you'll get. `⌃Esc` cancels |
+| `⌃Tab` | Back to the tab you were on. Hold `⌃` and press `Tab` again to go further back; the sidebar outlines the tab you'll get, or with the sidebar hidden its name shows at the bottom left of the page. `⌃Esc` cancels |
 | `⌥⌘↑` / `⌥⌘↓` or `⇧⌘[` / `⇧⌘]` | Previous or next tab in the sidebar |
 | `⌘R` | Reload |
 | `⌘[` / `⌘]` or `⌘←` / `⌘→` | Back and forward |
