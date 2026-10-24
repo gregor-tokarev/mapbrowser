@@ -558,10 +558,10 @@ impl BrowserApp {
     fn load_favicons(&mut self, hosts: Vec<String>, cx: &mut Context<Self>) {
         let task = self.favicons.load_for(hosts, cx.background_executor());
         cx.spawn(async move |this, cx| {
-            let loaded = task.await;
+            let mut loaded = task.await;
             this.update(cx, |this, cx| {
                 // Only the sidebar shows favicons.
-                if this.favicons.insert_loaded(loaded) && this.sidebar_width().is_some() {
+                if this.favicons.insert_loaded(&mut loaded) && this.sidebar_width().is_some() {
                     cx.notify();
                 }
             })
@@ -1368,6 +1368,23 @@ impl BrowserApp {
         self.forget_unused_favicons(cx);
     }
 
+    /// Whether any tab, closed tab or visit in any space is on `host`, so
+    /// its icon may be cached (`forget_unused_favicons`).
+    fn site_in_use(&self, host: &str) -> bool {
+        let on_host = |url: &str| host_of(url).as_deref() == Some(host);
+        self.state
+            .spaces
+            .iter()
+            .flat_map(|space| &space.tabs)
+            .any(|tab| on_host(&tab.url))
+            || self
+                .state
+                .closed_tabs()
+                .iter()
+                .any(|closed| on_host(&closed.tab.url))
+            || self.history.urls().any(on_host)
+    }
+
     /// Deletes the cached icons of sites that no tab, closed tab or visit
     /// in any space has any more: the cache names every site it holds.
     fn forget_unused_favicons(&mut self, cx: &mut Context<Self>) {
@@ -1826,12 +1843,13 @@ impl BrowserApp {
         });
         let task = self.favicons.load_for(hosts, cx.background_executor());
         cx.spawn(async move |this, cx| {
-            let loaded = task.await;
+            let mut loaded = task.await;
             this.update(cx, |this, cx| {
-                let icons = loaded.iter().cloned().collect();
-                this.favicons.insert_loaded(loaded);
+                this.favicons.insert_loaded(&mut loaded);
                 if let Some(bar) = &this.command_bar {
-                    let _ = bar.handle.update(cx, |bar, _, cx| bar.add_icons(icons, cx));
+                    let _ = bar.handle.update(cx, |bar, _, cx| {
+                        bar.add_icons(loaded.into_iter().collect(), cx)
+                    });
                 }
             })
         })
@@ -2451,6 +2469,11 @@ impl BrowserApp {
                 }
             }
             EngineEvent::Favicon { host, png, .. } => {
+                // An icon fetched before Clear History or Delete Space
+                // forgot its site would bring the site back to the cache.
+                if !self.site_in_use(&host) {
+                    return;
+                }
                 let shown = self
                     .state
                     .active_space()

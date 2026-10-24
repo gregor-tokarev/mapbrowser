@@ -1654,10 +1654,15 @@ const LOCAL_SUFFIXES: &[&str] = &[
 
 /// Whether `host` (lowercase, without a trailing dot) only means something
 /// on the local network: a single label such as "router", or a name under
-/// one of the local suffixes. No HSTS preload list can hold such names.
+/// one of the local suffixes. A single label that is itself a public
+/// suffix ("dev", "app", "google") doesn't count: the HSTS preload list
+/// holds many such top-level domains, and its entry covers the bare label
+/// too. No preload list can hold the names that are left.
 pub fn is_local_network_name(host: &str) -> bool {
-    !host.is_empty()
-        && (!host.contains('.') || LOCAL_SUFFIXES.iter().any(|suffix| host.ends_with(suffix)))
+    let single_label = !host.is_empty()
+        && !host.contains('.')
+        && !psl::suffix(host.as_bytes()).is_some_and(|suffix| suffix.is_known());
+    single_label || LOCAL_SUFFIXES.iter().any(|suffix| host.ends_with(suffix))
 }
 
 /// The URL that trimmed, non-empty text names, or `None` for a search query.

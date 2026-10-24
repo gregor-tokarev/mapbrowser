@@ -30,9 +30,14 @@ const MAX_FRAMES: usize = 64;
 /// stop playing audibly. An element is held only while it plays: pausing,
 /// ending, emptying or leaving the document (which pauses it) lets it go.
 /// Its own listeners stay, as a removed element's events no longer reach
-/// the document; adding the same listener twice adds it once.
+/// the document; adding the same listener twice adds it once. Every
+/// listener goes when the page is hidden: a page kept in the back-forward
+/// cache keeps its scripts, and the browser runs a fresh copy with a new
+/// token when the page comes back, so copies never pile up.
 const SCRIPT: &str = r#"(() => {
   const debug = console.debug.bind(console);
+  const off = new AbortController();
+  const signal = off.signal;
   const playing = new Set();
   let audible = false;
   const tell = (now) => {
@@ -50,13 +55,18 @@ const SCRIPT: &str = r#"(() => {
   const watch = (element) => {
     if (!(element instanceof HTMLMediaElement)) return;
     for (const type of ["playing", "pause", "ended", "emptied", "volumechange"]) {
-      element.addEventListener(type, changed);
+      element.addEventListener(type, changed, { signal });
     }
     if (!element.paused && !element.ended) playing.add(element);
   };
-  document.addEventListener("play", (event) => { watch(event.target); report(); }, true);
+  document.addEventListener("play", (event) => { watch(event.target); report(); },
+    { capture: true, signal });
   document.querySelectorAll("audio, video").forEach(watch);
-  addEventListener("pagehide", () => tell(false));
+  addEventListener("pagehide", () => {
+    tell(false);
+    off.abort();
+    playing.clear();
+  }, { signal });
   report();
 })();"#;
 

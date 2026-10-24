@@ -363,8 +363,8 @@ pub fn certificate_error_overridable(code: i32) -> bool {
 /// `strict_enforcement`, and `CefSSLInfo` only the certificate's status), so
 /// only hosts no preload list can hold may continue: IP addresses, whose
 /// HSTS headers Chromium ignores, localhost names, whose headers it ignores
-/// too, and local network names (nas.local, router), which could only have
-/// sent HSTS themselves. Those devices often have self-signed certificates,
+/// too, and local network names (nas.local, router, but not a top-level
+/// domain such as "dev"), which could only have sent HSTS themselves. Those devices often have self-signed certificates,
 /// and Chrome lets you past them unless the device asked for HSTS.
 pub fn certificate_continue_allowed(code: i32, url: &str) -> bool {
     let Some(host) = gpui::http_client::Url::parse(url)

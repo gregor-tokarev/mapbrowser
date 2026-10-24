@@ -129,9 +129,10 @@ impl Engine {
 
 /// Every content setting Chromium keeps an answer to `permission` in, for
 /// Reset: the menu lists answers this session gave to any prompt, not only
-/// `SITE_SETTINGS`. Each is the setting Chromium decides a prompt of that
-/// kind by, so it is one this Chromium knows; setting one it doesn't
-/// know would crash it.
+/// `SITE_SETTINGS`. Setting a type Chromium never registered aborts the
+/// browser process, so each one here is checked against Chromium 152's
+/// content_settings_registry.cc: plain MIDI isn't registered there (its
+/// prompt is kept in MIDI_SYSEX), the older LOCAL_NETWORK_ACCESS is.
 fn reset_settings(permission: Permission) -> &'static [ContentSettingTypes] {
     use ContentSettingTypes as Kind;
     match permission {
@@ -142,7 +143,7 @@ fn reset_settings(permission: Permission) -> &'static [ContentSettingTypes] {
         Permission::Location => &[Kind::GEOLOCATION],
         Permission::Notifications => &[Kind::NOTIFICATIONS],
         Permission::Clipboard => &[Kind::CLIPBOARD_READ_WRITE],
-        Permission::Midi => &[Kind::MIDI_SYSEX, Kind::MIDI],
+        Permission::Midi => &[Kind::MIDI_SYSEX],
         Permission::Downloads => &[Kind::AUTOMATIC_DOWNLOADS],
         Permission::StorageAccess => &[Kind::STORAGE_ACCESS, Kind::TOP_LEVEL_STORAGE_ACCESS],
         Permission::LocalFonts => &[Kind::LOCAL_FONTS],
@@ -150,7 +151,7 @@ fn reset_settings(permission: Permission) -> &'static [ContentSettingTypes] {
         Permission::IdleDetection => &[Kind::IDLE_DETECTION],
         Permission::PointerLock => &[Kind::POINTER_LOCK],
         Permission::KeyboardLock => &[Kind::KEYBOARD_LOCK],
-        Permission::LocalNetwork => &[Kind::LOCAL_NETWORK],
+        Permission::LocalNetwork => &[Kind::LOCAL_NETWORK, Kind::LOCAL_NETWORK_ACCESS],
         Permission::LoopbackNetwork => &[Kind::LOOPBACK_NETWORK],
         Permission::Sensors => &[Kind::SENSORS],
         Permission::FileSystem => &[Kind::FILE_SYSTEM_WRITE_GUARD],

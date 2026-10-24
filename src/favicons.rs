@@ -97,12 +97,14 @@ impl FaviconStore {
     }
 
     /// Returns whether any icon was added. Icons stored while the read was
-    /// running are newer and win.
-    pub fn insert_loaded(&mut self, loaded: LoadedIcons) -> bool {
+    /// running are newer and win. Hosts `retain_hosts` forgot meanwhile
+    /// stay forgotten: their icons are taken out of `loaded`.
+    pub fn insert_loaded(&mut self, loaded: &mut LoadedIcons) -> bool {
+        loaded.retain(|(host, _)| self.looked_up.contains(host));
         let mut added = false;
-        for (host, image) in loaded {
-            if let Entry::Vacant(entry) = self.icons.entry(host) {
-                entry.insert(image);
+        for (host, image) in loaded.iter() {
+            if let Entry::Vacant(entry) = self.icons.entry(host.clone()) {
+                entry.insert(image.clone());
                 added = true;
             }
         }
@@ -494,7 +496,8 @@ mod tests {
         // An older disk read never replaces an icon stored meanwhile.
         let stale = Arc::new(Image::from_bytes(ImageFormat::Png, png(1)));
         let other = Arc::new(Image::from_bytes(ImageFormat::Png, png(3)));
-        assert!(store.insert_loaded(vec![
+        store.looked_up.insert("other.com".into());
+        assert!(store.insert_loaded(&mut vec![
             ("example.com".into(), stale),
             ("other.com".into(), other)
         ]));
