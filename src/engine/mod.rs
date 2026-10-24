@@ -79,6 +79,12 @@ pub enum Shortcut {
     FindPrevious,
     /// ⌘P: print the page.
     Print,
+    /// ⌘Y: the visited pages, in the command bar. Web apps such as Google
+    /// Docs redo with it, so a focused page gets it first.
+    History,
+    /// ⇧F10 or the context-menu key: the selected tab's menu, as a
+    /// right-click on its row would open.
+    TabMenu,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -672,7 +678,8 @@ pub fn shortcut_character(characters: &str, ignoring_modifiers: &str, key: u16) 
 /// rest of macOS and the menu bar do, so ⌘Z on AZERTY undoes instead of
 /// closing the tab and ⌘+ zooms on German keyboards. Tab, the arrows, the
 /// brackets and the digits stay on their physical keys, which every layout
-/// has. Every shortcut needs ⌘ or ⌃, so typing is never intercepted.
+/// has. Every shortcut but ⇧F10 and the context-menu key, which type
+/// nothing, needs ⌘ or ⌃, so typing is never intercepted.
 #[cfg(any(target_os = "macos", test))]
 pub fn shortcut_for_key(
     key: u16,
@@ -705,6 +712,7 @@ pub fn shortcut_for_key(
         (true, false, true, false, Some('i')) => Some(Shortcut::DevTools),
         (true, false, false, false, Some('.')) => Some(Shortcut::Stop),
         (true, false, false, false, Some('p')) => Some(Shortcut::Print),
+        (true, false, false, false, Some('y')) => Some(Shortcut::History),
         // "+" needs ⇧ on many layouts, where ⌘= means the same.
         (true, false, false, _, Some('=' | '+')) => Some(Shortcut::ZoomIn),
         (true, false, false, false, Some('-')) => Some(Shortcut::ZoomOut),
@@ -734,6 +742,9 @@ pub fn shortcut_for_key(
         (true, false, false, false, 30 | 124) => Shortcut::Forward,
         // kVK_ANSI_0, like the digits for layouts that type no "0" there.
         (true, false, false, false, 29) => Shortcut::ZoomReset,
+        // kVK_F10 with ⇧, and kVK_ContextualMenu (a PC keyboard's menu
+        // key). Neither types anything; a page gets them first.
+        (false, false, false, true, 109) | (false, false, false, false, 110) => Shortcut::TabMenu,
         (true, false, false, false, _) => Shortcut::SelectTab(digit?),
         (false, true, false, false, _) => Shortcut::SelectSpace(digit?),
         _ => return None,
@@ -1096,7 +1107,8 @@ mod tests {
 
     #[test]
     fn never_intercepts_typing() {
-        for key in 0..=127 {
+        // kVK_F10 and kVK_ContextualMenu type nothing.
+        for key in (0..=127).filter(|key| ![109, 110].contains(key)) {
             for character in [None, Some('t'), Some('w'), Some('1')] {
                 for (option, shift) in [(false, false), (false, true), (true, false), (true, true)]
                 {
@@ -1297,9 +1309,10 @@ mod tests {
             (None, Some(EditCommand::SelectAll))
         );
         assert_eq!(press("w", 6, COMMAND), (Some(Shortcut::CloseTab), None));
-        // QWERTZ ⌘Z (the US Y key) undoes and ⌘Y does nothing.
+        // QWERTZ ⌘Z (the US Y key) undoes and ⌘Y (the US Z key) shows
+        // History.
         assert_eq!(press("z", 16, COMMAND), (None, Some(EditCommand::Undo)));
-        assert_eq!(press("y", 6, COMMAND), (None, None));
+        assert_eq!(press("y", 6, COMMAND), (Some(Shortcut::History), None));
         // Dvorak ⌘, (the US W key) does nothing, ⌘Q (the US X key) doesn't
         // cut, and ⌘T (the US K key) opens the command bar.
         assert_eq!(press(",", 13, COMMAND), (None, None));

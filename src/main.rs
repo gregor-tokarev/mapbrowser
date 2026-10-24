@@ -99,10 +99,13 @@ fn key_bindings() -> Vec<KeyBinding> {
         // text fields take them while they have focus.
         KeyBinding::new("cmd-z", Undo, None),
         KeyBinding::new("cmd-shift-z", Redo, None),
-        // Browser shortcuts, as in Safari and Chrome: Settings and History
-        // open with a page focused too, before the page sees the key (the
-        // key monitor doesn't route them to it, and GPUI's view claims
-        // them ahead of the page's).
+        // Browser shortcuts, as in Safari and Chrome: Settings opens with a
+        // page focused too, before the page sees the key (the key monitor
+        // doesn't route it to the page, and GPUI's view claims it ahead of
+        // the page's). History's ⌘Y is Redo in web apps such as Google
+        // Docs: the key monitor gives a focused page it first, as Chrome
+        // does (`Shortcut::History`), and this binding serves the shell's
+        // own focus, the command bar and the menu bar.
         KeyBinding::new("cmd-,", Settings, None),
         KeyBinding::new("cmd-y", ShowHistory, None),
         KeyBinding::new("alt-cmd-l", ShowDownloads, None),
@@ -445,11 +448,7 @@ fn main() -> anyhow::Result<()> {
         });
         // History and settings are lists in the command bar.
         cx.on_action(move |_: &ShowHistory, cx| {
-            cx.defer(move |cx| {
-                let _ = window.update(cx, |app, window, cx| {
-                    app.toggle_command_bar(CommandMode::History, window, cx)
-                });
-            })
+            cx.defer(move |cx| run_shortcut(window, Shortcut::History, cx))
         });
         cx.on_action(move |_: &Settings, cx| {
             cx.defer(move |cx| {

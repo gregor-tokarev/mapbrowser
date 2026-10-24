@@ -1234,8 +1234,8 @@ impl BrowserApp {
         if self.state.selected_space_id == from || self.state.selected_space_id == space_id {
             self.show_selected();
         }
-        if let Some(space) = self.state.space(space_id) {
-            self.show_toast(format!("Moved to {}", space.name), cx);
+        if let Some(name) = self.state.space(space_id).map(|space| space.name.clone()) {
+            self.show_toast_about(ToastKind::Done, "Moved to ", &name, Cut::End, cx);
         }
         self.persist_later(cx);
         cx.notify();
@@ -1327,7 +1327,7 @@ impl BrowserApp {
         for id in tabs {
             self.drop_browser(id);
         }
-        self.show_toast(format!("Unloaded {name}"), cx);
+        self.show_toast_about(ToastKind::Done, "Unloaded ", &name, Cut::End, cx);
     }
 
     /// Deletes a space and its tabs; the last space stays. Chromium keeps
@@ -1358,7 +1358,7 @@ impl BrowserApp {
         if active {
             self.show_selected();
         }
-        self.show_toast(format!("Deleted {}", space.name), cx);
+        self.show_toast_about(ToastKind::Done, "Deleted ", &space.name, Cut::End, cx);
         self.persist_later(cx);
         // The space's history goes with it, and the icons of the sites only
         // it had.
@@ -2191,6 +2191,10 @@ impl BrowserApp {
     }
 
     pub fn shortcut(&mut self, shortcut: Shortcut, window: &mut Window, cx: &mut Context<Self>) {
+        // A menu opened from the keyboard, unless one is open already.
+        if shortcut == Shortcut::TabMenu {
+            return self.show_menu_from_keyboard(window, cx);
+        }
         let naming_in_hidden_sidebar = self.shown_for_naming();
         self.end_rename(window, cx);
         // A tab's menu lists ⌘W, ⌘D, ⌘R and ⇧⌘C beside its items: while it
@@ -2327,9 +2331,16 @@ impl BrowserApp {
                     self.engine.borrow().print(id);
                 }
             }
+            Shortcut::History => self.toggle_command_bar(CommandMode::History, window, cx),
+            Shortcut::TabMenu => {}
         }
-        // ⌘T and ⌘L open, close or keep the bar themselves.
-        if bar_open && !matches!(shortcut, Shortcut::CommandBar | Shortcut::EditAddress) {
+        // ⌘T, ⌘L and ⌘Y open, close or keep the bar themselves.
+        if bar_open
+            && !matches!(
+                shortcut,
+                Shortcut::CommandBar | Shortcut::EditAddress | Shortcut::History
+            )
+        {
             self.refresh_command_bar(cx);
         }
     }

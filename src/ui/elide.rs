@@ -1,7 +1,7 @@
-//! One line of text cut short to fit its box, other than at its end: a
-//! host loses its start, whole labels at a time, so the domain that owns
-//! it stays readable ("…session-join.attacker.example"), and a file name
-//! loses its middle, keeping how it ends and its extension. GPUI 0.2.2
+//! One line of text cut short to fit its box: a host loses its start,
+//! whole labels at a time, so the domain that owns it stays readable
+//! ("…session-join.attacker.example"), a file name loses its middle,
+//! keeping how it ends and its extension, and a name its end. GPUI 0.2.2
 //! cuts text only at the end, and the room a line gets is known only once
 //! it is laid out, so the text is measured and painted then, in the
 //! parent's text style.
@@ -18,6 +18,8 @@ pub enum Cut {
     Start,
     /// Keep the start and the end: file names.
     Middle,
+    /// Keep the start: names, such as a space's.
+    End,
 }
 
 /// `text` on one line `height` tall, cut where `cut` says if it doesn't
@@ -136,6 +138,7 @@ fn keep(text: &str, kept: usize, cut: Cut) -> String {
     let chars: Vec<char> = text.chars().collect();
     let tail = match cut {
         Cut::Start => kept,
+        Cut::End => 0,
         // At least the extension, if there is room for more than it.
         Cut::Middle => {
             let extension = chars
@@ -157,7 +160,7 @@ fn keep(text: &str, kept: usize, cut: Cut) -> String {
     let end: String = chars[chars.len() - tail..].iter().collect();
     let end = match cut {
         Cut::Start => from_label(text, &end),
-        Cut::Middle => &end,
+        Cut::Middle | Cut::End => &end,
     };
     format!("{start}…{end}")
 }

@@ -492,8 +492,8 @@ impl BrowserApp {
                 this.swipe_spaces(event, window, cx)
             }))
             .on_drag_move(
-                cx.listener(|this, event: &DragMoveEvent<DraggedTab>, _, cx| {
-                    this.drag_tab_over(event, cx)
+                cx.listener(|this, event: &DragMoveEvent<DraggedTab>, window, cx| {
+                    this.drag_tab_over(event, window, cx)
                 }),
             )
             .on_drop(cx.listener(|this, dragged: &DraggedTab, window, cx| {
@@ -528,9 +528,37 @@ impl BrowserApp {
     /// Follows a tab dragged over the sidebar. Between the navigation row
     /// and the bottom bar it finds the tab's drop position. Near the tab
     /// list's top or bottom edge the list scrolls (`scroll_dragged_tab`).
-    /// While "…" lists the spaces for it, the list under them stays put.
-    fn drag_tab_over(&mut self, event: &DragMoveEvent<DraggedTab>, cx: &mut Context<Self>) {
+    /// While "…" lists the spaces for it, the list under them stays put;
+    /// the list of spaces closes once the tab leaves it and the bottom bar,
+    /// as Arc's spring-loaded lists do, and the tab list takes it again.
+    fn drag_tab_over(
+        &mut self,
+        event: &DragMoveEvent<DraggedTab>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let (pointer, sidebar) = (event.event.position, event.bounds);
+        if self.tab_lists.drag_menu {
+            let over_bar =
+                sidebar.contains(&pointer) && pointer.y >= sidebar.bottom() - px(BOTTOM_BAR);
+            let over_menu = self
+                .menu
+                .as_ref()
+                .and_then(|menu| menu.drawn.get())
+                .is_some_and(|menu| menu.contains(&pointer));
+            if !over_bar && !over_menu {
+                self.tab_lists.drag_menu = false;
+                self.tab_over_spaces.set(false);
+                if self
+                    .menu
+                    .as_ref()
+                    .is_some_and(|menu| menu.kind == MenuKind::Spaces)
+                {
+                    self.close_menu(window, cx);
+                }
+                cx.notify();
+            }
+        }
         let over_list = self.menu.is_none()
             && sidebar.contains(&pointer)
             && pointer.y >= sidebar.top() + px(PAGES_TOP)
@@ -2033,7 +2061,7 @@ impl BrowserApp {
                 let menu_open = self.menu.as_ref().is_some_and(|menu| {
                     matches!(menu.kind, MenuKind::Space(space) | MenuKind::DeleteSpace(space) if space == id)
                 });
-                let dot = Theme::new(space.theme(), theme.dark).focus();
+                let dot = Theme::new(space.theme(), theme.dark).dot();
                 let chip = div()
                     .flex()
                     .items_center()
@@ -2322,6 +2350,9 @@ struct TabTooltip {
 struct TabTooltipText {
     title: SharedString,
     host: SharedString,
+    /// The host's width, at most the bubble's: a longer one loses its
+    /// start, never the domain that owns it.
+    host_width: f32,
     /// The lines the title takes, and the width it wraps at.
     lines: usize,
     room: f32,
@@ -2359,13 +2390,24 @@ impl TabTooltip {
         if text_width(&title, font(UI_FONT), 14., window) <= width - ROW_TITLE_CHROME {
             return None;
         }
+        // A title that is an address wraps between its labels, or after a
+        // hyphen in a long one.
+        let title = if title.contains('.') && !title.contains(char::is_whitespace) {
+            breakable(&title).replace('-', "-\u{200B}")
+        } else {
+            title
+        };
         // At the tooltip's 12 pt, in the bubble less its padding.
         let room = TAB_TOOLTIP_MAX_WIDTH.min(width - 2. * TOOLTIP_EDGE) - 2. * TOOLTIP_PADDING;
         let lines = wrapped_lines(&title, font(UI_FONT), 12., room, cx).min(TAB_TOOLTIP_LINES);
         let host = host_of(&tab.url).unwrap_or_else(|| tab.url.clone());
+        let host_width = text_width(&host, font(UI_FONT), 11., window)
+            .ceil()
+            .min(room);
         Some(TabTooltipText {
             title: title.into(),
             host: host.into(),
+            host_width,
             lines,
             room,
         })
@@ -2405,7 +2447,8 @@ impl Render for TabTooltip {
                     .child(text.title.clone()),
             )
             .child(
-                truncated(text.host.clone())
+                elided(text.host.clone(), Cut::Start, 15.)
+                    .w(px(text.host_width))
                     .text_size(px(11.))
                     .line_height(px(15.))
                     .text_color(theme.tertiary()),

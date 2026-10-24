@@ -1,10 +1,11 @@
 //! Toasts: short messages ("Copied URL", "Zoom 110%", "Downloaded …") above
 //! the sidebar's bottom bar, with a mark for what they report: ✓ done,
 //! ✕ failed, · for news. A long one keeps the words that say what
-//! happened: in the sidebar the host or file name it names moves to a
-//! second line, over the page it is cut in place, a host from its start
-//! and a file name in its middle (other text loses its middle). Long ones
-//! stay up a little longer.
+//! happened: in the sidebar the host, file or space it names moves to a
+//! second line; over the page it is cut in place, a host from its start, a
+//! file name in its middle and a space's name at its end (other text loses
+//! its middle). Long ones stay up a little longer, and one under the
+//! pointer until it leaves.
 //!
 //! While the sidebar is hidden (⌘S) the toast shows over the page card's
 //! bottom-left corner, as Arc shows toasts over the page then, above the
@@ -26,10 +27,9 @@ use super::{
 };
 use crate::{app::BrowserApp, model::TabId};
 use gpui::{
-    AnyElement, AppContext, Bounds, Context, Div, Font, FontWeight, InteractiveElement,
-    IntoElement, ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement,
-    Styled, Task, Window, WindowHandle, WindowOptions, div, font, point, prelude::FluentBuilder,
-    px, size,
+    AnyElement, AppContext, Bounds, Context, Font, FontWeight, InteractiveElement, IntoElement,
+    ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement, Styled, Task,
+    Window, WindowHandle, WindowOptions, div, font, point, prelude::FluentBuilder, px, size,
 };
 use std::{ops::Range, rc::Rc, time::Duration};
 
@@ -95,7 +95,13 @@ pub struct Toast {
     action: Option<ToastAction>,
     /// The text as the sidebar shows it, fitted to `.0` points.
     fitted: Option<(f32, Lines)>,
-    _timer: Task<()>,
+    duration: Duration,
+    /// The pointer is on it in the sidebar: it stays until the pointer
+    /// leaves, and then for `duration` again, so it never goes from under
+    /// a click aimed at it.
+    hovered: bool,
+    /// Ends the toast; none while it is hovered.
+    _timer: Option<Task<()>>,
 }
 
 /// A toast's text in the sidebar: one line, or, too long for one, what
@@ -127,6 +133,17 @@ fn toast_duration(kind: ToastKind, text: &str) -> Duration {
     let extra_chars = text.chars().count().saturating_sub(24) as u64;
     let failed = if kind == ToastKind::Failed { 1500 } else { 0 };
     Duration::from_millis((1500 + 50 * extra_chars + failed).min(5000))
+}
+
+/// Ends the toast on screen after `duration`.
+fn toast_timer(duration: Duration, cx: &mut Context<BrowserApp>) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        cx.background_executor().timer(duration).await;
+        let _ = this.update(cx, |this, cx| {
+            this.toast = None;
+            cx.notify();
+        });
+    })
 }
 
 /// The toast's mark: a check, a cross, or a dot.
@@ -362,13 +379,8 @@ impl BrowserApp {
         action: Option<ToastAction>,
         cx: &mut Context<Self>,
     ) {
-        let timer = cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(duration).await;
-            let _ = this.update(cx, |this, cx| {
-                this.toast = None;
-                cx.notify();
-            });
-        });
+        // A toast that replaces one under the pointer is under it too.
+        let hovered = self.toast.as_ref().is_some_and(|toast| toast.hovered);
         self.toast = Some(Toast {
             kind,
             text,
@@ -376,9 +388,23 @@ impl BrowserApp {
             undo,
             action,
             fitted: None,
-            _timer: timer,
+            duration,
+            hovered,
+            _timer: (!hovered).then(|| toast_timer(duration, cx)),
         });
         cx.notify();
+    }
+
+    /// The pointer came onto the sidebar's toast, or left it: its time
+    /// stops while it is hovered, and starts again as the pointer leaves.
+    fn hover_toast(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        let Some(toast) = &mut self.toast else {
+            return;
+        };
+        if toast.hovered != hovered {
+            toast.hovered = hovered;
+            toast._timer = (!hovered).then(|| toast_timer(toast.duration, cx));
+        }
     }
 
     /// The failed save's notice, short enough for a toast.
@@ -419,7 +445,7 @@ impl BrowserApp {
         width: f32,
         theme: &Theme,
         cx: &mut Context<Self>,
-    ) -> Vec<Div> {
+    ) -> Vec<AnyElement> {
         let card = || {
             div()
                 .mx(px(8.))
@@ -434,6 +460,11 @@ impl BrowserApp {
         };
         let toast = self.toast.as_ref().map(|toast| {
             card()
+                .id("toast")
+                // Clicks on it never reach the tab row behind it; the list
+                // still scrolls under it.
+                .block_mouse_except_scroll()
+                .on_hover(cx.listener(|this, hovered: &bool, _, cx| this.hover_toast(*hovered, cx)))
                 .flex()
                 .items_center()
                 .gap(px(8.))
@@ -512,7 +543,11 @@ impl BrowserApp {
                         ),
                 )
         });
-        toast.into_iter().chain(save).collect()
+        toast
+            .map(IntoElement::into_any_element)
+            .into_iter()
+            .chain(save.map(IntoElement::into_any_element))
+            .collect()
     }
 
     /// The toast, or the failed save's notice, if the sidebar that shows

@@ -19,18 +19,21 @@ use super::{
 };
 use crate::{
     app::BrowserApp,
-    engine::{Permission, ZoomStep, site_origin},
+    engine::{Permission, Shortcut, ZoomStep, site_origin},
     favicons::host_of,
     model::{Pin, SpaceId, THEME_COUNT, TabId},
     ui::page_notice::Leaving,
 };
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, Div, Font, FontWeight, InteractiveElement,
+    AnyElement, App, Bounds, ClickEvent, Context, Div, Font, FontWeight, Hsla, InteractiveElement,
     IntoElement, KeyBinding, KeyContext, KeyDownEvent, MouseButton, MouseMoveEvent, ParentElement,
     Pixels, Point, ScrollHandle, SharedString, Size, Stateful, StatefulInteractiveElement, Styled,
     Window, actions, deferred, div, font, point, prelude::FluentBuilder, px, relative,
 };
-use std::time::{Duration, Instant};
+use std::{
+    cell::Cell,
+    time::{Duration, Instant},
+};
 
 actions!(
     menu,
@@ -65,12 +68,15 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("tab", NextControl, Some("Menu")),
         KeyBinding::new("shift-tab", PreviousControl, Some("Menu")),
         // Space doesn't choose, as in AppKit's menus: it may be part of a
-        // name being typed ("side p" for Side Project).
+        // name being typed ("side p" for Side Project). In a question it
+        // presses the ringed button (`type_in_menu`).
         KeyBinding::new("enter", Choose, Some("Menu")),
         // Return never deletes: in the delete prompt it means Cancel, as
         // destructive buttons are never the default on macOS.
         KeyBinding::new("cmd-backspace", ChooseDestructive, Some("Menu")),
-        // The keyboard's way to a right-click, while the shell has focus.
+        // The keyboard's way to a right-click, while the shell has focus;
+        // on macOS the key monitor sends it from a focused page too
+        // (`Shortcut::TabMenu`).
         KeyBinding::new("shift-f10", ShowTabMenu, Some("Browser")),
         KeyBinding::new("menu", ShowTabMenu, Some("Browser")),
         // In the library, a download that ended leaves the list.
@@ -162,6 +168,9 @@ pub struct OpenMenu {
     /// its last key came (`type_in_menu`).
     typed: String,
     typed_at: Option<Instant>,
+    /// Where it was last drawn, in window coordinates: the spaces "…"
+    /// lists for a dragged tab close once the drag leaves them.
+    pub(super) drawn: Cell<Option<Bounds<Pixels>>>,
 }
 
 impl OpenMenu {
@@ -175,6 +184,7 @@ impl OpenMenu {
             scroll: ScrollHandle::new(),
             typed: String::new(),
             typed_at: None,
+            drawn: Cell::new(None),
         }
     }
 
@@ -297,6 +307,8 @@ enum Entry {
     Closed {
         index: usize,
         title: SharedString,
+        /// The space it reopens in, if not the one on screen.
+        elsewhere: Option<SharedString>,
     },
     Empty(&'static str),
     /// A question; its title and its explanation wrap onto `lines` lines
@@ -322,6 +334,9 @@ enum Entry {
         missing: bool,
         can_retry: bool,
         space: Option<SharedString>,
+        /// Its space's name and theme, if not the one on screen: its icon
+        /// wears the space's dot, and the status names it where it fits.
+        elsewhere: Option<(SharedString, u8)>,
     },
     /// The site a site menu is about, and whether its connection is plain
     /// HTTP.
@@ -419,13 +434,15 @@ impl Entry {
             | Entry::Space { .. }
             | Entry::Check { .. }
             | Entry::Permission { .. } => 1,
-            // A file that is there: open it, or show it in Finder.
+            // A file that is there: open it, or show it in Finder. Any
+            // other download is one choice: stop it, download it again,
+            // or, with nothing to do, only take ⌫ to leave the list.
             Entry::Download {
                 state: DownloadState::Done,
                 missing: false,
                 ..
             } => 2,
-            Entry::Download { .. } => usize::from(self.action(0).is_some()),
+            Entry::Download { .. } => 1,
             Entry::Swatches(..) => usize::from(THEME_COUNT),
             Entry::Icons(..) => space_icons().len() + 1,
             Entry::Zoom(_) => 3,
@@ -511,7 +528,7 @@ impl Entry {
                 ..
             } => Some(label),
             Entry::Closed { title: label, .. } | Entry::Space { name: label, .. } => Some(label),
-            Entry::Download { name, .. } if self.parts() > 0 => Some(name),
+            Entry::Download { name, .. } => Some(name),
             Entry::Check { label, .. } => Some(label),
             Entry::Permission { permission, .. } => Some(permission_name(*permission)),
             _ => None,
@@ -523,7 +540,7 @@ impl Entry {
 /// 16 pt slot. On a highlighted row the dot has a white ring: the
 /// highlight may be the very same colour.
 fn space_mark(icon: Option<String>, theme: u8, dark: bool, lit: bool) -> gpui::Div {
-    let dot = Theme::new(theme, dark).focus();
+    let dot = Theme::new(theme, dark).dot();
     div()
         .flex()
         .flex_none()
@@ -540,6 +557,38 @@ fn space_mark(icon: Option<String>, theme: u8, dark: bool, lit: bool) -> gpui::D
                     .when(lit, |dot| dot.border_1().border_color(gpui::white())),
             ),
         })
+}
+
+/// The least of " · <space>" a recently closed tab of another space keeps
+/// while its title is cut: a few letters of the name.
+const SPACE_MARKER_LEAST: f32 = 34.;
+
+/// `text` on one line, then, for a row of another space, " · <space>" in
+/// `marker`'s colour, in `room` points at `size`: the space's name loses
+/// its end first, down to `least` points, and only then the text its end.
+fn with_space(
+    text: SharedString,
+    space: Option<SharedString>,
+    room: f32,
+    size: f32,
+    least: f32,
+    marker: Hsla,
+    cx: &App,
+) -> Div {
+    let line = div().flex().items_center().min_w_0().overflow_hidden();
+    let Some(space) = space else {
+        return line.child(truncated(text).min_w_0());
+    };
+    let space = format!(" · {space}");
+    let width = |text: &str| advance_width(text, &font(UI_FONT), size, cx).ceil();
+    let text_room = width(&text).min((room - width(&space).min(least)).max(0.));
+    line.child(truncated(text).flex_none().w(px(text_room)))
+        .child(
+            truncated(space)
+                .flex_none()
+                .w(px((room - text_room).max(0.)))
+                .text_color(marker),
+        )
 }
 
 /// Counts the lines of each question in a menu `width` wide, so the whole
@@ -797,18 +846,15 @@ impl BrowserApp {
                             .space_id
                             .and_then(|id| self.state.space(id))
                             .filter(|_| several);
-                        // Another space's: its name first, where a narrow
-                        // row still shows it.
-                        let mut status = download.status();
-                        if let Some(space) =
-                            space.filter(|space| space.id != self.state.selected_space_id)
-                        {
-                            status = format!("{} · {status}", space.name);
-                        }
+                        // Another space's says which, after how it went.
+                        let elsewhere = space
+                            .filter(|space| space.id != self.state.selected_space_id)
+                            .map(|space| (space.name.clone().into(), space.theme()));
                         Entry::Download {
                             id: download.id,
                             name: download.name.clone(),
-                            status,
+                            status: download.status(),
+                            elsewhere,
                             state: download.state,
                             missing: download.missing,
                             can_retry: download.can_retry()
@@ -838,6 +884,11 @@ impl BrowserApp {
                         .map(|(index, closed)| Entry::Closed {
                             index,
                             title: closed.tab.shown_title().to_owned().into(),
+                            // Choosing it switches to its space.
+                            elsewhere: (several && closed.space_id != self.state.selected_space_id)
+                                .then(|| self.state.space(closed.space_id))
+                                .flatten()
+                                .map(|space| space.name.clone().into()),
                         }),
                 );
                 if closed.is_empty() {
@@ -994,6 +1045,8 @@ impl BrowserApp {
             sidebar,
             f32::from(viewport.height),
         );
+        menu.drawn
+            .set(Some(Bounds::new(origin, gpui::size(px(width), px(height)))));
         let highlight = menu.highlight.or_else(|| default_highlight(&entries));
         let list = div()
             .id("menu-list")
@@ -1106,12 +1159,28 @@ impl BrowserApp {
             Entry::Closed {
                 index: closed,
                 title,
+                elsewhere,
             } => {
                 let tab = &self.state.closed_tabs()[closed].tab;
+                let sidebar = self.sidebar_width().unwrap_or_default();
+                // Inside the library's padding and the row's, beside the
+                // icon and its gap.
+                let room = LIBRARY_WIDTH.min(sidebar - 2. * EDGE) - 2. * PADDING - 18. - 22.;
                 let row = item(1000 + closed, true)
                     .gap(px(8.))
                     .child(self.favicon(tab, 14., theme))
-                    .child(truncated(title).flex_1().min_w_0());
+                    .child(
+                        with_space(
+                            title,
+                            elsewhere,
+                            room,
+                            13.,
+                            SPACE_MARKER_LEAST,
+                            secondary,
+                            cx,
+                        )
+                        .flex_1(),
+                    );
                 highlights(row, target(0), cx)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.run_menu_action(Action::Reopen(closed), window, cx)
@@ -1124,6 +1193,7 @@ impl BrowserApp {
                 status,
                 state,
                 space,
+                elsewhere,
                 ..
             } => {
                 let sidebar = self.sidebar_width().unwrap_or_default();
@@ -1160,18 +1230,30 @@ impl BrowserApp {
                     )),
                     _ => None,
                 };
-                let row_lit = open && lit == Some(0);
+                // The row itself is the choice when it opens the file, and
+                // when there is nothing to press, so that ⌫ can still
+                // remove it.
+                let row_choice = open || button.is_none();
+                let row_lit = row_choice && lit == Some(0);
                 // The room for the name: the library's width (`render_menu`)
                 // less its padding and the row's: 9 + 4, the icon and the
                 // button (16 and 24), and the gaps beside the name.
                 let room = LIBRARY_WIDTH.min(sidebar - 2. * EDGE) - 2. * PADDING - 69.;
                 let name_cut = advance_width(&name, &font(UI_FONT), 13., cx) > room;
+                // The whole status line, where the row cuts it, and always
+                // for another space's download.
+                let line = match &elsewhere {
+                    Some((space, _)) => format!("{status} · {space}"),
+                    None => status.clone(),
+                };
+                let status_cut =
+                    elsewhere.is_some() || advance_width(&line, &font(UI_FONT), 11.5, cx) > room;
                 let muted = if row_lit {
                     gpui::white().opacity(0.8)
                 } else {
                     theme.tertiary()
                 };
-                let status_color = if state == DownloadState::Failed {
+                let status_color = if state == DownloadState::Failed && !row_lit {
                     theme.error()
                 } else {
                     muted
@@ -1191,15 +1273,21 @@ impl BrowserApp {
                         theme.title()
                     })
                     .when(row_lit, |row| row.bg(focus))
-                    // The whole name, where the row cuts it in the middle.
-                    .when(name_cut, |row| {
-                        row.tooltip(Tooltip::build_wrapping(name.clone(), "", theme, sidebar))
+                    // The whole name, where the row cuts it in the middle,
+                    // and the whole status line, where it is cut.
+                    .when(name_cut || status_cut, |row| {
+                        let text = if status_cut {
+                            format!("{name} — {line}")
+                        } else {
+                            name.to_string()
+                        };
+                        row.tooltip(Tooltip::build_wrapping(text, "", theme, sidebar))
                     })
                     // GPUI hides a tooltip only as it redraws: a row that
                     // doesn't change on hover still redraws as the pointer
                     // leaves it, so its tooltip goes with it.
                     .hover(|style| style)
-                    .when(open, |row| {
+                    .when(row_choice, |row| {
                         let row_target = target(0);
                         highlights(row, row_target, cx)
                             // Back on the row from its magnifier, which
@@ -1207,11 +1295,33 @@ impl BrowserApp {
                             .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
                                 this.hover_menu(row_target, true, cx)
                             }))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.run_menu_action(Action::OpenDownload(id), window, cx)
-                            }))
                     })
-                    .child(icon(Icon::File, 16., muted))
+                    .when(open, |row| {
+                        row.on_click(cx.listener(move |this, _, window, cx| {
+                            this.run_menu_action(Action::OpenDownload(id), window, cx)
+                        }))
+                    })
+                    // Another space's download wears that space's dot, as
+                    // its switcher button does: the status line may have no
+                    // room left to name the space.
+                    .child(
+                        div()
+                            .relative()
+                            .flex_none()
+                            .size(px(16.))
+                            .child(icon(Icon::File, 16., muted))
+                            .children(elsewhere.as_ref().map(|&(_, space_theme)| {
+                                div()
+                                    .absolute()
+                                    .right(px(-2.))
+                                    .bottom(px(-1.))
+                                    .size(px(8.))
+                                    .rounded_full()
+                                    .bg(Theme::new(space_theme, theme.dark).dot())
+                                    .border_1()
+                                    .border_color(if row_lit { focus } else { theme.surface() })
+                            })),
+                    )
                     .child(
                         div()
                             .flex()
@@ -1220,10 +1330,20 @@ impl BrowserApp {
                             .min_w_0()
                             .child(elided(name, Cut::Middle, 17.).text_size(px(13.)))
                             .child(
-                                truncated(status)
-                                    .text_size(px(11.5))
-                                    .line_height(px(15.))
-                                    .text_color(status_color),
+                                // How it went keeps its room; the space's
+                                // name takes what is left.
+                                with_space(
+                                    status.into(),
+                                    elsewhere.map(|(space, _)| space),
+                                    room,
+                                    11.5,
+                                    0.,
+                                    muted,
+                                    cx,
+                                )
+                                .text_size(px(11.5))
+                                .line_height(px(15.))
+                                .text_color(status_color),
                             ),
                     )
                     .children(button.map(|(button_id, glyph, label, action, part)| {
@@ -1487,7 +1607,7 @@ impl BrowserApp {
             Entry::Icons(space, current, space_theme) => {
                 // No icon shows the space's own dot, whichever space's
                 // colours the menu has.
-                let dot = Theme::new(space_theme, theme.dark).focus();
+                let dot = Theme::new(space_theme, theme.dark).dot();
                 let choices: Vec<_> = std::iter::once(None)
                     .chain(space_icons().iter().copied().map(Some))
                     .collect();
@@ -1655,7 +1775,7 @@ impl BrowserApp {
                     }))
                     .when_some(drop_to, |row, space_id| {
                         // Tinted in its colour, as the space's button is.
-                        let tint = Theme::new(space_theme, theme.dark).focus().opacity(0.35);
+                        let tint = Theme::new(space_theme, theme.dark).dot().opacity(0.35);
                         row.drag_over::<DraggedTab>(move |style, _, _, _| style.bg(tint))
                             .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
                                 this.drop_tab_on_space(dragged.0, space_id, window, cx)
@@ -1947,12 +2067,19 @@ impl BrowserApp {
     /// ⌥⌘L, History > Show Downloads and the command bar: the library, opened
     /// from the keyboard with its first choice highlighted, so Return opens
     /// the newest download. A hidden sidebar peeks while it is open; again
-    /// closes it.
+    /// closes it. An open command bar closes, as for ⌘Y, so the library
+    /// gets the keys.
     pub(crate) fn show_downloads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self
-            .menu
-            .as_ref()
-            .is_some_and(|menu| menu.kind == MenuKind::Library)
+        let bar_open = self.command_bar.is_some();
+        if bar_open {
+            self.close_command_bar(cx);
+            window.activate_window();
+        }
+        if !bar_open
+            && self
+                .menu
+                .as_ref()
+                .is_some_and(|menu| menu.kind == MenuKind::Library)
         {
             return self.close_menu(window, cx);
         }
@@ -1992,8 +2119,9 @@ impl BrowserApp {
     /// for House Hunt), looked for from the highlighted item on. A letter
     /// typed again and again steps through the items starting with it.
     /// Nothing matching leaves the highlight where it is, and a space only
-    /// continues a name: Return chooses.
-    fn type_in_menu(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    /// continues a name: Return chooses. Outside a name, Space presses the
+    /// question's button that wears the focus ring, as in AppKit's alerts.
+    fn type_in_menu(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let Some(menu) = &mut self.menu else {
             return;
         };
@@ -2018,6 +2146,14 @@ impl BrowserApp {
         }
         // No name starts with a space.
         if menu.typed.is_empty() && text.trim().is_empty() {
+            let (kind, highlight) = (menu.kind, menu.highlight);
+            let entries = self.menu_entries(kind);
+            let on_button = highlight
+                .or_else(|| default_highlight(&entries))
+                .is_some_and(|at| matches!(entries.get(at.entry), Some(Entry::Confirm { .. })));
+            if on_button {
+                self.choose_in_menu(window, cx);
+            }
             return;
         }
         menu.typed.push_str(&text.to_lowercase());
@@ -2056,11 +2192,31 @@ impl BrowserApp {
     /// ⇧F10 or the context-menu key, as a right-click from the keyboard:
     /// the selected tab's menu, below its row, or the space's menu when no
     /// tab is selected. Its first item is highlighted, as in a menu opened
-    /// from the keyboard on macOS. Menus show only in the sidebar.
-    fn show_menu_from_keyboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.menu.is_some() || self.sidebar_width().is_none() {
+    /// from the keyboard on macOS. Menus show only in the sidebar: a hidden
+    /// one peeks, as for the library, and the menu opens once its rows are
+    /// laid out, a frame later. The menu keeps the peek while it is open.
+    pub(crate) fn show_menu_from_keyboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.menu.is_some() || self.fullscreen {
             return;
         }
+        if self.sidebar_width().is_some() {
+            return self.open_menu_from_keyboard(window, cx);
+        }
+        self.sidebar_peek = true;
+        self.sync_traffic_lights();
+        cx.notify();
+        // Callbacks for the next frame run before it is drawn; the one
+        // after it finds the peeking sidebar's rows in place.
+        cx.on_next_frame(window, |_, window, cx| {
+            cx.on_next_frame(window, |this, window, cx| {
+                if this.menu.is_none() && this.sidebar_width().is_some() {
+                    this.open_menu_from_keyboard(window, cx);
+                }
+            });
+        });
+    }
+
+    fn open_menu_from_keyboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let inset = point(px(4. * EDGE), px(0.));
         match self.active_tab_id() {
             Some(tab_id) => {
@@ -2125,10 +2281,14 @@ pub(super) fn handle_menu_keys<E: InteractiveElement>(root: E, cx: &mut Context<
         cx.listener(|this, _: &ChooseDestructive, window, cx| this.choose_destructive(window, cx)),
     )
     .on_action(
-        cx.listener(|this, _: &ShowTabMenu, window, cx| this.show_menu_from_keyboard(window, cx)),
+        cx.listener(|this, _: &ShowTabMenu, window, cx| {
+            this.shortcut(Shortcut::TabMenu, window, cx)
+        }),
     )
     .on_action(cx.listener(|this, _: &RemoveFromList, window, cx| this.remove_in_menu(window, cx)))
-    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| this.type_in_menu(event, cx)))
+    .on_key_down(
+        cx.listener(|this, event: &KeyDownEvent, window, cx| this.type_in_menu(event, window, cx)),
+    )
 }
 
 #[cfg(test)]

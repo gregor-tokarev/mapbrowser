@@ -77,6 +77,12 @@ const PALETTES: [[Tones; 2]; THEME_COUNT as usize] = [
     ],
 ];
 
+/// Periwinkle's space dot, `[light, dark]`. Its focus tone is too close to
+/// lavender's to tell the two spaces' dots apart at 7 pt, so its dot leans
+/// to azure; its window and highlights keep their own colours.
+const PERIWINKLE: u8 = 1;
+const PERIWINKLE_DOT: [u32; 2] = [0x1868c8, 0x3d8be8];
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Theme {
     pub dark: bool,
@@ -85,11 +91,17 @@ pub struct Theme {
     title: Rgba,
     focus: Rgba,
     surface: Rgba,
+    dot: Rgba,
 }
 
 impl Theme {
     pub fn new(index: u8, dark: bool) -> Self {
         let tones = &PALETTES[usize::from(index % THEME_COUNT)][usize::from(dark)];
+        let dot = if index % THEME_COUNT == PERIWINKLE {
+            PERIWINKLE_DOT[usize::from(dark)]
+        } else {
+            tones.focus
+        };
         Self {
             dark,
             from: rgb(tones.from),
@@ -97,6 +109,7 @@ impl Theme {
             title: rgb(tones.title),
             focus: rgb(tones.focus),
             surface: rgb(tones.surface),
+            dot: rgb(dot),
         }
     }
 
@@ -112,6 +125,7 @@ impl Theme {
             title: mix(self.title, other.title, t),
             focus: mix(self.focus, other.focus, t),
             surface: mix(self.surface, other.surface, t),
+            dot: mix(self.dot, other.dot, t),
         }
     }
 
@@ -224,6 +238,13 @@ impl Theme {
         self.focus.into()
     }
 
+    /// The space's dot in the switcher and in menus, and the tint of a
+    /// tab dragged over its button: the focus tone, but for periwinkle
+    /// (`PERIWINKLE_DOT`), so every space's dot differs from the others'.
+    pub fn dot(&self) -> Hsla {
+        self.dot.into()
+    }
+
     /// Fills under white text: buttons that delete something. Too dark for
     /// red text or glyphs on dark surfaces; those use `error`.
     pub fn danger(&self) -> Hsla {
@@ -266,7 +287,7 @@ impl Theme {
         linear_gradient(
             135.,
             linear_color_stop(self.from, 0.),
-            linear_color_stop(self.focus, 1.),
+            linear_color_stop(self.dot, 1.),
         )
     }
 }
