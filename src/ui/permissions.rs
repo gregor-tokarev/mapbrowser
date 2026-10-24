@@ -305,7 +305,7 @@ impl BrowserApp {
         if self.permission_shown().is_some_and(|shown| shown.id == id) {
             // Esc reaches the card through the shell's key context. Only
             // GPUI's focus moves: a page keeps its keyboard focus.
-            if self.renaming.is_none() && self.menu.is_none() {
+            if !self.naming() && self.menu.is_none() {
                 window.focus(&self.focus_handle);
             }
             cx.notify();

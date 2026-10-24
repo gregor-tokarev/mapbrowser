@@ -27,10 +27,15 @@ use gpui::{
     AnyElement, AnyView, App, AppContext, Bounds, BoxShadow, ClickEvent, Context, Div,
     DragMoveEvent, EmptyView, Font, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, Pixels, Point, Render, ScrollHandle, ScrollWheelEvent,
-    SharedString, Size, Stateful, StatefulInteractiveElement, Styled, Window, div, font, img,
-    point, prelude::FluentBuilder, px, size,
+    SharedString, Size, Stateful, StatefulInteractiveElement, Styled, WeakEntity, Window, div,
+    font, img, point, prelude::FluentBuilder, px, size,
 };
-use std::{cell::Cell, collections::HashMap, rc::Rc, time::Instant};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    rc::Rc,
+    time::Instant,
+};
 
 /// The navigation row's centre, level with the traffic lights.
 const TOP_ROW_CENTER: f32 = 20.;
@@ -38,6 +43,8 @@ const URL_PILL_TOP: f32 = 42.;
 /// The sliding pages start just above the URL pill.
 const PAGES_TOP: f32 = 40.;
 const BOTTOM_BAR: f32 = 48.;
+/// The library, space and "+" buttons' top in the bottom bar.
+const BAR_BUTTON_TOP: f32 = 10.;
 const ROW_HEIGHT: f32 = 36.;
 pub(super) const ROW_GAP: f32 = 5.;
 const FAVORITE_HEIGHT: f32 = 47.;
@@ -60,6 +67,11 @@ const AUTOSCROLL_SLOWEST: f32 = 120.;
 const AUTOSCROLL_FASTEST: f32 = 720.;
 /// Room between the tab list and a card over its bottom.
 const NOTICE_GAP: f32 = 8.;
+/// The cards and toasts over the list's bottom sit this far above the
+/// bottom bar.
+const NOTICE_LIFT: f32 = 4.;
+/// The list's room below its last row.
+const LIST_END: f32 = 8.;
 /// A row's title is this much narrower than the sidebar while its close
 /// button shows: the row's margins and padding, the favicon and the button.
 const ROW_TITLE_CHROME: f32 = 16. + 9.5 + 16. + 11.5 + 4. + 24.;
@@ -100,8 +112,24 @@ pub struct TabLists {
     revealed: HashMap<SpaceId, (TabId, Pin)>,
     /// A tab dragged near the list's top or bottom edge scrolls it.
     drag: Option<DragScroll>,
-    /// The height of the cards over the list's bottom, measured as drawn.
+    /// What shows over the list's bottom, measured as drawn: the lasting
+    /// cards (a permission, a failed save, a load error), and all of it,
+    /// with a toast above them.
+    cards: Rc<Cell<f32>>,
     notice: Rc<Cell<f32>>,
+    /// How far the toast reached over the list in the last frame.
+    cover: f32,
+    /// The active space's list as last laid out: the tab of each part.
+    laid_out: Rc<RefCell<Vec<Option<TabId>>>>,
+    /// A reveal waiting a frame for its row to be laid out.
+    waiting: bool,
+    /// The first space the switcher shows when they don't all fit.
+    switcher_start: Cell<usize>,
+    /// Whether the list of spaces opened for a tab dragged over "…".
+    drag_menu: bool,
+    /// Where a dragged tab would land, as the sidebar draws it; its
+    /// preview draws it too (`TabPreview`).
+    drop_line: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 #[derive(Clone, Default)]
@@ -129,6 +157,54 @@ impl TabLists {
         }
         self.lists.entry(space_id).or_default().clone()
     }
+
+    /// The space's list brings its selected tab into view again on the
+    /// next frame, even if it already did.
+    pub(crate) fn forget_reveal(&mut self, space_id: SpaceId) {
+        self.revealed.remove(&space_id);
+    }
+}
+
+/// The tab list's parts in order, and the tab each one is: the space
+/// title, the pinned rows, the divider, "+ New Tab" and the Today rows.
+fn list_parts(space: &Space) -> Vec<Option<TabId>> {
+    std::iter::once(None)
+        .chain(space.section(Pin::Pinned).map(|tab| Some(tab.id)))
+        .chain([None, None])
+        .chain(space.section(Pin::Today).map(|tab| Some(tab.id)))
+        .collect()
+}
+
+/// Scrolls `list` so its `item`, as last laid out, shows whole above its
+/// last `cover` points, which a toast covers. A row above the view takes
+/// the list back to its top if it shows there, so the space's title,
+/// Pinned and "+ New Tab" stay in sight; else the list moves as little as
+/// it can. Unless `reveal`, only a row on screen moves, out from under
+/// the toast.
+fn reveal_row(list: &ScrollHandle, item: usize, cover: f32, reveal: bool) {
+    let Some(row) = list.bounds_for_item(item) else {
+        return list.scroll_to_item(item);
+    };
+    let (view, offset) = (list.bounds(), list.offset());
+    // The row's place from the list's top, the part scrolled past and the
+    // part the toast leaves.
+    let top = f32::from(row.top() - view.top());
+    let bottom = top + f32::from(row.size.height);
+    let scrolled = -f32::from(offset.y);
+    let height = f32::from(view.size.height);
+    let room = height - cover;
+    let on_screen = bottom > scrolled && top < scrolled + height;
+    let scrolled = if top < scrolled {
+        if !reveal {
+            return;
+        }
+        if bottom <= room { 0. } else { top }
+    } else if bottom > scrolled + room && (reveal || on_screen) {
+        (bottom - room).min(top)
+    } else {
+        return;
+    };
+    list.set_offset(point(offset.x, px(-scrolled)));
 }
 
 /// How fast a tab list scrolls with a tab dragged at `y`: up near its top
@@ -370,8 +446,16 @@ impl BrowserApp {
             _ => vec![self.render_page(active, 0., width, true, theme, cx)],
         };
         // Only while a tab is dragged over the list: where it would land.
-        let indicator = self.tab_drag.and_then(|drag| drag.target).map(|target| {
-            let bounds = self.drop_zones.borrow().indicator(target);
+        // The dragged tab's preview draws it too, above itself (`TabPreview`).
+        let pages_bottom = window.viewport_size().height - px(BOTTOM_BAR);
+        let line = self
+            .tab_drag
+            .and_then(|drag| drag.target)
+            .map(|target| self.drop_zones.borrow().indicator(target));
+        self.tab_lists
+            .drop_line
+            .set(line.filter(|line| line.top() >= px(PAGES_TOP) && line.bottom() <= pages_bottom));
+        let indicator = line.map(|bounds| {
             div()
                 .absolute()
                 .left(bounds.left())
@@ -431,7 +515,7 @@ impl BrowserApp {
             .child(self.render_top_row(width, theme, cx))
             .children(
                 self.render_notice(width, theme, window, cx)
-                    .map(|notice| self.measure_notice(notice, cx)),
+                    .map(|notice| self.measure_notice(notice, self.toast.is_some(), cx)),
             )
             .child(self.render_bottom_bar(width, theme, cx))
             .child(render_edge(width, cx))
@@ -440,9 +524,11 @@ impl BrowserApp {
     /// Follows a tab dragged over the sidebar. Between the navigation row
     /// and the bottom bar it finds the tab's drop position. Near the tab
     /// list's top or bottom edge the list scrolls (`scroll_dragged_tab`).
+    /// While "…" lists the spaces for it, the list under them stays put.
     fn drag_tab_over(&mut self, event: &DragMoveEvent<DraggedTab>, cx: &mut Context<Self>) {
         let (pointer, sidebar) = (event.event.position, event.bounds);
-        let over_list = sidebar.contains(&pointer)
+        let over_list = self.menu.is_none()
+            && sidebar.contains(&pointer)
             && pointer.y >= sidebar.top() + px(PAGES_TOP)
             && pointer.y < sidebar.bottom() - px(BOTTOM_BAR);
         let drag = TabDrag {
@@ -461,7 +547,7 @@ impl BrowserApp {
             && pointer.x >= sidebar.left() + px(SWITCHER_INSET)
             && pointer.x < sidebar.right() - px(SWITCHER_INSET);
         let speed = autoscroll_speed(pointer.y, list)
-            .filter(|_| sidebar.contains(&pointer) && !over_switcher);
+            .filter(|_| self.menu.is_none() && sidebar.contains(&pointer) && !over_switcher);
         let scrolling = self.tab_lists.drag.is_some();
         self.tab_lists.drag = speed.map(|speed| DragScroll {
             speed,
@@ -477,10 +563,11 @@ impl BrowserApp {
         }
     }
 
-    /// Before each frame: drops a menu whose tab or space is gone, ends a
-    /// peek the pointer has left, brings the selected tab (or the ⌃Tab
-    /// walk's target) into view, and scrolls a list a tab is held at the
-    /// edge of.
+    /// Before each frame: drops a menu whose tab or space is gone, or whose
+    /// sidebar went away, closes the spaces a dragged tab was offered once
+    /// the drag ends, ends a peek the pointer has left, brings the selected
+    /// tab (or the ⌃Tab walk's target) into view, and scrolls a list a tab
+    /// is held at the edge of.
     pub(super) fn prepare_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let stale_menu = self.menu.as_ref().is_some_and(|menu| match menu.kind {
             MenuKind::Tab(id)
@@ -490,11 +577,23 @@ impl BrowserApp {
             MenuKind::Space(id) | MenuKind::DeleteSpace(id) => self.state.space(id).is_none(),
             _ => false,
         });
-        if stale_menu {
+        // Every menu belongs to the sidebar, and would be left floating
+        // over the card (and under the page) without it.
+        if stale_menu || self.sidebar_width().is_none() {
             self.menu = None;
         }
+        if self.tab_lists.drag_menu && !cx.has_active_drag() {
+            self.tab_lists.drag_menu = false;
+            if self
+                .menu
+                .as_ref()
+                .is_some_and(|menu| menu.kind == MenuKind::Spaces)
+            {
+                cx.defer_in(window, |this, window, cx| this.close_menu(window, cx));
+            }
+        }
         self.update_peek(window, cx);
-        self.reveal_selection();
+        self.reveal_selection(window);
         self.scroll_dragged_tab(window);
     }
 
@@ -527,9 +626,17 @@ impl BrowserApp {
     }
 
     /// Scrolls the active space's list (or favorites) to the selected tab,
-    /// or to the tab a ⌃Tab walk has reached, when that changes. Scrolling
-    /// by hand leaves it be, and each space keeps where it was.
-    fn reveal_selection(&mut self) {
+    /// or to the tab a ⌃Tab walk has reached, when that changes, clear of
+    /// a toast over the list's bottom; a toast that comes up over that row
+    /// moves it up too. Scrolling by hand leaves it be, and each space
+    /// keeps where it was. A hidden list does this once it shows.
+    fn reveal_selection(&mut self, window: &mut Window) {
+        if self.sidebar_width().is_none() {
+            return;
+        }
+        let (cover, before) = (self.toast_cover(), self.tab_lists.cover);
+        let covered = cover > before;
+        self.tab_lists.cover = cover;
         let space = self.state.active_space();
         let lists = self.tab_lists.list(space.id, &self.state.spaces);
         let target = self
@@ -541,7 +648,8 @@ impl BrowserApp {
             return;
         };
         let shown = (tab.id, tab.pin);
-        if self.tab_lists.revealed.insert(space.id, shown) == Some(shown) {
+        let reveal = self.tab_lists.revealed.get(&space.id) != Some(&shown);
+        if !reveal && !covered {
             return;
         }
         let index = space
@@ -550,16 +658,33 @@ impl BrowserApp {
             .unwrap_or(0);
         // The list holds the space title, the pinned rows, the divider,
         // "+ New Tab" and the Today rows.
-        match tab.pin {
+        let item = match tab.pin {
             Pin::Favorite => {
-                let count = space.section(Pin::Favorite).count();
-                reveal_favorite(&lists.favorites, index, count);
+                if reveal {
+                    let count = space.section(Pin::Favorite).count();
+                    reveal_favorite(&lists.favorites, index, count);
+                }
+                self.tab_lists.revealed.insert(space.id, shown);
+                return;
             }
-            Pin::Pinned => lists.tabs.scroll_to_item(1 + index),
-            Pin::Today => {
-                let pinned = space.section(Pin::Pinned).count();
-                lists.tabs.scroll_to_item(pinned + 3 + index);
-            }
+            Pin::Pinned => 1 + index,
+            Pin::Today => space.section(Pin::Pinned).count() + 3 + index,
+        };
+        // Rows just opened, closed or moved have no place yet: the list is
+        // laid out with them in the next frame, and the row found then.
+        let laid_out = *self.tab_lists.laid_out.borrow() == list_parts(space);
+        if !laid_out && !self.tab_lists.waiting {
+            self.tab_lists.waiting = true;
+            self.tab_lists.cover = before;
+            window.request_animation_frame();
+            return;
+        }
+        self.tab_lists.waiting = false;
+        self.tab_lists.revealed.insert(space.id, shown);
+        if laid_out {
+            reveal_row(&lists.tabs, item, cover, reveal);
+        } else {
+            lists.tabs.scroll_to_item(item);
         }
     }
 
@@ -621,22 +746,33 @@ impl BrowserApp {
         )
     }
 
-    /// Notes the notice's height as drawn, which the tab list keeps clear
-    /// of while a card stays (`notice_inset`). A new height redraws once.
-    fn measure_notice(&self, notice: Div, cx: &mut Context<Self>) -> Div {
-        let (height, app) = (self.tab_lists.notice.clone(), cx.weak_entity());
-        notice.on_children_prepainted(move |cards, _, cx| {
-            let top = cards
-                .iter()
-                .map(|card| f32::from(card.top()))
-                .reduce(f32::min);
-            let bottom = cards
-                .iter()
-                .map(|card| f32::from(card.bottom()))
-                .reduce(f32::max);
-            let measured = top.zip(bottom).map_or(0., |(top, bottom)| bottom - top);
-            if (height.get() - measured).abs() >= 0.5 {
-                height.set(measured);
+    /// Notes the notice's height as drawn: the lasting cards below its
+    /// toast (`toast_first`), which the tab list keeps clear of while they
+    /// stay (`notice_inset`), and all of it, which a toast lifts over the
+    /// list (`toast_cover`). A new height redraws once.
+    fn measure_notice(&self, notice: Div, toast_first: bool, cx: &mut Context<Self>) -> Div {
+        let (cards, all, app) = (
+            self.tab_lists.cards.clone(),
+            self.tab_lists.notice.clone(),
+            cx.weak_entity(),
+        );
+        notice.on_children_prepainted(move |parts, _, cx| {
+            let height = |parts: &[Bounds<Pixels>]| {
+                let top = parts
+                    .iter()
+                    .map(|part| f32::from(part.top()))
+                    .reduce(f32::min);
+                let bottom = parts
+                    .iter()
+                    .map(|part| f32::from(part.bottom()))
+                    .reduce(f32::max);
+                top.zip(bottom).map_or(0., |(top, bottom)| bottom - top)
+            };
+            let lasting = height(parts.get(usize::from(toast_first)..).unwrap_or_default());
+            let measured = height(&parts);
+            if (cards.get() - lasting).abs() >= 0.5 || (all.get() - measured).abs() >= 0.5 {
+                cards.set(lasting);
+                all.set(measured);
                 let app = app.clone();
                 // Drawing can't ask for another frame; once it ends, this does.
                 cx.defer(move |cx| {
@@ -647,16 +783,29 @@ impl BrowserApp {
     }
 
     /// How far the tab list ends above the sidebar's bottom bar: clear of a
-    /// permission card or a load error, which stay until answered; toasts
-    /// go by themselves and may cover it.
+    /// permission card, a failed save or a load error, which stay until
+    /// answered or fixed. Toasts go by themselves, above them, and may
+    /// cover the list for a moment (`toast_cover`).
     fn notice_inset(&self) -> f32 {
-        let card =
-            self.permission_shown().is_some() || (self.error.is_some() && self.page_covers_card());
+        let card = self.permission_shown().is_some()
+            || self.save_failure.is_some()
+            || (self.error.is_some() && self.page_covers_card());
         if card {
-            self.tab_lists.notice.get() + NOTICE_GAP
+            self.tab_lists.cards.get() + NOTICE_GAP
         } else {
             0.
         }
+    }
+
+    /// How far a toast reaches up over the end of the tab list, with a
+    /// little room: the list can scroll that much further while it shows,
+    /// and keeps the selected row above it.
+    fn toast_cover(&self) -> f32 {
+        if self.toast.is_none() {
+            return 0.;
+        }
+        let over = self.tab_lists.notice.get() + NOTICE_LIFT - self.notice_inset();
+        over.max(0.) + NOTICE_LIFT
     }
 
     fn render_top_row(&self, width: f32, theme: &Theme, cx: &mut Context<Self>) -> Div {
@@ -802,17 +951,19 @@ impl BrowserApp {
             .get(&space.id)
             .cloned()
             .unwrap_or_default();
-        // The list's parts in order, and the tab each one is.
-        let parts_tabs: Vec<Option<TabId>> = std::iter::once(None)
-            .chain(pinned.iter().map(|tab| Some(tab.id)))
-            .chain([None, None])
-            .chain(today.iter().map(|tab| Some(tab.id)))
-            .collect();
+        let parts_tabs = list_parts(space);
+        let laid_out = self.tab_lists.laid_out.clone();
         // A row that moves under a still pointer (after a close, say) hears
         // of it only once the pointer moves: the list checks once laid out.
         let follow_pointer = (interactive && self.menu.is_none() && self.tab_drag.is_none())
             .then(|| (cx.weak_entity(), self.hovered_tab));
         let list_handle = lists.tabs.clone();
+        // While a toast shows, the list can scroll its last rows up past it.
+        let list_end = if interactive {
+            self.toast_cover().max(LIST_END)
+        } else {
+            LIST_END
+        };
         div()
             .absolute()
             .top_0()
@@ -871,7 +1022,7 @@ impl BrowserApp {
                     // the list scrolls rather than squeezing them.
                     .flex()
                     .flex_col()
-                    .pb(px(8.))
+                    .pb(px(list_end))
                     .mb(px(if interactive { self.notice_inset() } else { 0. }))
                     .when_some(zones, |list, zones| {
                         list.on_children_prepainted(move |_, window, cx| {
@@ -883,6 +1034,7 @@ impl BrowserApp {
                                 .map(|part| Bounds::new(part.origin + scrolled, part.size))
                                 .collect();
                             zones.borrow_mut().measure_list(&parts, pinned_count);
+                            laid_out.borrow_mut().clone_from(&parts_tabs);
                             let Some((app, hovered)) = &follow_pointer else {
                                 return;
                             };
@@ -1193,6 +1345,22 @@ impl BrowserApp {
         // Below the pill, level with its left edge.
         let anchor = point(px(8.), px(URL_PILL_TOP + 40.));
         self.open_menu(kind, anchor, window, cx);
+    }
+
+    /// A tab dropped on a space in the list "…" showed for its drag moves
+    /// there, as it does dropped on the space's button.
+    pub(crate) fn drop_tab_on_space(
+        &mut self,
+        tab_id: TabId,
+        space_id: SpaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tab_drag = None;
+        self.tab_over_spaces.set(false);
+        self.tab_lists.drag_menu = false;
+        self.close_menu(window, cx);
+        self.leave_tab(tab_id, Leaving::Move(space_id), cx);
     }
 
     fn render_favorites(
@@ -1562,6 +1730,7 @@ impl BrowserApp {
             tile,
             cursor: point(px(0.), px(0.)),
             over_spaces: self.tab_over_spaces.clone(),
+            line: self.tab_lists.drop_line.clone(),
         };
         element.on_drag(DraggedTab(tab.id), move |_, cursor, _, cx| {
             preview.over_spaces.set(false);
@@ -1640,11 +1809,10 @@ impl BrowserApp {
                     .text_size(px(14.))
                     .text_color(theme.title())
             })
-            .children(badges.map(|badges| {
-                badges
-                    .ml(px(6.))
-                    .when(title_room, |badges| badges.mr(px(24.)))
-            }))
+            // The close button's place stays free beside the badges, so
+            // the speaker never slides away from a pointer coming to mute
+            // the tab, and × never takes its place.
+            .children(badges.map(|badges| badges.ml(px(6.)).mr(px(24.))))
             .when(interactive && self.is_switch_target(id), |row| {
                 row.child(switch_outline(theme))
             });
@@ -1656,12 +1824,11 @@ impl BrowserApp {
         let tooltip = self.menu.is_none().then(|| {
             let (app, theme) = (cx.weak_entity(), *theme);
             move |window: &mut Window, cx: &mut App| {
-                let tab = app
-                    .upgrade()
-                    .and_then(|app| app.read(cx).state.tab(id).cloned());
-                TabTooltip::build(tab, &theme, width, window, cx)
+                TabTooltip::build(app.clone(), id, &theme, width, window, cx)
             }
         });
+        // ⌘W closes the selected tab: only its row names the key.
+        let close_shortcut = if selected { "⌘W" } else { "" };
         let row_size = size(px(width - 16.), px(ROW_HEIGHT));
         let pin = tab.pin;
         self.draggable(press_only(row), tab, row_size, false, theme)
@@ -1720,7 +1887,7 @@ impl BrowserApp {
                             .hover(move |style| style.bg(button_hover))
                             .child(icon(glyph, 18., theme.icon())),
                     )
-                    .maybe_tooltip(self.tooltip(close_label, "⌘W", theme, width))
+                    .maybe_tooltip(self.tooltip(close_label, close_shortcut, theme, width))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         this.end_rename(window, cx);
@@ -1730,8 +1897,10 @@ impl BrowserApp {
             })
     }
 
-    /// A permission request, the toast and, while a page view covers the
-    /// card, its load error.
+    /// The toast, then what stays until answered or fixed: a failed save,
+    /// a permission request and, while a page view covers the card, its
+    /// load error. Toasts come and go above those, which stay put under a
+    /// pointer on their way to a button.
     fn render_notice(
         &self,
         width: f32,
@@ -1761,12 +1930,12 @@ impl BrowserApp {
                 .absolute()
                 .left_0()
                 .right_0()
-                .bottom(px(BOTTOM_BAR + 4.))
+                .bottom(px(BOTTOM_BAR + NOTICE_LIFT))
                 .flex()
                 .flex_col()
                 .gap(px(6.))
-                .children(permission)
                 .children(toasts)
+                .children(permission)
                 .when_some(error, |notice, error| {
                     notice.child(
                         card(div())
@@ -1815,9 +1984,20 @@ impl BrowserApp {
             .iter()
             .position(|space| space.id == self.state.selected_space_id)
             .unwrap_or(0);
-        // Too many to show: the run of spaces that ends at the active one,
-        // or starts at the first.
-        let start = active_index.saturating_sub(layout.shown - 1);
+        // Too many to show: the run of spaces stays where it was, so each
+        // button keeps its space, and moves only as far as it must to show
+        // the active one.
+        let mut start = self
+            .tab_lists
+            .switcher_start
+            .get()
+            .min(spaces.len() - layout.shown);
+        if active_index < start {
+            start = active_index;
+        } else if active_index >= start + layout.shown {
+            start = active_index + 1 - layout.shown;
+        }
+        self.tab_lists.switcher_start.set(start);
         let (hover, selected) = (theme.hover(), theme.selected());
         let buttons = spaces
             .iter()
@@ -1879,7 +2059,7 @@ impl BrowserApp {
                     MouseButton::Right,
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                         // Above the button, like the library's and "+"'s.
-                        let anchor = event.position - point(px(14.), px(18.));
+                        let anchor = bottom_bar_anchor(event.position, window);
                         this.open_menu(MenuKind::Space(id), anchor, window, cx)
                     }),
                 )
@@ -1924,25 +2104,41 @@ impl BrowserApp {
             )
             .maybe_tooltip(self.tooltip("All Spaces", "", theme, width))
             .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
-                let anchor = event.position() - point(px(14.), px(18.));
+                let anchor = bottom_bar_anchor(event.position(), window);
                 this.open_menu(MenuKind::Spaces, anchor, window, cx)
             }))
+            // A tab dragged here gets the list of every space, to drop it
+            // on one the switcher has no room for.
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<DraggedTab>, window, cx| {
+                    let pointer = event.event.position;
+                    if this.menu.is_none() && event.bounds.contains(&pointer) {
+                        this.tab_lists.drag_menu = true;
+                        this.tab_over_spaces.set(true);
+                        let anchor = bottom_bar_anchor(pointer, window);
+                        this.open_menu(MenuKind::Spaces, anchor, window, cx);
+                    }
+                },
+            ))
         });
         Some(
             div()
                 .absolute()
                 .left(px(SWITCHER_INSET))
                 .right(px(SWITCHER_INSET))
-                .top(px(10.))
+                .top(px(BAR_BUTTON_TOP))
                 .h(px(SPACE_BUTTON))
                 .flex()
                 .items_center()
                 .justify_center()
                 .gap(px(layout.gap))
                 .overflow_hidden()
+                // The dragged tab shrinks over the switcher and over the
+                // spaces "…" lists for it, leaving them in sight.
                 .on_drag_move(
                     cx.listener(|this, event: &DragMoveEvent<DraggedTab>, _, cx| {
-                        let over = event.bounds.contains(&event.event.position);
+                        let over = event.bounds.contains(&event.event.position)
+                            || this.tab_lists.drag_menu;
                         if this.tab_over_spaces.replace(over) != over {
                             cx.notify();
                         }
@@ -1965,7 +2161,7 @@ impl BrowserApp {
                 tool_button("library", Icon::Archive, 18., true, theme)
                     .absolute()
                     .left(px(9.5))
-                    .top(px(10.))
+                    .top(px(BAR_BUTTON_TOP))
                     .maybe_tooltip(self.menu.is_none().then(|| {
                         Tooltip::build_wrapping(
                             "Library — Downloads and Recently Closed",
@@ -1975,7 +2171,7 @@ impl BrowserApp {
                         )
                     }))
                     .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
-                        let anchor = event.position() - point(px(14.), px(18.));
+                        let anchor = bottom_bar_anchor(event.position(), window);
                         this.open_menu(MenuKind::Library, anchor, window, cx)
                     })),
             )
@@ -1985,14 +2181,22 @@ impl BrowserApp {
                 tool_button("plus", Icon::Plus, 23., true, theme)
                     .absolute()
                     .left(px(width - 24.5 - 14.))
-                    .top(px(10.))
+                    .top(px(BAR_BUTTON_TOP))
                     .maybe_tooltip(self.tooltip("New Tab or Space", "", theme, width))
                     .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
-                        let anchor = event.position() - point(px(14.), px(18.));
+                        let anchor = bottom_bar_anchor(event.position(), window);
                         this.open_menu(MenuKind::Plus, anchor, window, cx)
                     })),
             )
     }
+}
+
+/// Where the menu of a bottom bar button pressed at `pointer` opens: level
+/// with the pointer and just above the buttons, so it never covers the one
+/// that opened it.
+fn bottom_bar_anchor(pointer: Point<Pixels>, window: &Window) -> Point<Pixels> {
+    let buttons_top = window.viewport_size().height - px(BOTTOM_BAR - BAR_BUTTON_TOP);
+    point(pointer.x - px(14.), buttons_top - px(4.))
 }
 
 /// The invisible handle on the sidebar's right edge: drag it to resize the
@@ -2019,60 +2223,91 @@ fn render_edge(width: f32, cx: &mut Context<BrowserApp>) -> impl IntoElement + u
 }
 
 /// A tab row's tooltip: the whole title, which the row cuts short, and the
-/// host, styled and placed like `Tooltip`.
+/// host, styled and placed like `Tooltip`. Rows can move under a still
+/// pointer (a tab opened above, one closed): it follows the row under it.
 struct TabTooltip {
-    title: SharedString,
-    host: SharedString,
+    app: WeakEntity<BrowserApp>,
+    /// The tab it is about, and what it shows of it: nothing for a title
+    /// that fits its row.
+    tab_id: TabId,
+    text: Option<TabTooltipText>,
     theme: Theme,
     /// The sidebar's width.
     width: f32,
     /// The pointer's x when the tooltip opened.
     pointer: f32,
+}
+
+struct TabTooltipText {
+    title: SharedString,
+    host: SharedString,
     /// The lines the title takes, and the width it wraps at.
     lines: usize,
     room: f32,
 }
 
 impl TabTooltip {
-    /// Measured when it opens, with the row's title as it is then. A title
-    /// that fits its row gets an empty tooltip.
+    /// Measured when it opens, with the row's title as it is then.
     fn build(
-        tab: Option<Tab>,
+        app: WeakEntity<BrowserApp>,
+        tab_id: TabId,
         theme: &Theme,
         width: f32,
         window: &mut Window,
         cx: &mut App,
     ) -> AnyView {
-        let Some(tab) = tab else {
-            return cx.new(|_| EmptyView).into();
-        };
+        let tab = app
+            .upgrade()
+            .and_then(|app| app.read(cx).state.tab(tab_id).cloned());
+        let text = tab.and_then(|tab| Self::measure(&tab, width, window, cx));
+        let (theme, pointer) = (*theme, f32::from(window.mouse_position().x));
+        cx.new(|_| Self {
+            app,
+            tab_id,
+            text,
+            theme,
+            width,
+            pointer,
+        })
+        .into()
+    }
+
+    /// What the tooltip shows of `tab`, unless its title fits its row.
+    fn measure(tab: &Tab, width: f32, window: &Window, cx: &App) -> Option<TabTooltipText> {
         let title = tab.shown_title().to_owned();
         if text_width(&title, font(UI_FONT), 14., window) <= width - ROW_TITLE_CHROME {
-            return cx.new(|_| EmptyView).into();
+            return None;
         }
         // At the tooltip's 12 pt, in the bubble less its padding.
         let room = TAB_TOOLTIP_MAX_WIDTH.min(width - 2. * TOOLTIP_EDGE) - 2. * TOOLTIP_PADDING;
         let lines = wrapped_lines(&title, font(UI_FONT), 12., room, cx).min(TAB_TOOLTIP_LINES);
-        let host = host_of(&tab.url).unwrap_or(tab.url);
-        let (theme, pointer) = (*theme, f32::from(window.mouse_position().x));
-        cx.new(|_| Self {
+        let host = host_of(&tab.url).unwrap_or_else(|| tab.url.clone());
+        Some(TabTooltipText {
             title: title.into(),
             host: host.into(),
-            theme,
-            width,
-            pointer,
             lines,
             room,
         })
-        .into()
     }
 }
 
 impl Render for TabTooltip {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let moved = self.app.upgrade().and_then(|app| {
+            let app = app.read(cx);
+            let hovered = app.hovered_tab.filter(|&id| id != self.tab_id)?;
+            app.state.tab(hovered).cloned()
+        });
+        if let Some(tab) = moved {
+            self.tab_id = tab.id;
+            self.text = Self::measure(&tab, self.width, window, cx);
+        }
+        let Some(text) = &self.text else {
+            return div();
+        };
         let theme = &self.theme;
         // Padding and border, the title's lines and the host's.
-        let height = 2. * 5. + 2. + 16. * self.lines as f32 + 15.;
+        let height = 2. * 5. + 2. + 16. * text.lines as f32 + 15.;
         let bubble = tooltip_bubble(theme)
             .flex_col()
             .max_w(px(TAB_TOOLTIP_MAX_WIDTH.min(self.width - 2. * TOOLTIP_EDGE)))
@@ -2080,16 +2315,16 @@ impl Render for TabTooltip {
             .child(
                 div()
                     // A title that wraps does so where it was measured.
-                    .when(self.lines > 1, |title| title.w(px(self.room)))
+                    .when(text.lines > 1, |title| title.w(px(text.room)))
                     .line_clamp(TAB_TOOLTIP_LINES)
                     .text_ellipsis()
                     .text_size(px(12.))
                     .line_height(px(16.))
                     .text_color(theme.title())
-                    .child(self.title.clone()),
+                    .child(text.title.clone()),
             )
             .child(
-                truncated(self.host.clone())
+                truncated(text.host.clone())
                     .text_size(px(11.))
                     .line_height(px(15.))
                     .text_color(theme.tertiary()),

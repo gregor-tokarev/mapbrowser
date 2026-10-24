@@ -7,6 +7,7 @@
 use super::{
     Tooltip, UI_FONT,
     downloads::DownloadState,
+    drag::DraggedTab,
     elide::{Cut, elided},
     icons::{Icon, icon},
     permissions::{permission_icon, permission_name},
@@ -74,13 +75,12 @@ const HEADER_HEIGHT: f32 = 22.;
 const SWATCH_ROW_HEIGHT: f32 = 30.;
 const ICON_ROW_HEIGHT: f32 = 28.;
 const ICONS_PER_ROW: usize = 7;
-/// A question: a title, which for a long space name wraps onto as many as
-/// `PROMPT_TITLE_LINES` lines, and its explanation. Its padding above,
-/// between and below them, and their sizes.
+/// A question: a title, which for a long space name wraps onto as many
+/// lines as it takes (a menu taller than the window scrolls), and its
+/// explanation. Its padding above, between and below them, and their sizes.
 const PROMPT_SPACING: f32 = 4. + 2. + 8.;
 const PROMPT_PADDING: f32 = 9.;
 const PROMPT_TITLE_LINE: f32 = 18.;
-const PROMPT_TITLE_LINES: usize = 4;
 const PROMPT_TITLE_SIZE: f32 = 13.;
 const PROMPT_DETAIL_LINE: f32 = 16.;
 const PROMPT_DETAIL_SIZE: f32 = 12.;
@@ -504,7 +504,8 @@ fn space_mark(icon: Option<String>, theme: u8, dark: bool, lit: bool) -> gpui::D
 /// name of a space to delete shows, and the menu is placed by its real
 /// height.
 fn fit_prompts(entries: &mut [Entry], width: f32, cx: &App) {
-    let room = width - 2. * PADDING - 2. * PROMPT_PADDING;
+    // Inside the menu's 1 pt border, its padding and the question's.
+    let room = width - 2. * (1. + PADDING + PROMPT_PADDING);
     let bold = Font {
         weight: FontWeight::SEMIBOLD,
         ..font(UI_FONT)
@@ -517,8 +518,7 @@ fn fit_prompts(entries: &mut [Entry], width: f32, cx: &App) {
         } = entry
         {
             *lines = (
-                wrapped_lines(title, bold.clone(), PROMPT_TITLE_SIZE, room, cx)
-                    .min(PROMPT_TITLE_LINES),
+                wrapped_lines(title, bold.clone(), PROMPT_TITLE_SIZE, room, cx),
                 wrapped_lines(detail, font(UI_FONT), PROMPT_DETAIL_SIZE, room, cx),
             );
         }
@@ -909,8 +909,16 @@ impl BrowserApp {
         let mut entries = self.menu_entries(menu.kind);
         fit_prompts(&mut entries, width, cx);
         let content = entries.iter().map(Entry::height).sum::<f32>();
-        let height = (content + 2. * PADDING).min(max_height(f32::from(viewport.height)));
         let (anchor, above) = menu.anchors(viewport.height);
+        // The menu fits wholly below its anchor or wholly above `above`,
+        // scrolling inside, so it never covers what opened it: a second
+        // press on the library button closes a long library.
+        let room = (f32::from(viewport.height) - EDGE - f32::from(anchor.y))
+            .max(f32::from(above) - EDGE)
+            .max(ITEM_HEIGHT + 2. * PADDING);
+        let height = (content + 2. * PADDING)
+            .min(max_height(f32::from(viewport.height)))
+            .min(room);
         let origin = place(
             anchor,
             above,
@@ -1422,8 +1430,8 @@ impl BrowserApp {
                 .px(px(PROMPT_PADDING))
                 .pt(px(4.))
                 .child(
-                    // The whole name, question mark and all, unless it is
-                    // longer than a few lines.
+                    // The whole name, question mark and all, on the lines
+                    // measured for it.
                     div()
                         .line_clamp(title_lines)
                         .text_ellipsis()
@@ -1521,10 +1529,24 @@ impl BrowserApp {
                     .when(!shortcut.is_empty(), |row| {
                         row.child(div().flex_none().text_color(secondary).child(shortcut))
                     });
+                // "…" lists the spaces for a dragged tab too: dropped on
+                // another one, it moves there.
+                let drop_to = match action {
+                    Action::SwitchSpace(space_id) if !current => Some(space_id),
+                    _ => None,
+                };
                 highlights(row, target(0), cx)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.run_menu_action(action, window, cx)
                     }))
+                    .when_some(drop_to, |row, space_id| {
+                        // Tinted in its colour, as the space's button is.
+                        let tint = Theme::new(space_theme, theme.dark).focus().opacity(0.35);
+                        row.drag_over::<DraggedTab>(move |style, _, _, _| style.bg(tint))
+                            .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
+                                this.drop_tab_on_space(dragged.0, space_id, window, cx)
+                            }))
+                    })
                     .into_any_element()
             }
             Entry::Note(text) => div()

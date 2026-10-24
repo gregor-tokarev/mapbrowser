@@ -21,7 +21,7 @@ use super::{
     theme::Theme,
     truncated,
 };
-use crate::app::BrowserApp;
+use crate::{app::BrowserApp, model::TabId};
 use gpui::{
     AnyElement, AppContext, Bounds, Context, Div, Font, FontWeight, InteractiveElement,
     IntoElement, ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement,
@@ -63,8 +63,10 @@ pub struct Toast {
     pub kind: ToastKind,
     pub text: SharedString,
     /// Says how to undo what was done ("Closed 3 tabs · ⇧⌘T reopens
-    /// them"): the sidebar wraps it to two lines rather than cut the hint.
-    undo: bool,
+    /// them"), with the batch of closed tabs it is about: the sidebar wraps
+    /// it to two lines rather than cut the hint, and it goes once they are
+    /// back.
+    undo: Option<TabId>,
     /// The text as the sidebar shows it, elided to fit `.0` points.
     fitted: Option<(f32, SharedString)>,
     _timer: Task<()>,
@@ -205,13 +207,30 @@ impl BrowserApp {
     ) {
         let text = text.into();
         let duration = toast_duration(kind, &text);
-        self.set_toast(kind, text, duration, false, cx);
+        self.set_toast(kind, text, duration, None, cx);
     }
 
-    /// Shows a ✓ toast that says how to undo what was done, for
-    /// `UNDO_DURATION`.
-    pub fn show_undo_toast(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.set_toast(ToastKind::Done, text.into(), UNDO_DURATION, true, cx);
+    /// Shows a ✓ toast that says how ⇧⌘T reopens the tabs closed together
+    /// as `batch`, for `UNDO_DURATION`.
+    pub fn show_undo_toast(
+        &mut self,
+        text: impl Into<SharedString>,
+        batch: TabId,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_toast(ToastKind::Done, text.into(), UNDO_DURATION, Some(batch), cx);
+    }
+
+    /// The tabs closed as `batch` are back: the toast offering that goes.
+    pub(crate) fn dismiss_undo_toast(&mut self, batch: TabId, cx: &mut Context<Self>) {
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.undo == Some(batch))
+        {
+            self.toast = None;
+            cx.notify();
+        }
     }
 
     fn set_toast(
@@ -219,7 +238,7 @@ impl BrowserApp {
         kind: ToastKind,
         text: SharedString,
         duration: Duration,
-        undo: bool,
+        undo: Option<TabId>,
         cx: &mut Context<Self>,
     ) {
         let timer = cx.spawn(async move |this, cx| {
@@ -253,7 +272,7 @@ impl BrowserApp {
     pub(super) fn fit_toast(&mut self, width: f32, window: &Window) {
         let room = (width - SIDEBAR_CHROME_WIDTH).max(0.);
         if let Some(toast) = &mut self.toast
-            && !toast.undo
+            && toast.undo.is_none()
             && toast
                 .fitted
                 .as_ref()
@@ -263,8 +282,8 @@ impl BrowserApp {
         }
     }
 
-    /// The sidebar's toast and the failed save's notice, above its bottom
-    /// bar.
+    /// The sidebar's toast and, below it, the failed save's notice, above
+    /// its bottom bar.
     pub(super) fn render_toasts(
         &self,
         width: f32,
@@ -291,7 +310,7 @@ impl BrowserApp {
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme.title())
                 .child(mark(toast.kind, theme))
-                .child(if toast.undo {
+                .child(if toast.undo.is_some() {
                     div()
                         .min_w_0()
                         .line_clamp(2)
@@ -339,24 +358,33 @@ impl BrowserApp {
                         ),
                 )
         });
-        save.into_iter().chain(toast).collect()
+        toast.into_iter().chain(save).collect()
     }
 
     /// The toast, or the failed save's notice, if the sidebar that shows
     /// them is hidden, else the progress of running downloads, which its
-    /// ring would show. Pages in HTML fullscreen (videos) show none.
+    /// ring would show. Pages in HTML fullscreen (videos) show none. A
+    /// ⌃Tab walk names the tab it has reached instead, which the hidden
+    /// sidebar would outline.
     fn toast_over_card(&self) -> Option<Shown> {
         if self.sidebar_width().is_some() || self.fullscreen {
             return None;
         }
-        self.toast
+        let walk = self
+            .tab_switch
             .as_ref()
-            .map(|toast| (toast.kind, toast.text.clone()))
-            .or_else(|| self.save_notice())
-            .or_else(|| {
-                self.downloads_over_card()
-                    .map(|text| (ToastKind::Info, text))
-            })
+            .and_then(|switch| self.state.tab(switch.target()))
+            .map(|tab| (ToastKind::Info, tab.shown_title().to_owned().into()));
+        walk.or_else(|| {
+            self.toast
+                .as_ref()
+                .map(|toast| (toast.kind, toast.text.clone()))
+        })
+        .or_else(|| self.save_notice())
+        .or_else(|| {
+            self.downloads_over_card()
+                .map(|text| (ToastKind::Info, text))
+        })
     }
 
     /// Called on every frame of the browser window: the pop-up opens,
