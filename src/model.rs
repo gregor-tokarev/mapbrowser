@@ -1614,6 +1614,17 @@ pub fn normalize_address(input: &str) -> String {
     if let Some(query) = forced_search(input) {
         return search_url(query);
     }
+    // A path with a space in it, as Finder's Copy as Pathname gives one,
+    // opens the file only if it is there: "/r/rust memes" and "/imagine a
+    // red fox" are searched for. The disk is looked at here, as the text
+    // is opened, never as it is typed.
+    if input.contains(char::is_whitespace)
+        && let Some(path) = file_path(input)
+        && std::fs::symlink_metadata(&path).is_ok()
+        && let Ok(url) = Url::from_file_path(path)
+    {
+        return url.into();
+    }
     web_address(input).unwrap_or_else(|| search_url(input))
 }
 
@@ -1667,9 +1678,12 @@ pub fn is_local_network_name(host: &str) -> bool {
 
 /// The URL that trimmed, non-empty text names, or `None` for a search query.
 fn web_address(input: &str) -> Option<String> {
-    // A file's path, as Finder's Copy as Pathname gives it, opens the file,
-    // as in Chrome and Safari; spaces in it are part of its name.
-    if let Some(path) = file_path(input) {
+    // A file's path opens the file, as in Chrome and Safari. One with a
+    // space in it reads as words to search for, unless the file is there
+    // (`normalize_address`).
+    if !input.contains(char::is_whitespace)
+        && let Some(path) = file_path(input)
+    {
         return Url::from_file_path(path).ok().map(String::from);
     }
     let lower = input.to_ascii_lowercase();
@@ -1763,6 +1777,24 @@ fn web_address(input: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Intranet short-link text such as "go/payroll" or "wiki/Onboarding": a
+/// name of two characters or more, then a path. It reads like "tcp/ip"
+/// or "and/or", so Return searches for it; the command bar offers it as
+/// an address as well, and first once the user has been to that name.
+/// Returns the name, lowercase, and the address.
+pub fn short_link(input: &str) -> Option<(String, String)> {
+    let input = input.trim();
+    let (name, path) = input.split_once('/')?;
+    let name = name.to_ascii_lowercase();
+    let short = name.len() >= 2
+        && !path.is_empty()
+        && host_label(&name)
+        && !input.contains(char::is_whitespace)
+        && forced_search(input).is_none()
+        && is_search_query(input);
+    short.then(|| (name, format!("http://{input}")))
 }
 
 /// Whether `name` can be a machine's name on the network: letters, digits

@@ -6,7 +6,7 @@
 
 use super::{
     UI_FONT,
-    elide::{Cut, elided},
+    elide::{self, Cut},
     icons::{Icon, icon},
     placeholder_favicon, shadow, text_width,
     theme::Theme,
@@ -20,9 +20,9 @@ use crate::{
     model::{self, Pin, SearchEngine, SpaceId, TabId},
 };
 use gpui::{
-    App, AppContext, Bounds, Context, DisplayId, Div, Entity, EventEmitter, FontWeight, Image,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, Pixels, Point, Render,
-    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
+    App, AppContext, Bounds, Context, DisplayId, Div, Entity, EventEmitter, Font, FontWeight,
+    Image, InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, Pixels, Point,
+    Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, actions, div, font,
     http_client::Url, img, point, prelude::FluentBuilder, px, size,
 };
@@ -34,6 +34,21 @@ use std::{
 
 actions!(command_bar, [SelectPrevious, SelectNext, SubmitInNewTab]);
 
+/// The least share of a row's room a title keeps beside what follows it,
+/// if it needs that much, and the least it keeps where the domain that
+/// owns the row's host needs the room.
+const TITLE_SHARE: f32 = 0.35;
+const TITLE_FLOOR: f32 = 0.25;
+/// The most of a row the highlighted row's hint takes ("Switch to <space>").
+const HINT_SHARE: f32 = 0.3;
+/// The least of a space's name a row's detail keeps while the host before
+/// it gives way: a few letters.
+const DETAIL_LEAST: f32 = 30.;
+/// The least room for a highlighted row's hint ("Switch to…"); with less,
+/// it shows only ↩.
+const HINT_LEAST: f32 = 64.;
+/// Between a row's title and what follows it.
+const DASH: &str = " — ";
 /// Rows the list shows at most before it scrolls; fewer on a short card
 /// (`visible_rows`).
 const MAX_VISIBLE_ROWS: usize = 8;
@@ -159,9 +174,11 @@ pub struct CommandItem {
     /// than the domain that owns it, or, where titles repeat, its address,
     /// which loses its middle.
     pub address: Option<(String, Cut)>,
-    /// Shown after the title and address: a tab's space, when a page was
-    /// visited, or a note. A host before it loses its start first.
+    /// Shown after the title and address: a tab's space, or a note. It
+    /// loses its end before the host loses anything.
     pub detail: Option<String>,
+    /// Shown last and never cut: how long ago a page was visited.
+    pub when: Option<String>,
     /// Shown at the right of the highlighted row: what Return does.
     pub hint: SharedString,
     pub icon: ItemIcon,
@@ -558,7 +575,8 @@ fn completion(query: &str, context: &CommandContext) -> Option<Completion> {
     let lower = query.to_lowercase();
     let typed = url_text(&lower);
     let dotted = typed.contains('.');
-    let address = dotted || !model::is_search_query(query);
+    let address =
+        dotted || !model::is_search_query(query) || visited_short_link(query, context).is_some();
     let length = typed.chars().count();
     if length < 3 || (length < 4 && !dotted) {
         return None;
@@ -667,6 +685,7 @@ fn switch_item(tab: &TabEntry, context: &CommandContext) -> CommandItem {
         title: tab.title.clone(),
         address,
         detail,
+        when: None,
         hint,
         icon: ItemIcon::Page(host_of(&tab.url)),
     }
@@ -688,6 +707,7 @@ fn space_item(id: SpaceId, name: &str) -> CommandItem {
         title: name.to_owned(),
         address: None,
         detail: Some("Space".into()),
+        when: None,
         hint: "Switch to Space".into(),
         icon: ItemIcon::Glyph(Icon::ArrowRight),
     }
@@ -704,6 +724,7 @@ fn closed_item(closed: &ClosedEntry, context: &CommandContext) -> CommandItem {
         title: closed.title.clone(),
         address: None,
         detail: Some(detail),
+        when: None,
         hint: "Reopen Tab".into(),
         icon: ItemIcon::Page(host_of(&closed.url)),
     }
@@ -733,11 +754,6 @@ fn page_item(
         .first()
         .filter(|_| elsewhere)
         .and_then(|&id| context.space_name(id));
-    let detail = [space.map(str::to_owned), when]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" · ");
     let active = context.active.as_ref().map(|active| active.id);
     let hint = match command {
         Command::SwitchToTab(id) if Some(id) == active => "Current Tab".into(),
@@ -749,7 +765,8 @@ fn page_item(
         command,
         title,
         address,
-        detail: (!detail.is_empty()).then_some(detail),
+        detail: space.map(str::to_owned),
+        when,
         hint,
         icon: ItemIcon::Page(host_of(&page.url)),
     }
@@ -766,6 +783,7 @@ fn action(
         title: title.into(),
         address: None,
         detail: None,
+        when: None,
         hint: hint.into(),
         icon: ItemIcon::Glyph(icon),
     }
@@ -1111,6 +1129,7 @@ fn search_engine_action(engine: SearchEngine, context: &CommandContext) -> Comma
         title: format!("Use {} for Searches", engine.short_name()),
         address: None,
         detail: current.then(|| "Current".into()),
+        when: None,
         hint: if current { "" } else { "Make Default" }.into(),
         icon: ItemIcon::Glyph(if current { Icon::Check } else { Icon::Search }),
     }
@@ -1157,12 +1176,41 @@ pub fn results(mode: CommandMode, query: &str, context: &CommandContext) -> Vec<
         }
     };
     let link = app_link(query);
+    // Short-link text ("go/payroll") opens the machine it names once that
+    // has been visited, and is searched for, with the address offered
+    // below, until then.
+    let short_link = (!unchanged && link.is_none())
+        .then(|| model::short_link(query))
+        .flatten()
+        .map(|(_, url)| url);
+    let visited_link = short_link
+        .as_ref()
+        .and_then(|_| visited_short_link(query, context));
+    let open_link = |url: &str| CommandItem {
+        command: open(url),
+        hint: open_where(open_only_elsewhere(url, context)),
+        title: url.to_owned(),
+        address: None,
+        detail: None,
+        when: None,
+        icon: ItemIcon::Glyph(Icon::Globe),
+    };
+    let search_item = || CommandItem {
+        command: open(query),
+        title: model::search_text(query).to_owned(),
+        address: None,
+        detail: Some(context.search_engine.search_label()),
+        when: None,
+        hint: "Search".into(),
+        icon: ItemIcon::Glyph(Icon::Search),
+    };
     let mut items = vec![if unchanged {
         CommandItem {
             command: Command::Reload,
             title: query.to_owned(),
             address: None,
             detail: None,
+            when: None,
             hint: "Reload".into(),
             icon: ItemIcon::Glyph(Icon::Globe),
         }
@@ -1172,18 +1220,14 @@ pub fn results(mode: CommandMode, query: &str, context: &CommandContext) -> Vec<
             title: address,
             address: None,
             detail: None,
+            when: None,
             hint: hint.into(),
             icon: ItemIcon::Glyph(Icon::Link),
         }
+    } else if let Some(url) = &visited_link {
+        open_link(url)
     } else if model::is_search_query(query) {
-        CommandItem {
-            command: open(query),
-            title: model::search_text(query).to_owned(),
-            address: None,
-            detail: Some(context.search_engine.search_label()),
-            hint: "Search".into(),
-            icon: ItemIcon::Glyph(Icon::Search),
-        }
+        search_item()
     } else {
         let url = model::normalize_address(query);
         CommandItem {
@@ -1192,9 +1236,16 @@ pub fn results(mode: CommandMode, query: &str, context: &CommandContext) -> Vec<
             title: url,
             address: None,
             detail: None,
+            when: None,
             icon: ItemIcon::Glyph(Icon::Globe),
         }
     }];
+
+    match (&visited_link, &short_link) {
+        (Some(_), _) => items.push(search_item()),
+        (None, Some(url)) => items.push(open_link(url)),
+        (None, None) => {}
+    }
 
     let actions = actions(context);
     let typed_page = || {
@@ -1238,6 +1289,7 @@ pub fn results(mode: CommandMode, query: &str, context: &CommandContext) -> Vec<
                 title: page.url,
                 address: None,
                 detail: page.title,
+                when: None,
                 icon: ItemIcon::Page(host),
             },
         })
@@ -1312,6 +1364,8 @@ pub fn results(mode: CommandMode, query: &str, context: &CommandContext) -> Vec<
             .map(|(_, closed)| closed_item(closed, context)),
     );
 
+    // The short link's own page is its row already.
+    shown.extend(short_link.as_deref().map(page_key));
     let mut pages: Vec<(u32, f64, &HistoryEntry)> = context
         .history
         .iter()
@@ -1337,6 +1391,22 @@ pub fn results(mode: CommandMode, query: &str, context: &CommandContext) -> Vec<
     actions.sort_by_key(|(score, _)| Reverse(*score));
     items.extend(actions.into_iter().take(MAX_ACTIONS).map(|(_, item)| item));
     items
+}
+
+/// The address of short-link text ("go/payroll", `model::short_link`)
+/// whose name the user has been to: a visited page or an open tab is on
+/// that machine, so the text means it, as in Chrome.
+fn visited_short_link(query: &str, context: &CommandContext) -> Option<String> {
+    let (name, url) = model::short_link(query)?;
+    let visited = context
+        .history
+        .iter()
+        .any(|page| text_host(&page.address_lower) == name)
+        || context
+            .tabs
+            .iter()
+            .any(|tab| host_of(&tab.url).as_deref() == Some(name.as_str()));
+    visited.then_some(url)
 }
 
 /// Whether the site at `url` is open in another space but not in this
@@ -1393,6 +1463,7 @@ fn empty_results(context: &CommandContext) -> Vec<CommandItem> {
             },
             address,
             detail,
+            when: None,
             hint: "⇧⌘T".into(),
             icon: ItemIcon::Glyph(Icon::Reopen),
         });
@@ -1819,60 +1890,163 @@ impl CommandBar {
         }
     }
 
-    /// What follows a row's title, at most `width` wide, so a long one (a
-    /// page's title) leaves room for the title: the address and the detail
-    /// after it, cut as `Cut` says, so a host loses its start but never the
-    /// space or time that follow it. A detail alone loses its end.
+    /// What follows a row's title, measured: " — ", the address, the
+    /// detail and when, as `render_detail` draws them.
+    fn detail_parts(&self, item: &CommandItem, window: &Window) -> Option<DetailParts> {
+        if item.address.is_none() && item.detail.is_none() && item.when.is_none() {
+            return None;
+        }
+        let measure = |text: &str| text_width(text, font(UI_FONT), 13., window).ceil();
+        let detail = item.detail.as_ref().map(|detail| match item.address {
+            Some(_) => format!(" · {detail}"),
+            None => detail.clone(),
+        });
+        let when = item.when.as_ref().map(|when| {
+            if item.address.is_some() || item.detail.is_some() {
+                format!(" · {when}")
+            } else {
+                when.clone()
+            }
+        });
+        let address = item
+            .address
+            .as_ref()
+            .map_or(0., |(address, _)| measure(address));
+        // A host keeps at least the domain that owns it.
+        let address_least = item.address.as_ref().map_or(0., |(text, cut)| {
+            (*cut == Cut::Start)
+                .then(|| psl::domain_str(text))
+                .flatten()
+                .map_or(DETAIL_LEAST, |owner| measure(&format!("…{owner}")))
+                .min(address)
+        });
+        let detail_width = detail.as_deref().map_or(0., measure);
+        Some(DetailParts {
+            fixed: measure(DASH) + when.as_deref().map_or(0., measure),
+            address,
+            address_least,
+            detail_least: detail_width.min(measure(" · ") + DETAIL_LEAST),
+            detail_width,
+            detail,
+            when,
+        })
+    }
+
+    /// What follows a row's title, at most `room` wide, so a long one (a
+    /// page's title) leaves room for the title: the address, the detail and
+    /// when. Short of room, the detail (a space's name) loses its end first,
+    /// down to a few letters, then the host its start, down to the domain
+    /// that owns it, before which the detail goes; when a page was visited
+    /// is never cut.
     fn render_detail(
         &self,
         item: &CommandItem,
-        width: Pixels,
+        parts: DetailParts,
+        room: f32,
         selected: bool,
         window: &Window,
-    ) -> Option<Div> {
-        if item.address.is_none() && item.detail.is_none() {
-            return None;
-        }
-        let row = div()
+    ) -> Div {
+        let left = (room - parts.fixed).max(0.);
+        let (address, detail) = (parts.address, parts.detail_width);
+        let (address_room, detail_room) = if address + detail <= left {
+            (address, detail)
+        } else if address + parts.detail_least <= left {
+            (address, left - address)
+        } else if parts.address_least + parts.detail_least <= left {
+            (left - parts.detail_least, parts.detail_least)
+        } else if item.address.is_some() {
+            (left.min(address), 0.)
+        } else {
+            (0., left.min(detail))
+        };
+        let detail = parts.detail.filter(|_| detail_room > 0.);
+        // Cut here rather than as it paints, so what follows it comes
+        // right after it: a host loses whole labels, and the room they
+        // leave goes to the detail.
+        let measure = |text: &str| text_width(text, font(UI_FONT), 13., window).ceil();
+        let address = item
+            .address
+            .as_ref()
+            .map(|(address, cut)| elide::fit(address, address_room, *cut, measure));
+        let address_width = address.as_deref().map_or(0., measure);
+        let detail_room = (detail_room + address_room - address_width).min(parts.detail_width);
+        div()
             .flex()
             .flex_none()
             .items_center()
-            .max_w(width)
-            .min_w_0()
+            .w(px((parts.fixed + address_width + detail_room).min(room)))
             .overflow_hidden()
             .text_color(if selected {
                 gpui::white()
             } else {
                 self.theme.tertiary()
             })
-            .child(div().flex_none().child(" — "));
-        Some(match (&item.address, &item.detail) {
-            (Some((address, cut)), detail) => {
-                let text = match detail {
-                    Some(detail) => format!("{address} · {detail}"),
-                    None => address.clone(),
-                };
-                // It takes the room it needs, and less when there isn't as
-                // much: it paints itself to fit.
-                let needed = text_width(&text, font(UI_FONT), 13., window).ceil();
-                row.child(elided(text, *cut, 18.).w(px(needed)).flex_shrink())
-            }
-            (None, Some(detail)) => row.child(truncated(detail.clone()).flex_shrink().min_w_0()),
-            (None, None) => row,
-        })
+            .child(div().flex_none().child(DASH))
+            .children(address.map(|address| div().flex_none().child(address)))
+            .children(detail.map(|detail| truncated(detail).flex_none().w(px(detail_room))))
+            .children(parts.when.map(|when| div().flex_none().child(when)))
     }
 
-    /// A row; its detail is at most `detail_width` wide (`render_detail`).
+    /// A row of a bar `bar_width` wide. The title keeps at least
+    /// `TITLE_SHARE` of the row, or all it needs, and what follows it at
+    /// least the domain that owns its host and when (`render_detail`), and
+    /// otherwise at most 40 % of the bar. The highlighted row's hint takes
+    /// at most `HINT_SHARE` of the row, and less where the title and the
+    /// domain need the room: a space's name in it loses its end, and the
+    /// words go before the title or the domain would.
     fn render_item(
         &self,
         index: usize,
         item: &CommandItem,
-        detail_width: Pixels,
+        bar_width: f32,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = &self.theme;
         let selected = self.selected == Some(index);
+        let measure = |text: &str, size: f32, weight: FontWeight| {
+            let font = Font {
+                weight,
+                ..font(UI_FONT)
+            };
+            text_width(text, font, size, window).ceil()
+        };
+        let title_weight = if selected {
+            FontWeight::SEMIBOLD
+        } else {
+            FontWeight::NORMAL
+        };
+        // Inside the bar's border, the row's margins and padding, beside
+        // the icon and its gap.
+        let row = bar_width - 2. - 2. * 8. - 2. * 13. - (24. + 8.);
+        let title = measure(&item.title, 13., title_weight);
+        let title_least = title.min(row * TITLE_SHARE);
+        let parts = self.detail_parts(item, window);
+        let detail_least = parts
+            .as_ref()
+            .map_or(0., |parts| parts.fixed + parts.address_least);
+        // ↩ in its box and the gap before it; words go before it with a gap,
+        // unless the title and the domain leave too little room for them.
+        let enter = 8. + 2. * 5. + measure("↩", 12., FontWeight::MEDIUM);
+        let hint_room = (row * HINT_SHARE).min(row - enter - 8. - title_least - detail_least);
+        let hint_words = selected && !item.hint.is_empty() && hint_room >= HINT_LEAST;
+        let hint_width = match (selected, hint_words) {
+            (false, _) => 0.,
+            (true, false) => enter,
+            (true, true) => {
+                enter + 8. + measure(&item.hint, 12., FontWeight::MEDIUM).min(hint_room)
+            }
+        };
+        let content = row - hint_width;
+        // The domain that owns the host and when may take a little of the
+        // title's share, and more than 40 % of the bar.
+        let title_floor = title.min(row * TITLE_FLOOR);
+        let detail_room = (content - title_least)
+            .max((content - title_floor).min(detail_least))
+            .min((bar_width * 0.4).max(detail_least))
+            // All a short title leaves.
+            .max(content - title)
+            .max(0.);
         div()
             .id(("item", index))
             .flex()
@@ -1910,9 +2084,11 @@ impl CommandBar {
                             } else {
                                 theme.title()
                             })
-                            .when(selected, |title| title.font_weight(FontWeight::SEMIBOLD)),
+                            .font_weight(title_weight),
                     )
-                    .children(self.render_detail(item, detail_width, selected, window)),
+                    .children(parts.map(|parts| {
+                        self.render_detail(item, parts, detail_room, selected, window)
+                    })),
             )
             // What Return does: every highlighted row can be the default,
             // so each shows ↩, with words where it has them.
@@ -1926,7 +2102,9 @@ impl CommandBar {
                         .text_size(px(12.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(gpui::white())
-                        .when(!item.hint.is_empty(), |hint| hint.child(item.hint.clone()))
+                        .when(hint_words, |hint| {
+                            hint.child(truncated(item.hint.clone()).max_w(px(hint_room)))
+                        })
                         .child(
                             div()
                                 .flex()
@@ -1943,6 +2121,19 @@ impl CommandBar {
     }
 }
 
+/// What follows a row's title, measured (`detail_parts`): what never
+/// gives way (" — " and when), the address's width and the least it is cut
+/// to, and the detail's.
+struct DetailParts {
+    fixed: f32,
+    address: f32,
+    address_least: f32,
+    detail: Option<String>,
+    detail_width: f32,
+    detail_least: f32,
+    when: Option<String>,
+}
+
 impl Render for CommandBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
@@ -1952,7 +2143,7 @@ impl Render for CommandBar {
             .iter()
             .enumerate()
             .map(|(index, item)| {
-                self.render_item(index, item, width * 0.4, window, cx)
+                self.render_item(index, item, f32::from(width), window, cx)
                     .into_any_element()
             })
             .collect::<Vec<_>>();

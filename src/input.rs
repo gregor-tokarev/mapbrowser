@@ -56,6 +56,9 @@ pub struct TextInput {
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
     scroll_x: Pixels,
+    /// After `select_all_focus` the field shows the text's start, though
+    /// the caret is at its end, until the caret or the text changes.
+    hold_scroll_start: bool,
     style: InputStyle,
     /// States ⌘Z goes back to, the latest last, and those ⇧⌘Z redoes.
     undo: Vec<Snapshot>,
@@ -181,6 +184,7 @@ impl TextInput {
             last_bounds: None,
             is_selecting: false,
             scroll_x: px(0.),
+            hold_scroll_start: false,
             style: InputStyle::default(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -207,6 +211,7 @@ impl TextInput {
         self.selection_reversed = false;
         self.marked_range = None;
         self.scroll_x = px(0.);
+        self.hold_scroll_start = false;
         self.undo.clear();
         self.redo.clear();
         self.run = None;
@@ -247,14 +252,17 @@ impl TextInput {
         window.focus(&self.focus_handle);
     }
 
-    /// Selects the whole text from its end, so that a long one shows its
-    /// start, as Safari's and Chrome's address fields do: an address's
-    /// scheme and host, not the end of its path.
+    /// Selects the whole text, showing a long one from its start, as
+    /// Safari's and Chrome's address fields do: an address's scheme and
+    /// host, not the end of its path. The caret is at the end, as after
+    /// any select-all in AppKit, so ⇧← takes back the last character and
+    /// ⇧→ does nothing.
     pub fn select_all_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
         self.selected_range = 0..self.content.len();
-        self.selection_reversed = true;
+        self.selection_reversed = false;
         self.scroll_x = px(0.);
+        self.hold_scroll_start = true;
         cx.notify();
     }
 
@@ -337,6 +345,7 @@ impl TextInput {
         let previous = std::mem::replace(&mut self.content, snapshot.content);
         self.selected_range = snapshot.selected_range;
         self.selection_reversed = snapshot.selection_reversed;
+        self.hold_scroll_start = false;
         self.run = None;
         self.emit_changed_since(&previous, cx);
         cx.notify();
@@ -528,6 +537,7 @@ impl TextInput {
             {
                 self.selected_range = start..start + segment.len();
                 self.selection_reversed = false;
+                self.hold_scroll_start = false;
                 cx.notify();
                 return;
             }
@@ -584,6 +594,7 @@ impl TextInput {
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
         self.selection_reversed = false;
+        self.hold_scroll_start = false;
         cx.notify()
     }
 
@@ -614,6 +625,7 @@ impl TextInput {
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let before = self.selected_range.clone();
         if self.selection_reversed {
             self.selected_range.start = offset
         } else {
@@ -622,6 +634,10 @@ impl TextInput {
         if self.selected_range.end < self.selected_range.start {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
+        }
+        // ⇧→ at the end of a select-all changes nothing, the view included.
+        if self.selected_range != before {
+            self.hold_scroll_start = false;
         }
         cx.notify()
     }
@@ -744,6 +760,7 @@ impl EntityInputHandler for TextInput {
                 .into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.selection_reversed = false;
+        self.hold_scroll_start = false;
         self.marked_range.take();
         self.end_edit(kind);
         self.emit_changed_since(&previous, cx);
@@ -797,6 +814,7 @@ impl EntityInputHandler for TextInput {
             })
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
         self.selection_reversed = false;
+        self.hold_scroll_start = false;
         self.emit_changed_since(&previous, cx);
         cx.notify();
     }
@@ -957,7 +975,9 @@ impl Element for TextElement {
 
         let cursor_pos = line.x_for_index(cursor);
         let visible_width = (bounds.size.width - px(2.)).max(px(0.));
-        let scroll_x = if input.focus_handle.is_focused(window) {
+        let scroll_x = if input.hold_scroll_start {
+            px(0.)
+        } else if input.focus_handle.is_focused(window) {
             let mut scroll = input.scroll_x;
             if cursor_pos < scroll {
                 scroll = cursor_pos;
