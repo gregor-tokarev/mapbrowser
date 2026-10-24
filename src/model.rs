@@ -248,6 +248,15 @@ impl SearchEngine {
         }
     }
 
+    /// Its name where a sentence says what it searches with, as Chrome
+    /// names it: "Search Brave for …", not "Search Brave Search for …".
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Self::Brave => "Brave",
+            engine => engine.name(),
+        }
+    }
+
     /// What a search with it is called: "Google Search", "Brave Search".
     pub fn search_label(self) -> String {
         let name = self.name();
@@ -595,6 +604,12 @@ impl BrowserState {
 
     pub fn root_dir(&self) -> &Path {
         &self.storage_dir
+    }
+
+    /// Whether the session is the one saved last, read from state.json:
+    /// only then does a space missing from it mean the space was deleted.
+    pub fn from_state_file(&self) -> bool {
+        self.from_state_file
     }
 
     pub fn profile_dir(&self, space_id: SpaceId) -> PathBuf {
@@ -1593,6 +1608,11 @@ const LOCAL_SUFFIXES: &[&str] = &[
 
 /// The URL that trimmed, non-empty text names, or `None` for a search query.
 fn web_address(input: &str) -> Option<String> {
+    // A file's path, as Finder's Copy as Pathname gives it, opens the file,
+    // as in Chrome and Safari; spaces in it are part of its name.
+    if let Some(path) = file_path(input) {
+        return Url::from_file_path(path).ok().map(String::from);
+    }
     let lower = input.to_ascii_lowercase();
     // Typed web addresses must be complete: "https://" alone, a space in
     // the host or a port that isn't a number are searched for instead.
@@ -1616,6 +1636,8 @@ fn web_address(input: &str) -> Option<String> {
         "mailto:",
         "tel:",
         "sms:",
+        "facetime:",
+        "facetime-audio:",
         "intent:",
     ]
     .iter()
@@ -1665,18 +1687,43 @@ fn web_address(input: &str) -> Option<String> {
     if name.is_empty() || name.starts_with('[') {
         return None;
     }
-    // A real domain suffix opens over HTTPS. Other names are intranet hosts
-    // ("router/", "nas:5000", "wiki.corp/page") when they come with a path
-    // or port, else words ("node.js", "e.g.", "café") to search for.
+    // A real domain suffix opens over HTTPS. Other dotted names are
+    // intranet hosts ("wiki.mycompany/page") when they come with a path or
+    // port, else words ("node.js", "e.g.", "café") to search for.
     let known_suffix =
         name.contains('.') && psl::suffix(name.as_bytes()).is_some_and(|suffix| suffix.is_known());
     if known_suffix {
         Some(format!("https://{schemeless}"))
-    } else if has_path || has_port {
+    } else if name.contains('.') && (has_path || has_port) {
+        Some(format!("http://{schemeless}"))
+    } else if host_label(name) && (has_port || &schemeless[authority.len()..] == "/") {
+        // A single name is a machine on the network only in the forms a
+        // word with a slash or a colon isn't written in: "router/" and
+        // "nas:5000" open, "tcp/ip", "24/7" and "16:9" are searched for.
         Some(format!("http://{schemeless}"))
     } else {
         None
     }
+}
+
+/// Whether `name` can be a machine's name on the network: letters, digits
+/// and hyphens, with a letter among them ("24" is a number).
+fn host_label(name: &str) -> bool {
+    !name.starts_with('-')
+        && !name.ends_with('-')
+        && name.bytes().any(|byte| byte.is_ascii_alphabetic())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// The file a typed path names: an absolute path, or one in the home
+/// folder ("~/Desktop/page.html"). "//host/path" is an address.
+fn file_path(input: &str) -> Option<PathBuf> {
+    if let Some(path) = input.strip_prefix("~/") {
+        return dirs::home_dir().map(|home| home.join(path));
+    }
+    (input.starts_with('/') && !input.starts_with("//")).then(|| PathBuf::from(input))
 }
 
 /// Splits "host:port" and "[ipv6]:port"; the port is `None` without a colon.

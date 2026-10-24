@@ -95,8 +95,10 @@ fn key_bindings() -> Vec<KeyBinding> {
         // text fields take them while they have focus.
         KeyBinding::new("cmd-z", Undo, None),
         KeyBinding::new("cmd-shift-z", Redo, None),
-        // Not browser shortcuts: a page that leaves them alone hands them to
-        // the menu bar.
+        // Browser shortcuts, as in Safari and Chrome: Settings and History
+        // open with a page focused too, before the page sees the key (the
+        // key monitor doesn't route them to it, and GPUI's view claims
+        // them ahead of the page's).
         KeyBinding::new("cmd-,", Settings, None),
         KeyBinding::new("cmd-y", ShowHistory, None),
         KeyBinding::new("escape", Dismiss, Some("Browser")),

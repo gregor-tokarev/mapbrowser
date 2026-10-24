@@ -9,7 +9,7 @@ use crate::model::{self, SpaceId, TabId, display_url};
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Reverse,
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     fs, io,
     path::{Path, PathBuf},
     sync::{
@@ -29,6 +29,11 @@ const MAX_AGE_SECS: u64 = 90 * 24 * 60 * 60;
 /// Longer addresses carry state rather than name a page worth finding again.
 const MAX_URL_LEN: usize = 2048;
 const MAX_TITLE_CHARS: usize = 300;
+/// A visit takes the titles its page shows this long after it began (10 s),
+/// then keeps the last: a page that keeps changing its title (a timer, an
+/// unread count) would otherwise rewrite the file every few seconds, and
+/// leave the visit named by whatever it said last. Chrome does the same.
+const TITLE_SECS: u64 = 10;
 
 /// A space's visits to one page.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +66,8 @@ pub struct VisitedPage {
     pub title: String,
     pub count: u32,
     pub last: u64,
+    /// The spaces it was visited in, the latest visit's first.
+    pub spaces: Vec<SpaceId>,
 }
 
 pub struct History {
@@ -71,6 +78,10 @@ pub struct History {
     pages: HashMap<TabId, usize>,
     /// Changed since the last snapshot.
     changed: bool,
+    /// The last snapshot's number. Quitting writes the visits again unless
+    /// it was written: after a failed write (a full disk) they would be
+    /// lost, or a cleared history would come back at the next launch.
+    snapshot_seq: u64,
 }
 
 /// Seconds since the Unix epoch.
@@ -114,6 +125,7 @@ impl History {
             visits,
             pages: HashMap::new(),
             changed: false,
+            snapshot_seq: 0,
         };
         let count = history.visits.len();
         history
@@ -176,8 +188,9 @@ impl History {
         true
     }
 
-    /// The title of the page the tab shows. Returns whether it changed.
-    pub fn set_title(&mut self, tab_id: TabId, title: &str) -> bool {
+    /// The title of the page the tab shows, at `now`: its first, or a later
+    /// one early in the visit (`TITLE_SECS`). Returns whether it changed.
+    pub fn set_title(&mut self, tab_id: TabId, title: &str, now: u64) -> bool {
         let title = title.trim();
         let Some(visit) = self
             .pages
@@ -188,6 +201,9 @@ impl History {
         };
         // Chromium reports the address as the title of pages without one.
         if title.is_empty() || title == visit.url {
+            return false;
+        }
+        if !visit.title.is_empty() && now.saturating_sub(visit.last) > TITLE_SECS {
             return false;
         }
         let title: String = title.chars().take(MAX_TITLE_CHARS).collect();
@@ -204,6 +220,20 @@ impl History {
         let count = self.visits.len();
         self.visits.retain(|visit| visit.space_id != space_id);
         self.forgot(count)
+    }
+
+    /// Drops the visits of spaces the session doesn't have: one deleted by
+    /// an older version, which keeps no history, or just before a crash
+    /// kept this file from being written. Returns whether there were any.
+    pub fn retain_spaces(&mut self, spaces: &HashSet<SpaceId>) -> bool {
+        let count = self.visits.len();
+        self.visits.retain(|visit| spaces.contains(&visit.space_id));
+        self.forgot(count)
+    }
+
+    /// Every visited address, for the favicons still worth keeping.
+    pub fn urls(&self) -> impl Iterator<Item = &str> {
+        self.visits.iter().map(|visit| visit.url.as_str())
     }
 
     /// Forgets every visit. Returns whether there were any.
@@ -248,6 +278,7 @@ impl History {
                         title: visit.title.clone(),
                         count: visit.count,
                         last: visit.last,
+                        spaces: vec![visit.space_id],
                     });
                 }
                 Entry::Occupied(mut entry) => {
@@ -256,6 +287,9 @@ impl History {
                     let newer = visit.last > page.last;
                     if newer {
                         page.last = visit.last;
+                        page.spaces.insert(0, visit.space_id);
+                    } else {
+                        page.spaces.push(visit.space_id);
                     }
                     if !visit.title.is_empty() && (newer || page.title.is_empty()) {
                         page.title.clone_from(&visit.title);
@@ -271,17 +305,24 @@ impl History {
     /// The visits to write, if they changed since the last snapshot. Taken
     /// on the main thread; writing can happen anywhere.
     pub fn snapshot(&mut self) -> Option<HistorySnapshot> {
-        std::mem::take(&mut self.changed).then(|| HistorySnapshot {
-            path: self.path.clone(),
-            visits: self.visits.clone(),
-            seq: NEXT_SNAPSHOT.fetch_add(1, Ordering::Relaxed),
-        })
+        std::mem::take(&mut self.changed).then(|| self.take_snapshot())
     }
 
-    /// Writes any change on the calling thread, for quitting.
+    fn take_snapshot(&mut self) -> HistorySnapshot {
+        self.snapshot_seq = NEXT_SNAPSHOT.fetch_add(1, Ordering::Relaxed);
+        HistorySnapshot {
+            path: self.path.clone(),
+            visits: self.visits.clone(),
+            seq: self.snapshot_seq,
+        }
+    }
+
+    /// Writes on the calling thread, for quitting: any change, and visits
+    /// whose last write failed or is still running (it is waited for).
     pub fn save(&mut self) {
-        if let Some(snapshot) = self.snapshot()
-            && let Err(error) = snapshot.write()
+        let written = *WRITTEN.lock().unwrap_or_else(PoisonError::into_inner);
+        if (std::mem::take(&mut self.changed) || written < self.snapshot_seq)
+            && let Err(error) = self.take_snapshot().write()
         {
             eprintln!("Couldn't save the browsing history: {error}");
         }

@@ -31,6 +31,9 @@
 //! can show files that are there or gone. Answers to permissions Chromium
 //! keeps (location, notifications…) are kept per space and site for the
 //! site menu, as a profile would.
+//!
+//! A "title-demo" page keeps changing its title once a second, as a chat's
+//! unread count or a timer does.
 
 use super::{
     CrashReason, DownloadEnd, EngineEvent, Permission, PermissionDecision, ZoomStep, site_origin,
@@ -70,6 +73,9 @@ pub struct Engine {
     downloads: Arc<Mutex<HashMap<u64, PathBuf>>>,
     /// Unanswered sign-in, certificate and leave requests.
     page_requests: RefCell<HashMap<u64, PageRequest>>,
+    /// Tabs whose "title-demo" page keeps changing its title, each with
+    /// the load that started it: another load, or closing, stops it.
+    retitling: Arc<Mutex<HashMap<u64, u64>>>,
 }
 
 struct Request {
@@ -223,6 +229,7 @@ impl Engine {
             downloads_dir: data_dir.join("Downloads"),
             downloads: Arc::default(),
             page_requests: RefCell::default(),
+            retitling: Arc::default(),
         };
         Ok((engine, receiver))
     }
@@ -391,6 +398,7 @@ impl Engine {
     pub fn close_tab(&mut self, tab_id: u64) {
         if self.pages.borrow_mut().remove(&tab_id).is_some() {
             self.dismiss_requests(tab_id);
+            self.stop_retitling(tab_id);
             self.send(EngineEvent::Closed { tab_id });
         }
     }
@@ -624,6 +632,7 @@ impl Engine {
             (url.clone(), page.can_go_back(), page.can_go_forward())
         };
         self.dismiss_requests(tab_id);
+        self.stop_retitling(tab_id);
         let loading = |loading| EngineEvent::Loading {
             tab_id,
             loading,
@@ -762,6 +771,9 @@ impl Engine {
                 audio: capturing,
             });
         }
+        if url.contains("title-demo") {
+            self.keep_retitling(tab_id, page_title(url));
+        }
         if url.contains("popup-demo") {
             self.send(EngineEvent::PopupBlocked {
                 tab_id,
@@ -843,6 +855,40 @@ impl Engine {
     fn next_id(&self) -> u64 {
         self.next_id.set(self.next_id.get() + 1);
         self.next_id.get()
+    }
+
+    /// A "title-demo" page puts a count in its title once a second, as a
+    /// chat's unread count or a timer does, for five minutes.
+    fn keep_retitling(&self, tab_id: u64, title: String) {
+        let run = self.next_id();
+        let retitling = self.retitling.clone();
+        retitling
+            .lock()
+            .expect("retitling demos")
+            .insert(tab_id, run);
+        let events = self.events.clone();
+        std::thread::spawn(move || {
+            for count in 1..=300 {
+                std::thread::sleep(Duration::from_secs(1));
+                if retitling.lock().expect("retitling demos").get(&tab_id) != Some(&run) {
+                    return;
+                }
+                let title = format!("({count}) {title}");
+                if events
+                    .try_send(EngineEvent::Title { tab_id, title })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+    }
+
+    fn stop_retitling(&self, tab_id: u64) {
+        self.retitling
+            .lock()
+            .expect("retitling demos")
+            .remove(&tab_id);
     }
 
     /// Downloads the demo file from `url` (named after its last path
