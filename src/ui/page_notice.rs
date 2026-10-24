@@ -1437,8 +1437,9 @@ impl BrowserApp {
     /// the user leaves. Asking again while it asks doesn't wait.
     pub fn leave_tab(&mut self, tab_id: TabId, leaving: Leaving, cx: &mut Context<Self>) {
         let asked = self.notices.leaving.remove(&tab_id).is_some();
-        // A tab still downloading keeps its browser (`drop_browser`).
-        let ask = !asked && self.is_loaded(tab_id) && !self.downloads.running_in(tab_id);
+        // A page downloading asks too: once it lets go, the engine keeps
+        // its browser, hidden, until the downloads end.
+        let ask = !asked && self.is_loaded(tab_id);
         if ask && !self.engine.borrow_mut().close_tab_asking(tab_id) {
             self.notices.leaving.insert(tab_id, leaving);
             return;

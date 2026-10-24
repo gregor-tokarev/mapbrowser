@@ -575,10 +575,12 @@ fn with_space(
     marker: Hsla,
     cx: &App,
 ) -> Div {
-    let line = div().flex().items_center().min_w_0().overflow_hidden();
+    // Alone, the text is the line: inside a flex row it measured nothing
+    // and the row's second line went missing.
     let Some(space) = space else {
-        return line.child(truncated(text).min_w_0());
+        return truncated(text).min_w_0();
     };
+    let line = div().flex().items_center().min_w_0().overflow_hidden();
     let space = format!(" · {space}");
     let width = |text: &str| advance_width(text, &font(UI_FONT), size, cx).ceil();
     let text_room = width(&text).min((room - width(&space).min(least)).max(0.));

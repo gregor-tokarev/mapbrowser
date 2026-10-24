@@ -174,7 +174,7 @@ pub struct BrowserApp {
     /// Tabs whose page started a new document: its next address is a visit.
     new_documents: HashSet<TabId>,
     /// Tabs from the last session that haven't loaded yet: loading them
-    /// again is no new visit.
+    /// again is no new visit, sending them elsewhere is.
     restored: HashSet<TabId>,
     /// Whether the window's close, minimize and zoom buttons are hidden, as
     /// last set: they show whenever the sidebar does.
@@ -570,15 +570,22 @@ impl BrowserApp {
     }
 
     pub(crate) fn ensure_loaded(&mut self, tab_id: TabId) {
+        if let Some(tab) = self.state.tab(tab_id) {
+            let url = tab.url.clone();
+            self.load_tab_at(tab_id, &url);
+        }
+    }
+
+    /// Creates the tab's browser at `url`, which may differ from its address
+    /// (a blank page for a download, `retry_download`).
+    pub(crate) fn load_tab_at(&mut self, tab_id: TabId, url: &str) {
         if self.loaded.contains(&tab_id) {
             return;
         }
-        let (Some(space_id), Some(tab)) = (self.state.space_of_tab(tab_id), self.state.tab(tab_id))
-        else {
+        let Some(space_id) = self.state.space_of_tab(tab_id) else {
             return;
         };
-        let url = tab.url.clone();
-        match self.engine.borrow_mut().create_tab(tab_id, space_id, &url) {
+        match self.engine.borrow_mut().create_tab(tab_id, space_id, url) {
             Ok(()) => {
                 self.loaded.insert(tab_id);
             }
@@ -801,6 +808,7 @@ impl BrowserApp {
         }
         let url = model::normalize_address(input);
         self.error = None;
+        self.restored.remove(&tab_id);
         if self.loaded.contains(&tab_id) {
             // The tab follows the page: `Address` reports the new page once
             // it loads, `LoadError` an address that failed. Downloads and
@@ -1111,6 +1119,7 @@ impl BrowserApp {
         else {
             return;
         };
+        self.restored.remove(&tab_id);
         if self.loaded.contains(&tab_id) {
             // `Address` reports the page once it loads, as for ⌘L.
             self.engine.borrow().navigate(tab_id, &url);
@@ -2390,8 +2399,9 @@ impl BrowserApp {
     /// progress.
     fn engine_event(&mut self, event: EngineEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
-            EngineEvent::Created { .. } => {
+            EngineEvent::Created { tab_id } => {
                 self.engine.borrow_mut().register_pending();
+                self.start_retry(tab_id);
                 // The active tab's page takes keyboard focus once it is
                 // ready; a rename or menu in progress keeps it.
                 if self.naming() || self.menu.is_some() {

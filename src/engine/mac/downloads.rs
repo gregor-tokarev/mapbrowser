@@ -2,9 +2,10 @@
 //! handler CEF 152 hands them to Chrome's download code, which saves them
 //! there too but reports nothing to the app, and holds files it would ask
 //! about in a download bubble Alloy browsers don't have. Popup windows
-//! download the same way; one closed while downloading keeps its browser,
-//! hidden, until its downloads end, since CEF reports a download only
-//! while the browser that started it lives.
+//! download the same way. A popup closed while downloading, or a tab
+//! whose page let go while downloading (`TabLife::do_close`), keeps its
+//! browser, hidden, until its downloads end, since CEF reports a download
+//! only while the browser that started it lives.
 
 use super::{BrowserLink, Engine, frame_url, popups::popup_window};
 use crate::engine::{
@@ -30,8 +31,8 @@ pub(super) struct Downloads(Arc<Mutex<State>>);
 struct State {
     next_id: u64,
     active: HashMap<(u64, u32), Active>,
-    /// Popups closed while downloading, by browser instance: they close
-    /// once their downloads end.
+    /// Popups and pages closed while downloading, by browser instance:
+    /// they close once their downloads end.
     closing: HashMap<u64, Browser>,
 }
 
@@ -164,12 +165,13 @@ impl Downloads {
             .any(|&(owner, _)| owner == instance)
     }
 
-    /// Closes the popup `browser` (`instance`) once its downloads end.
+    /// Closes `browser` (`instance`), a popup or a page that let go, once
+    /// its downloads end.
     pub(super) fn close_when_done(&self, instance: u64, browser: Browser) {
         self.state().closing.insert(instance, browser);
     }
 
-    /// The popup waiting for the downloads of `instance`, now they ended.
+    /// The browser waiting for the downloads of `instance`, now they ended.
     fn done_closing(&self, instance: u64) -> Option<Browser> {
         let mut state = self.state();
         if state.active.keys().any(|&(owner, _)| owner == instance) {
@@ -276,8 +278,10 @@ wrap_download_handler! {
             if let Some(event) = self.link.downloads.update((self.link.instance, item.id()), item, callback.as_deref()) {
                 self.link.send(event);
             }
-            if let Some(popup) = self.link.downloads.done_closing(self.link.instance)
-                && let Some(host) = popup.host()
+            // A page's browser closes again, now through to its view
+            // (`TabLife::do_close`).
+            if let Some(browser) = self.link.downloads.done_closing(self.link.instance)
+                && let Some(host) = browser.host()
             {
                 host.close_browser(1);
             }

@@ -514,11 +514,16 @@ impl Engine {
     }
 
     /// Downloads `url` again from the tab's page. False without a page.
+    /// Like Chromium's, a blank page leaves its tab blank.
     pub fn start_download(&self, tab_id: u64, url: &str) -> bool {
-        if !self.has_tab(tab_id) {
+        let Some(blank) = self.pages.borrow().get(&tab_id).map(|page| {
+            page.entries
+                .get(page.index)
+                .is_none_or(|url| url == "about:blank")
+        }) else {
             return false;
-        }
-        self.download(tab_id, url, false);
+        };
+        self.download(tab_id, url, blank);
         true
     }
 

@@ -635,8 +635,39 @@ wrap_life_span_handler! {
             i32::from(popups::before_popup(&self.link, frame.as_deref(), url, target_disposition, user_gesture != 0, popup_features, window_info, client))
         }
         fn do_close(&self, browser: Option<&mut Browser>) -> i32 {
+            let link = &self.link;
             // The close goes ahead: the page let go (`close_tab_asking`).
-            self.link.pending().closing.insert(self.link.instance);
+            let shutting_down = {
+                let mut pending = link.pending();
+                pending.closing.insert(link.instance);
+                pending.shutting_down
+            };
+            // A page that let go while it downloads keeps its browser,
+            // hidden, until the downloads end: CEF reports a download only
+            // while its browser lives. Returning 1 without destroying the
+            // view keeps it alive; `on_download_updated` closes it again
+            // once they end. The tab lets go of it now.
+            if !shutting_down
+                && link.downloads.running_for(link.instance)
+                && let Some(browser) = browser.as_deref()
+            {
+                if let Some(view) = browser_view(browser) {
+                    view.setHidden(true);
+                }
+                link.downloads.close_when_done(link.instance, browser.clone());
+                let current = {
+                    let mut pending = link.pending();
+                    let current = pending.current.get(&link.tab_id) == Some(&link.instance);
+                    if current {
+                        pending.current.remove(&link.tab_id);
+                    }
+                    current
+                };
+                if current {
+                    link.send(EngineEvent::Closed { tab_id: link.tab_id });
+                }
+                return 1;
+            }
             // Closing a tab must destroy its child NSView, never its GPUI window.
             // Defer destruction until CEF has returned from this callback.
             if let Some(host) = browser.and_then(|browser| browser.host()) {
@@ -1422,13 +1453,15 @@ impl Engine {
             .current
             .contains_key(&tab_id)
     }
-    /// Drops the handle of a browser reported `Closed`. A browser created for
-    /// the tab since then stays.
+    /// Drops the handle of a browser reported `Closed`, also of one that
+    /// lives on hidden for its downloads (`TabLife::do_close`). A browser
+    /// created for the tab since then stays.
     pub fn forget_closed(&mut self, tab_id: u64) {
+        let let_go = !self.has_tab(tab_id);
         if self
             .browsers
             .get(&tab_id)
-            .is_some_and(|browser| browser.is_valid() == 0)
+            .is_some_and(|browser| let_go || browser.is_valid() == 0)
         {
             self.browsers.remove(&tab_id);
         }

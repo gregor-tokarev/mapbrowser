@@ -23,7 +23,7 @@ use gpui::{
     App, Bounds, Context, Div, FontWeight, Hsla, ParentElement, PathBuilder, Pixels, PromptLevel,
     SharedString, Styled, Window, WindowHandle, canvas, div, point, px,
 };
-use std::{f32::consts::TAU, path::PathBuf};
+use std::{collections::HashMap, f32::consts::TAU, path::PathBuf};
 
 pub use crate::model::DownloadState;
 
@@ -116,6 +116,9 @@ pub struct Downloads {
     /// A download failed since the library was last open: the badge on its
     /// button says so.
     failure_unseen: bool,
+    /// Downloads again waiting in a blank tab of their own, by tab: the row
+    /// each replaces once it starts, and the address.
+    retries: HashMap<TabId, (u64, String)>,
 }
 
 /// The ring: `start` and `length` in turns, clockwise from 12 o'clock.
@@ -387,6 +390,10 @@ impl BrowserApp {
         let space_id = self.state.space_of_tab(tab_id);
         self.downloads
             .start(id, tab_id, space_id, name, path, download_source(&url));
+        // A download again in a tab of its own takes its row's place now.
+        if let Some((replaced, _)) = self.downloads.retries.remove(&tab_id) {
+            self.downloads.remove(replaced);
+        }
         // A link that opened a new tab for a file leaves it blank: close it
         // (it isn't worth reopening) and go back to the page with the link,
         // in its own space: the window stays in the space on screen. Its
@@ -485,13 +492,14 @@ impl BrowserApp {
 
     /// Downloads a failed or cancelled file again, with the profile of the
     /// space it came from: through a page of that space that is open, else
-    /// through a tab of its own that closes once the download starts. The
-    /// new download takes the old one's place at the top of the list.
+    /// through a blank tab of its own that closes once the download starts.
+    /// The new download takes the old one's place at the top of the list.
     pub fn retry_download(&mut self, id: u64, cx: &mut Context<Self>) {
         let Some(download) = self
             .downloads
             .get(id)
             .filter(|download| download.can_retry())
+            .filter(|_| !self.downloads.retries.values().any(|&(row, _)| row == id))
         else {
             return;
         };
@@ -512,17 +520,29 @@ impl BrowserApp {
                     .flat_map(|space| space.tabs.iter().map(|tab| tab.id)),
             )
             .find(|&tab| self.is_loaded(tab));
-        let started = open_tab.is_some_and(|tab| self.engine.borrow().start_download(tab, &url));
-        if !started {
-            let Some(tab) = self.state.new_background_tab(space_id, &url) else {
-                return;
-            };
-            self.ensure_loaded(tab);
-            self.persist_later(cx);
+        if open_tab.is_some_and(|tab| self.engine.borrow().start_download(tab, &url)) {
+            self.downloads.remove(id);
+            self.save_downloads(cx);
+            cx.notify();
+            return;
         }
-        self.downloads.remove(id);
-        self.save_downloads(cx);
+        // Loading the address would show a picture or a PDF instead of
+        // downloading it: the tab's browser starts blank, and downloads once
+        // it is ready (`start_retry`). The row stays until it starts.
+        let Some(tab) = self.state.new_background_tab(space_id, &url) else {
+            return;
+        };
+        self.downloads.retries.insert(tab, (id, url));
+        self.load_tab_at(tab, "about:blank");
+        self.persist_later(cx);
         cx.notify();
+    }
+
+    /// A tab's browser is ready: a download again waiting for it starts.
+    pub(crate) fn start_retry(&mut self, tab_id: TabId) {
+        if let Some((_, url)) = self.downloads.retries.get(&tab_id) {
+            self.engine.borrow().start_download(tab_id, url);
+        }
     }
 
     /// Asks whether to quit while downloads run (a sheet on macOS), and
