@@ -2,7 +2,8 @@
 // Copyright 2022 - 2025 Zed Industries, Inc. Licensed under Apache-2.0.
 // See licenses/GPUI-Apache-2.0.txt.
 // Modified for Mapbrowser: reusable field API, navigation events, scoped shortcuts,
-// mouse focus, horizontal scrolling, themable styling, and corrected IME selection.
+// mouse focus, horizontal scrolling, themable styling, corrected IME selection,
+// undo and redo, and pasting on one line.
 
 use std::ops::Range;
 
@@ -55,8 +56,45 @@ pub struct TextInput {
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
     scroll_x: Pixels,
+    /// After `select_all_focus` the field shows the text's start, though
+    /// the caret is at its end, until the caret or the text changes.
+    hold_scroll_start: bool,
     style: InputStyle,
+    /// States ⌘Z goes back to, the latest last, and those ⇧⌘Z redoes.
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    /// The run of typing or deleting the last edit was part of, and where
+    /// it left the caret: the next edit of that kind there joins it, so ⌘Z
+    /// takes back a typed word or a held Backspace at once, as in AppKit.
+    run: Option<(EditKind, usize)>,
+    /// What the next `replace_text_in_range` is; the platform's text input
+    /// calls it for typing.
+    next_edit: EditKind,
+    /// A password field: it shows a bullet per character and copies nothing.
+    masked: bool,
 }
+
+/// The text and selection ⌘Z or ⇧⌘Z restores.
+#[derive(Clone, Debug)]
+struct Snapshot {
+    content: SharedString,
+    selected_range: Range<usize>,
+    selection_reversed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditKind {
+    Typing,
+    Deleting,
+    /// Pasting, cutting and deleting a selection or a word undo one by one.
+    Other,
+}
+
+/// Edits a field keeps for ⌘Z.
+const UNDO_LIMIT: usize = 100;
+
+/// What a password field shows for each character.
+const MASK: char = '•';
 
 /// Colours and metrics of the field; the defaults are the original dark style.
 #[derive(Clone, Debug)]
@@ -146,7 +184,13 @@ impl TextInput {
             last_bounds: None,
             is_selecting: false,
             scroll_x: px(0.),
+            hold_scroll_start: false,
             style: InputStyle::default(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            run: None,
+            next_edit: EditKind::Typing,
+            masked: false,
         }
     }
 
@@ -159,13 +203,44 @@ impl TextInput {
         &self.content
     }
 
+    /// Replaces the text, which ⌘Z then can't go back past: the address ⌘L
+    /// starts with, a space's name, the last text found.
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.content = text.replace(['\r', '\n'], " ").into();
         self.selected_range = self.content.len()..self.content.len();
         self.selection_reversed = false;
         self.marked_range = None;
         self.scroll_x = px(0.);
+        self.hold_scroll_start = false;
+        self.undo.clear();
+        self.redo.clear();
+        self.run = None;
         cx.notify();
+    }
+
+    pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
+        self.masked = masked;
+        cx.notify();
+    }
+
+    /// The offset in the text shown of `offset` in the content.
+    fn shown_offset(&self, offset: usize) -> usize {
+        if self.masked {
+            self.content[..offset].chars().count() * MASK.len_utf8()
+        } else {
+            offset
+        }
+    }
+
+    /// The offset in the content of `offset` in the text shown.
+    fn content_offset(&self, offset: usize) -> usize {
+        if !self.masked {
+            return offset;
+        }
+        self.content
+            .char_indices()
+            .nth(offset / MASK.len_utf8())
+            .map_or(self.content.len(), |(index, _)| index)
     }
 
     pub fn set_placeholder(&mut self, placeholder: &str, cx: &mut Context<Self>) {
@@ -173,10 +248,21 @@ impl TextInput {
         cx.notify();
     }
 
+    pub fn focus(&self, window: &mut Window) {
+        window.focus(&self.focus_handle);
+    }
+
+    /// Selects the whole text, showing a long one from its start, as
+    /// Safari's and Chrome's address fields do: an address's scheme and
+    /// host, not the end of its path. The caret is at the end, as after
+    /// any select-all in AppKit, so ⇧← takes back the last character and
+    /// ⇧→ does nothing.
     pub fn select_all_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
         self.selected_range = 0..self.content.len();
         self.selection_reversed = false;
+        self.scroll_x = px(0.);
+        self.hold_scroll_start = true;
         cx.notify();
     }
 
@@ -195,6 +281,86 @@ impl TextInput {
         if self.content != *previous {
             cx.emit(InputEvent::Changed(self.content.to_string()));
         }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            content: self.content.clone(),
+            selected_range: self.selected_range.clone(),
+            selection_reversed: self.selection_reversed,
+        }
+    }
+
+    /// Before an edit of `kind` to `range`: keeps the text for ⌘Z, unless
+    /// the edit continues the run of typing or deleting where it ended.
+    fn begin_edit(&mut self, kind: EditKind, range: &Range<usize>) {
+        let continues = match (kind, self.run) {
+            (EditKind::Typing, Some((EditKind::Typing, caret))) => {
+                self.selected_range.is_empty()
+                    && *range == self.selected_range
+                    && range.start == caret
+            }
+            // Backspace takes the character before the caret, Delete the
+            // one after it.
+            (EditKind::Deleting, Some((EditKind::Deleting, caret))) => {
+                range.end == caret || range.start == caret
+            }
+            _ => false,
+        };
+        if !continues {
+            self.undo.push(self.snapshot());
+            if self.undo.len() > UNDO_LIMIT {
+                self.undo.remove(0);
+            }
+        }
+        self.redo.clear();
+    }
+
+    /// After an edit of `kind`: where its run goes on.
+    fn end_edit(&mut self, kind: EditKind) {
+        self.run = (kind != EditKind::Other).then(|| (kind, self.cursor_offset()));
+    }
+
+    /// ⌘Z, and Edit > Undo, while the field has focus. Neither reaches the
+    /// page then, even with nothing left to undo.
+    fn undo(&mut self, _: &crate::Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.marked_range.is_none()
+            && let Some(snapshot) = self.undo.pop()
+        {
+            self.redo.push(self.snapshot());
+            self.restore(snapshot, cx);
+        }
+    }
+
+    fn redo(&mut self, _: &crate::Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.marked_range.is_none()
+            && let Some(snapshot) = self.redo.pop()
+        {
+            self.undo.push(self.snapshot());
+            self.restore(snapshot, cx);
+        }
+    }
+
+    fn restore(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
+        let previous = std::mem::replace(&mut self.content, snapshot.content);
+        self.selected_range = snapshot.selected_range;
+        self.selection_reversed = snapshot.selection_reversed;
+        self.hold_scroll_start = false;
+        self.run = None;
+        self.emit_changed_since(&previous, cx);
+        cx.notify();
+    }
+
+    /// Replaces the selection with `text` in an edit of `kind`.
+    fn edit_selection(
+        &mut self,
+        kind: EditKind,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.next_edit = kind;
+        self.replace_text_in_range(None, text, window, cx);
     }
 
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
@@ -219,7 +385,12 @@ impl TextInput {
         self.select_to(self.content.len(), cx);
     }
 
+    /// Where ⌥← goes. A password is one word, as in AppKit's secure
+    /// fields: moving by its words would show where its spaces are.
     fn previous_word(&self) -> usize {
+        if self.masked {
+            return 0;
+        }
         self.content[..self.cursor_offset()]
             .unicode_word_indices()
             .next_back()
@@ -227,6 +398,9 @@ impl TextInput {
     }
 
     fn next_word(&self) -> usize {
+        if self.masked {
+            return self.content.len();
+        }
         let cursor = self.cursor_offset();
         self.content[cursor..]
             .unicode_word_indices()
@@ -261,14 +435,14 @@ impl TextInput {
         if self.selected_range.is_empty() {
             self.select_to(self.previous_word(), cx);
         }
-        self.replace_text_in_range(None, "", window, cx);
+        self.edit_selection(EditKind::Other, "", window, cx);
     }
 
     fn delete_to_start(&mut self, _: &DeleteToStart, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             self.select_to(0, cx);
         }
-        self.replace_text_in_range(None, "", window, cx);
+        self.edit_selection(EditKind::Other, "", window, cx);
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -309,17 +483,31 @@ impl TextInput {
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
-            self.select_to(self.previous_boundary(self.cursor_offset()), cx)
-        }
-        self.replace_text_in_range(None, "", window, cx)
+        let caret = self.cursor_offset();
+        self.delete_next_to_caret(self.previous_boundary(caret)..caret, window, cx);
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
-            self.select_to(self.next_boundary(self.cursor_offset()), cx)
+        let caret = self.cursor_offset();
+        self.delete_next_to_caret(caret..self.next_boundary(caret), window, cx);
+    }
+
+    /// Backspace and Delete: a selection goes on its own, else the
+    /// character `beside` the caret, in a run that ⌘Z undoes together.
+    /// The selection isn't extended to it first, so ⌘Z puts the caret
+    /// back where the run began rather than selecting one character.
+    fn delete_next_to_caret(
+        &mut self,
+        beside: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.selected_range.is_empty() || self.marked_range.is_some() {
+            return self.edit_selection(EditKind::Other, "", window, cx);
         }
-        self.replace_text_in_range(None, "", window, cx)
+        self.next_edit = EditKind::Deleting;
+        let beside = self.range_to_utf16(&beside);
+        self.replace_text_in_range(Some(beside), "", window, cx);
     }
 
     fn on_mouse_down(
@@ -335,6 +523,11 @@ impl TextInput {
             self.select_all_focus(window, cx);
             return;
         }
+        // A password's words aren't shown, so a double click takes it all.
+        if event.click_count == 2 && self.masked {
+            self.select_all_focus(window, cx);
+            return;
+        }
         if event.click_count == 2 {
             let offset = self.index_for_mouse_position(event.position);
             if let Some((start, segment)) = self
@@ -344,6 +537,7 @@ impl TextInput {
             {
                 self.selected_range = start..start + segment.len();
                 self.selection_reversed = false;
+                self.hold_scroll_start = false;
                 cx.notify();
                 return;
             }
@@ -377,29 +571,30 @@ impl TextInput {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_text_in_range(None, &text.replace(['\r', '\n'], " "), window, cx);
+            self.edit_selection(EditKind::Other, &one_line(&text), window, cx);
         }
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
+        if !self.selected_range.is_empty() && !self.masked {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
         }
     }
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
+        if !self.selected_range.is_empty() && !self.masked {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
-            self.replace_text_in_range(None, "", window, cx)
+            self.edit_selection(EditKind::Other, "", window, cx)
         }
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
         self.selection_reversed = false;
+        self.hold_scroll_start = false;
         cx.notify()
     }
 
@@ -426,10 +621,11 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left() + self.scroll_x)
+        self.content_offset(line.closest_index_for_x(position.x - bounds.left() + self.scroll_x))
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let before = self.selected_range.clone();
         if self.selection_reversed {
             self.selected_range.start = offset
         } else {
@@ -438,6 +634,10 @@ impl TextInput {
         if self.selected_range.end < self.selected_range.start {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
+        }
+        // ⇧→ at the end of a select-all changes nothing, the view included.
+        if self.selected_range != before {
+            self.hold_scroll_start = false;
         }
         cx.notify()
     }
@@ -549,13 +749,20 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        let kind = std::mem::replace(&mut self.next_edit, EditKind::Typing);
+        // Committed composed text belongs to the edit its composition began.
+        if self.marked_range.is_none() && !(range.is_empty() && new_text.is_empty()) {
+            self.begin_edit(kind, &range);
+        }
         let previous = self.content.clone();
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.selection_reversed = false;
+        self.hold_scroll_start = false;
         self.marked_range.take();
+        self.end_edit(kind);
         self.emit_changed_since(&previous, cx);
         cx.notify();
     }
@@ -574,6 +781,11 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        // A composition (dead keys, input methods) is one edit, from its
+        // first marked text until it is committed.
+        if self.marked_range.is_none() {
+            self.begin_edit(EditKind::Typing, &range);
+        }
         let previous = self.content.clone();
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
@@ -602,6 +814,7 @@ impl EntityInputHandler for TextInput {
             })
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
         self.selection_reversed = false;
+        self.hold_scroll_start = false;
         self.emit_changed_since(&previous, cx);
         cx.notify();
     }
@@ -617,11 +830,13 @@ impl EntityInputHandler for TextInput {
         let range = self.range_from_utf16(&range_utf16);
         Some(Bounds::from_corners(
             point(
-                bounds.left() + last_layout.x_for_index(range.start) - self.scroll_x,
+                bounds.left() + last_layout.x_for_index(self.shown_offset(range.start))
+                    - self.scroll_x,
                 bounds.top(),
             ),
             point(
-                bounds.left() + last_layout.x_for_index(range.end) - self.scroll_x,
+                bounds.left() + last_layout.x_for_index(self.shown_offset(range.end))
+                    - self.scroll_x,
                 bounds.bottom(),
             ),
         ))
@@ -639,7 +854,8 @@ impl EntityInputHandler for TextInput {
         if self.content.is_empty() {
             return Some(0);
         }
-        let utf8_index = last_layout.closest_index_for_x(line_point.x + self.scroll_x);
+        let utf8_index =
+            self.content_offset(last_layout.closest_index_for_x(line_point.x + self.scroll_x));
         Some(self.offset_to_utf16(utf8_index))
     }
 }
@@ -699,12 +915,16 @@ impl Element for TextElement {
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
         let content = input.content.clone();
-        let selected_range = input.selected_range.clone();
-        let cursor = input.cursor_offset();
+        let selected_range = input.shown_offset(input.selected_range.start)
+            ..input.shown_offset(input.selected_range.end);
+        let cursor = input.shown_offset(input.cursor_offset());
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() {
             (input.placeholder.clone(), input.style.placeholder)
+        } else if input.masked {
+            let bullets = MASK.to_string().repeat(content.chars().count());
+            (bullets.into(), style.color)
         } else {
             (content, style.color)
         };
@@ -717,7 +937,11 @@ impl Element for TextElement {
             underline: None,
             strikethrough: None,
         };
-        let runs = if let Some(marked_range) = input.marked_range.as_ref() {
+        let marked_range = input
+            .marked_range
+            .as_ref()
+            .map(|range| input.shown_offset(range.start)..input.shown_offset(range.end));
+        let runs = if let Some(marked_range) = marked_range.as_ref() {
             vec![
                 TextRun {
                     len: marked_range.start,
@@ -751,7 +975,9 @@ impl Element for TextElement {
 
         let cursor_pos = line.x_for_index(cursor);
         let visible_width = (bounds.size.width - px(2.)).max(px(0.));
-        let scroll_x = if input.focus_handle.is_focused(window) {
+        let scroll_x = if input.hold_scroll_start {
+            px(0.)
+        } else if input.focus_handle.is_focused(window) {
             let mut scroll = input.scroll_x;
             if cursor_pos < scroll {
                 scroll = cursor_pos;
@@ -869,6 +1095,8 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::select_word_right))
             .on_action(cx.listener(Self::delete_word_left))
             .on_action(cx.listener(Self::delete_to_start))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -880,6 +1108,32 @@ impl Render for TextInput {
             .line_height(self.style.line_height)
             .text_size(self.style.font_size)
             .child(TextElement { input: cx.entity() })
+    }
+}
+
+/// Pasted text on one line. Line breaks go, with the spaces around them,
+/// when the lines then make one address, as a link wrapped by a mail or
+/// chat app does ("https://example.com/very/long/", "path/to/page");
+/// between words they become spaces. So do tabs, which a field would show
+/// as a wide gap.
+fn one_line(text: &str) -> String {
+    let text = text.replace('\t', " ");
+    if !text.contains(['\r', '\n']) {
+        return text;
+    }
+    let lines: Vec<&str> = text
+        .split(['\r', '\n'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let joined = lines.concat();
+    if lines.len() > 1
+        && !joined.contains(char::is_whitespace)
+        && !crate::model::is_search_query(&joined)
+    {
+        joined
+    } else {
+        lines.join(" ")
     }
 }
 

@@ -1,26 +1,35 @@
-//! This session's downloads (kept in memory only): the progress ring on the
-//! library button, the library's Downloads section, the "Downloaded"
-//! toast, and the question before quitting cancels unfinished ones. The
-//! ring moves only when the engine reports progress.
+//! Downloads: the progress ring on the library button, the library's
+//! Downloads section, the toasts when one ends, and the question before
+//! quitting cancels unfinished ones. Running downloads can be cancelled and
+//! stopped ones downloaded again, in the space they came from. The library
+//! keeps the last few after a restart. The ring moves only when the engine
+//! reports progress.
 
 use super::{
+    elide::Cut,
     icons::{Icon, icon},
+    menu::MenuKind,
     shadow,
     theme::Theme,
+    toast_window::{Subject, ToastKind},
 };
 use crate::{
     app::BrowserApp,
-    model::{Pin, TabId},
+    engine::{DownloadEnd, page::elide_middle},
+    model::{DOWNLOAD_LIMIT, Pin, SavedDownload, SpaceId, TabId, download_source},
     native,
 };
 use gpui::{
-    App, Bounds, Context, Div, Hsla, ParentElement, PathBuilder, Pixels, PromptLevel, SharedString,
-    Styled, Window, WindowHandle, canvas, div, point, px,
+    App, Bounds, Context, Div, FontWeight, Hsla, ParentElement, PathBuilder, Pixels, PromptLevel,
+    SharedString, Styled, Window, WindowHandle, canvas, div, point, px,
 };
-use std::{f32::consts::TAU, path::PathBuf};
+use std::{collections::HashMap, f32::consts::TAU, path::PathBuf};
 
-/// Downloads the library lists, newest first.
-const LIBRARY_LIMIT: usize = 5;
+pub use crate::model::DownloadState;
+
+/// Downloads kept from the last session are numbered from here, far above
+/// the engine's own numbers, which start at 1 at every launch.
+const RESTORED_IDS: u64 = 1 << 48;
 /// The badge over the library button's top-right corner (arc-design.md,
 /// image 20), in bottom bar coordinates.
 const BADGE_SIZE: f32 = 18.;
@@ -30,34 +39,70 @@ const RING_WIDTH: f32 = 1.75;
 /// Without a size, the ring shows a quarter arc that steps on by an
 /// eighth of a turn for every this many bytes.
 const UNKNOWN_SIZE_STEP: u64 = 256 * 1024;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DownloadState {
-    Running,
-    Done,
-    Failed,
-}
+/// File names in the question before quitting keep this many characters
+/// at most, their end included. Toasts cut them to the room they have.
+const NAME_CHARS: usize = 40;
 
 pub struct Download {
     pub id: u64,
-    pub tab_id: TabId,
+    /// The tab whose browser downloads it, this session.
+    pub tab_id: Option<TabId>,
+    /// The space whose profile it downloads with.
+    pub space_id: Option<SpaceId>,
     pub name: SharedString,
     pub path: PathBuf,
+    pub url: String,
     pub received: u64,
     pub total: Option<u64>,
     pub state: DownloadState,
+    /// Why it failed, in a few words.
+    pub error: Option<String>,
+    /// Done, but no longer where it was saved (checked as the library
+    /// opens).
+    pub missing: bool,
 }
 
 impl Download {
-    /// What the library shows beside the name: progress, or a failure.
-    pub fn status(&self) -> Option<String> {
+    /// The line under the name in the library: progress, or how it ended.
+    pub fn status(&self) -> String {
         match self.state {
-            DownloadState::Running => Some(match self.total {
-                Some(total) => format!("{}%", (self.received * 100 / total.max(1)).min(100)),
+            DownloadState::Running => match self.total {
+                Some(total) => format!(
+                    "{}% of {}",
+                    (self.received * 100 / total.max(1)).min(100),
+                    file_size(total)
+                ),
                 None => file_size(self.received),
-            }),
-            DownloadState::Done => None,
-            DownloadState::Failed => Some("Failed".into()),
+            },
+            DownloadState::Done if self.missing => "Moved or deleted".to_owned(),
+            DownloadState::Done => match self.total {
+                Some(size) => format!("Done — {}", file_size(size)),
+                None => "Done".to_owned(),
+            },
+            DownloadState::Failed => match &self.error {
+                Some(error) => format!("Failed — {error}"),
+                None => "Failed".to_owned(),
+            },
+            DownloadState::Cancelled => "Cancelled".to_owned(),
+        }
+    }
+
+    /// Whether it stopped before the end and can be downloaded again.
+    pub fn can_retry(&self) -> bool {
+        matches!(self.state, DownloadState::Failed | DownloadState::Cancelled)
+            && !self.url.is_empty()
+            && self.space_id.is_some()
+    }
+
+    fn saved(&self) -> SavedDownload {
+        SavedDownload {
+            name: self.name.to_string(),
+            path: self.path.clone(),
+            url: self.url.clone(),
+            space_id: self.space_id,
+            state: self.state,
+            size: self.total.filter(|_| self.state == DownloadState::Done),
+            error: self.error.clone(),
         }
     }
 }
@@ -68,6 +113,12 @@ pub struct Downloads {
     items: Vec<Download>,
     /// Whether the question before quitting is on screen.
     asking_to_quit: bool,
+    /// A download failed since the library was last open: the badge on its
+    /// button says so.
+    failure_unseen: bool,
+    /// Downloads again waiting in a blank tab of their own, by tab: the row
+    /// each replaces once it starts, and the address.
+    retries: HashMap<TabId, (u64, String)>,
 }
 
 /// The ring: `start` and `length` in turns, clockwise from 12 o'clock.
@@ -78,17 +129,58 @@ pub struct RingArc {
 }
 
 impl Downloads {
-    pub fn start(&mut self, id: u64, tab_id: TabId, name: String, path: PathBuf) {
+    /// The library as the last session saved it.
+    pub fn restore(saved: &[SavedDownload]) -> Self {
+        let items = (RESTORED_IDS..)
+            .zip(saved)
+            .map(|(id, saved)| Download {
+                id,
+                tab_id: None,
+                space_id: saved.space_id,
+                name: saved.name.clone().into(),
+                path: saved.path.clone(),
+                url: saved.url.clone(),
+                received: saved.size.unwrap_or(0),
+                total: saved.size,
+                state: saved.state,
+                error: saved.error.clone(),
+                missing: saved.state == DownloadState::Done && !saved.path.exists(),
+            })
+            .collect();
+        Self {
+            items,
+            ..Self::default()
+        }
+    }
+
+    /// What to save of the library.
+    pub fn saved(&self) -> Vec<SavedDownload> {
+        self.items.iter().map(Download::saved).collect()
+    }
+
+    pub fn start(
+        &mut self,
+        id: u64,
+        tab_id: TabId,
+        space_id: Option<SpaceId>,
+        name: String,
+        path: PathBuf,
+        url: String,
+    ) {
         self.items.insert(
             0,
             Download {
                 id,
-                tab_id,
+                tab_id: Some(tab_id),
+                space_id,
                 name: name.into(),
                 path,
+                url,
                 received: 0,
                 total: None,
                 state: DownloadState::Running,
+                error: None,
+                missing: false,
             },
         );
     }
@@ -97,8 +189,12 @@ impl Downloads {
         self.items.iter_mut().find(|download| download.id == id)
     }
 
+    /// Progress of a running download; false for any other.
     pub fn progress(&mut self, id: u64, received: u64, total: Option<u64>) -> bool {
-        let Some(download) = self.get_mut(id) else {
+        let Some(download) = self
+            .get_mut(id)
+            .filter(|download| download.state == DownloadState::Running)
+        else {
             return false;
         };
         download.received = received;
@@ -106,34 +202,105 @@ impl Downloads {
         true
     }
 
-    pub fn finish(&mut self, id: u64, ok: bool) -> Option<&Download> {
-        let download = self.get_mut(id)?;
-        download.state = if ok {
-            DownloadState::Done
-        } else {
-            DownloadState::Failed
-        };
-        Some(download)
+    /// Ends a running download: its name and the tab whose browser it
+    /// kept, read before the list is trimmed, which may drop it. `None` if
+    /// it wasn't running (a cancel that crossed its last step).
+    pub fn finish(&mut self, id: u64, end: &DownloadEnd) -> Option<(SharedString, Option<TabId>)> {
+        let download = self
+            .get_mut(id)
+            .filter(|download| download.state == DownloadState::Running)?;
+        match *end {
+            DownloadEnd::Complete { size } => {
+                download.state = DownloadState::Done;
+                download.received = size;
+                download.total = Some(size);
+            }
+            DownloadEnd::Cancelled => download.state = DownloadState::Cancelled,
+            DownloadEnd::Failed { reason } => {
+                download.state = DownloadState::Failed;
+                download.error = reason.map(str::to_owned);
+            }
+        }
+        let ended = (download.name.clone(), download.tab_id);
+        if download.state == DownloadState::Failed {
+            self.failure_unseen = true;
+        }
+        self.trim();
+        Some(ended)
+    }
+
+    /// Keeps every running download and the `DOWNLOAD_LIMIT` newest others.
+    fn trim(&mut self) {
+        let mut others = 0;
+        self.items.retain(|download| {
+            if download.state == DownloadState::Running {
+                return true;
+            }
+            others += 1;
+            others <= DOWNLOAD_LIMIT
+        });
     }
 
     pub fn get(&self, id: u64) -> Option<&Download> {
         self.items.iter().find(|download| download.id == id)
     }
 
+    /// Takes a download off the list; one still running stays.
+    fn remove(&mut self, id: u64) -> bool {
+        let before = self.items.len();
+        self.items
+            .retain(|download| download.id != id || download.state == DownloadState::Running);
+        self.items.len() != before
+    }
+
+    /// Takes every download that ended off the list. True if any did.
+    fn clear_finished(&mut self) -> bool {
+        let before = self.items.len();
+        self.items
+            .retain(|download| download.state == DownloadState::Running);
+        self.items.len() != before
+    }
+
+    /// Whether the list has downloads that ended, which Clear Downloads
+    /// takes off it.
+    pub fn any_finished(&self) -> bool {
+        self.items
+            .iter()
+            .any(|download| download.state != DownloadState::Running)
+    }
+
     /// Whether a download started in the tab still runs: the tab's
     /// browser must stay open until it ends, or its progress goes unheard.
     pub fn running_in(&self, tab_id: TabId) -> bool {
-        self.running().any(|download| download.tab_id == tab_id)
+        self.running()
+            .any(|download| download.tab_id == Some(tab_id))
     }
 
-    pub fn recent(&self) -> impl Iterator<Item = &Download> {
-        self.items.iter().take(LIBRARY_LIMIT)
+    /// The library's list: running downloads first, then the others,
+    /// newest first.
+    pub fn listed(&self) -> impl Iterator<Item = &Download> {
+        self.running().chain(
+            self.items
+                .iter()
+                .filter(|download| download.state != DownloadState::Running),
+        )
     }
 
     fn running(&self) -> impl Iterator<Item = &Download> {
         self.items
             .iter()
             .filter(|download| download.state == DownloadState::Running)
+    }
+
+    /// The library opened: files moved or deleted since are noted, and a
+    /// failure is no longer news.
+    pub fn library_opened(&mut self) {
+        self.failure_unseen = false;
+        for download in &mut self.items {
+            if download.state == DownloadState::Done {
+                download.missing = !download.path.exists();
+            }
+        }
     }
 
     /// All running downloads together, or `None` when none runs.
@@ -163,6 +330,30 @@ impl Downloads {
             }
         })
     }
+
+    /// The ring as one line, for showing over the page while the sidebar
+    /// is hidden: "Downloading report.pdf — 35%", and the name, which is
+    /// cut to the room there is. The percentage is padded to the width of
+    /// "100%", so the line keeps its width as it counts up.
+    fn summary(&self) -> Option<(String, Subject)> {
+        let mut running = self.running();
+        let first = running.next()?;
+        let count = 1 + running.count();
+        let what = if count == 1 {
+            first.name.to_string()
+        } else {
+            format!("{count} files")
+        };
+        let ring = self.ring()?;
+        let tail = if ring.start == 0. {
+            // U+2007, a space as wide as a figure.
+            let percent = format!("{}%", (ring.length * 100.).round());
+            format!(" — {percent:\u{2007}<4}")
+        } else {
+            "…".to_owned()
+        };
+        Some(Subject::compose("Downloading ", &what, &tail, Cut::Middle))
+    }
 }
 
 /// ⌘Q, Map > Quit Map and the window's close button: quits, but asks first
@@ -185,29 +376,30 @@ fn file_size(bytes: u64) -> String {
 }
 
 impl BrowserApp {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn download_started(
         &mut self,
         id: u64,
         tab_id: TabId,
         name: String,
         path: PathBuf,
+        url: String,
         blank_tab: bool,
         cx: &mut Context<Self>,
     ) {
-        // Without the sidebar's ring, nothing would show it started.
-        if self.sidebar_width().is_none() {
-            self.show_toast(format!("Downloading {name}"), cx);
+        let space_id = self.state.space_of_tab(tab_id);
+        self.downloads
+            .start(id, tab_id, space_id, name, path, download_source(&url));
+        // A download again in a tab of its own takes its row's place now.
+        if let Some((replaced, _)) = self.downloads.retries.remove(&tab_id) {
+            self.downloads.remove(replaced);
         }
-        self.downloads.start(id, tab_id, name, path);
         // A link that opened a new tab for a file leaves it blank: close it
         // (it isn't worth reopening) and go back to the page with the link,
         // in its own space: the window stays in the space on screen. Its
         // browser stays until the download ends.
         if blank_tab
-            && let Some(space) = self
-                .state
-                .space_of_tab(tab_id)
-                .and_then(|id| self.state.space(id))
+            && let Some(space) = space_id.and_then(|id| self.state.space(id))
             && space
                 .tabs
                 .iter()
@@ -223,14 +415,23 @@ impl BrowserApp {
             self.remove_tab(tab_id, cx);
             self.state.forget_closed(tab_id);
         }
-        if self.downloads_shown() {
+        self.save_downloads(cx);
+        self.downloads_changed(cx);
+    }
+
+    /// Redraws for a change to running downloads: the ring, the library,
+    /// or with the sidebar hidden their line over the page. A page in
+    /// fullscreen shows none of them.
+    fn downloads_changed(&self, cx: &mut Context<Self>) {
+        if !self.fullscreen || self.menu.is_some() {
             cx.notify();
         }
     }
 
-    /// Whether downloads are on screen: the ring, or the library.
-    fn downloads_shown(&self) -> bool {
-        self.sidebar_width().is_some() || self.menu.is_some()
+    fn save_downloads(&mut self, cx: &mut Context<Self>) {
+        if self.state.set_downloads(self.downloads.saved()) {
+            self.persist_later(cx);
+        }
     }
 
     pub(crate) fn download_progress(
@@ -240,50 +441,156 @@ impl BrowserApp {
         total: Option<u64>,
         cx: &mut Context<Self>,
     ) {
-        if self.downloads.progress(id, received, total) && self.downloads_shown() {
-            cx.notify();
+        if self.downloads.progress(id, received, total) {
+            self.downloads_changed(cx);
         }
     }
 
-    pub(crate) fn download_finished(&mut self, id: u64, ok: bool, cx: &mut Context<Self>) {
-        let Some(download) = self.downloads.finish(id, ok) else {
+    pub(crate) fn download_finished(&mut self, id: u64, end: DownloadEnd, cx: &mut Context<Self>) {
+        let Some((name, tab_id)) = self.downloads.finish(id, &end) else {
             return;
         };
-        let (name, tab_id) = (download.name.clone(), download.tab_id);
-        // A tab closed or unloaded during the download kept its browser.
-        if !self.downloads.running_in(tab_id)
+        // A tab closed or unloaded during the download kept its browser,
+        // also when the download itself just left the list.
+        if let Some(tab_id) = tab_id
+            && !self.downloads.running_in(tab_id)
             && !self.is_loaded(tab_id)
             && self.engine.borrow().has_tab(tab_id)
         {
             self.engine.borrow_mut().close_tab(tab_id);
         }
-        if ok {
-            self.show_toast(format!("Downloaded {name}"), cx);
-        } else if self.downloads_shown() {
+        // The open library shows a failure as it happens: it is no news.
+        if self
+            .menu
+            .as_ref()
+            .is_some_and(|menu| menu.kind == MenuKind::Library)
+        {
+            self.downloads.failure_unseen = false;
+        }
+        self.save_downloads(cx);
+        match end {
+            DownloadEnd::Complete { .. } => {
+                self.show_toast_about(ToastKind::Done, "Downloaded ", &name, Cut::Middle, cx)
+            }
+            DownloadEnd::Failed { .. } => self.show_toast_about(
+                ToastKind::Failed,
+                "Couldn't download ",
+                &name,
+                Cut::Middle,
+                cx,
+            ),
+            // Cancelled from the library, which shows it.
+            DownloadEnd::Cancelled => self.downloads_changed(cx),
+        }
+    }
+
+    /// The library's ×: stops a running download. The engine reports the
+    /// end, which the row then shows.
+    pub fn cancel_download(&mut self, id: u64) {
+        self.engine.borrow().cancel_download(id);
+    }
+
+    /// Downloads a failed or cancelled file again, with the profile of the
+    /// space it came from: through a page of that space that is open, else
+    /// through a blank tab of its own that closes once the download starts.
+    /// The new download takes the old one's place at the top of the list.
+    pub fn retry_download(&mut self, id: u64, cx: &mut Context<Self>) {
+        // A retry whose tab closed before its download started is over.
+        let over: Vec<TabId> = (self.downloads.retries.keys())
+            .copied()
+            .filter(|&tab| !self.is_loaded(tab))
+            .collect();
+        for tab in over {
+            self.downloads.retries.remove(&tab);
+        }
+        let Some(download) = self
+            .downloads
+            .get(id)
+            .filter(|download| download.can_retry())
+            .filter(|_| !self.downloads.retries.values().any(|&(row, _)| row == id))
+        else {
+            return;
+        };
+        let (url, origin_tab) = (download.url.clone(), download.tab_id);
+        let Some(space_id) = download
+            .space_id
+            .filter(|&space_id| self.state.space(space_id).is_some())
+        else {
+            return self.show_toast_kind(ToastKind::Failed, "Its space was deleted", cx);
+        };
+        let open_tab = origin_tab
+            .filter(|&tab| self.state.space_of_tab(tab) == Some(space_id))
+            .into_iter()
+            .chain(
+                self.state
+                    .space(space_id)
+                    .into_iter()
+                    .flat_map(|space| space.tabs.iter().map(|tab| tab.id)),
+            )
+            .find(|&tab| self.is_loaded(tab));
+        if open_tab.is_some_and(|tab| self.engine.borrow().start_download(tab, &url)) {
+            self.downloads.remove(id);
+            self.save_downloads(cx);
             cx.notify();
+            return;
+        }
+        // Loading the address would show a picture or a PDF instead of
+        // downloading it: the tab's browser starts blank, and downloads once
+        // it is ready (`start_retry`). The row stays until it starts.
+        let Some(tab) = self.state.new_background_tab(space_id, &url) else {
+            return;
+        };
+        self.downloads.retries.insert(tab, (id, url));
+        self.load_tab_at(tab, "about:blank");
+        self.persist_later(cx);
+        cx.notify();
+    }
+
+    /// A tab's browser is ready: a download again waiting for it starts.
+    /// One that can't start leaves its row to be retried again.
+    pub(crate) fn start_retry(&mut self, tab_id: TabId) {
+        let started = self
+            .downloads
+            .retries
+            .get(&tab_id)
+            .map(|(_, url)| self.engine.borrow().start_download(tab_id, url));
+        if started == Some(false) {
+            self.downloads.retries.remove(&tab_id);
         }
     }
 
     /// Asks whether to quit while downloads run (a sheet on macOS), and
     /// quits if so. Returns false when there is nothing to ask.
     fn ask_before_quitting(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let running = self.downloads.running().count();
-        if running == 0 {
+        let running: Vec<&Download> = self.downloads.running().collect();
+        let Some(first) = running.first() else {
             return false;
-        }
+        };
+        let (title, detail) = if running.len() == 1 {
+            (
+                "A download is in progress — Quit anyway?",
+                format!(
+                    "Quitting cancels “{}”, which hasn't finished downloading.",
+                    elide_middle(&first.name, NAME_CHARS)
+                ),
+            )
+        } else {
+            (
+                "Downloads in progress — Quit anyway?",
+                format!(
+                    "Quitting cancels the {} downloads that haven't finished.",
+                    running.len()
+                ),
+            )
+        };
         // Asked once: quitting again while it shows does nothing more.
         if std::mem::replace(&mut self.downloads.asking_to_quit, true) {
             return true;
         }
-        let detail = if running == 1 {
-            "Quitting cancels the download that hasn't finished.".to_owned()
-        } else {
-            format!("Quitting cancels the {running} downloads that haven't finished.")
-        };
         window.activate_window();
         let answer = window.prompt(
             PromptLevel::Warning,
-            "Downloads in progress — Quit anyway?",
+            title,
             Some(&detail),
             &["Quit", "Cancel"],
             cx,
@@ -293,6 +600,13 @@ impl BrowserApp {
             let _ = this.update(cx, |this, cx| {
                 this.downloads.asking_to_quit = false;
                 if quit {
+                    // Saved as cancelled, as quitting cancels them.
+                    for download in &mut this.downloads.items {
+                        if download.state == DownloadState::Running {
+                            download.state = DownloadState::Cancelled;
+                        }
+                    }
+                    this.state.set_downloads(this.downloads.saved());
                     cx.quit();
                 }
             });
@@ -301,20 +615,70 @@ impl BrowserApp {
         true
     }
 
-    /// Shows a download in Finder, selected.
+    /// Shows a finished download in Finder, selected.
     pub fn reveal_download(&self, id: u64) {
         if let Some(download) = self.downloads.get(id) {
             native::reveal_in_finder(&download.path);
         }
     }
 
-    /// The progress ring over the library button while files download.
+    /// Opens a finished download with its app, as a double click in Finder
+    /// does; macOS checks a downloaded app before it runs.
+    pub fn open_download(&self, id: u64) {
+        if let Some(download) = self.downloads.get(id) {
+            native::open_file(&download.path);
+        }
+    }
+
+    /// Takes a download that ended off the library's list; the file stays.
+    pub fn remove_download(&mut self, id: u64, cx: &mut Context<Self>) {
+        if self.downloads.remove(id) {
+            self.save_downloads(cx);
+            cx.notify();
+        }
+    }
+
+    /// Clear Downloads, and Clear History: takes every download that ended
+    /// off the list, with the address it came from. Files stay where they
+    /// are, and running downloads go on.
+    pub fn clear_downloads(&mut self, cx: &mut Context<Self>) {
+        if self.downloads.clear_finished() {
+            self.downloads.failure_unseen = false;
+            self.save_downloads(cx);
+            cx.notify();
+        }
+    }
+
+    /// The library is opening.
+    pub(crate) fn library_opened(&mut self) {
+        self.downloads.library_opened();
+    }
+
+    /// Running downloads as a line over the page, while the hidden sidebar
+    /// can't show their ring, and the file name in it, which may be cut.
+    pub(crate) fn downloads_over_card(&self) -> Option<(SharedString, Subject)> {
+        self.downloads
+            .summary()
+            .map(|(text, subject)| (text.into(), subject))
+    }
+
+    /// The progress ring over the library button while files download, or
+    /// a red one with "!" after a download failed, until the library opens.
     pub(super) fn render_download_badge(&self, theme: &Theme) -> Option<Div> {
-        let arc = self.downloads.ring()?;
-        let (track, fill) = (
-            theme.ink(if theme.dark { 0.18 } else { 0.12 }),
-            theme.focus(),
-        );
+        let ring = self.downloads.ring();
+        let failed = ring.is_none() && self.downloads.failure_unseen;
+        let arc = ring.or(failed.then_some(RingArc {
+            start: 0.,
+            length: 1.,
+        }))?;
+        let (track, fill) = if failed {
+            (theme.error().opacity(0.25), theme.error())
+        } else {
+            (
+                theme.ink(if theme.dark { 0.18 } else { 0.12 }),
+                theme.focus(),
+            )
+        };
         Some(
             div()
                 .absolute()
@@ -335,7 +699,16 @@ impl BrowserApp {
                     .absolute()
                     .size_full(),
                 )
-                .child(icon(Icon::ArrowDown, 10., fill)),
+                .child(if failed {
+                    div()
+                        .text_size(px(11.))
+                        .line_height(px(12.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(fill)
+                        .child("!")
+                } else {
+                    div().child(icon(Icon::ArrowDown, 10., fill))
+                }),
         )
     }
 }
@@ -379,21 +752,25 @@ mod tests {
     fn downloads(sizes: &[(u64, Option<u64>)]) -> Downloads {
         let mut downloads = Downloads::default();
         for (id, &(received, total)) in (1..).zip(sizes) {
-            downloads.start(id, 7, format!("{id}.zip"), PathBuf::from("/tmp"));
+            let name = format!("{id}.zip");
+            downloads.start(id, 7, None, name, PathBuf::from("/tmp"), String::new());
             downloads.progress(id, received, total);
         }
         downloads
     }
+
+    const DONE: DownloadEnd = DownloadEnd::Complete { size: 5 };
+    const FAILED: DownloadEnd = DownloadEnd::Failed { reason: None };
 
     #[test]
     fn the_ring_adds_up_running_downloads() {
         assert_eq!(Downloads::default().ring(), None);
         let mut both = downloads(&[(30, Some(100)), (10, Some(100))]);
         assert_eq!(both.ring().unwrap().length, 0.2);
-        both.finish(1, true);
+        both.finish(1, &DONE);
         assert_eq!(both.ring().unwrap().length, 0.1);
         assert!(both.running_in(7));
-        both.finish(2, false);
+        both.finish(2, &FAILED);
         assert_eq!(both.ring(), None);
         assert!(!both.running_in(7));
         // Just started: a sliver, not nothing.
@@ -422,15 +799,15 @@ mod tests {
     fn statuses_show_progress_or_failure() {
         let mut list = downloads(&[(420, Some(1000)), (12_345_678, None), (5, Some(5))]);
         let status = |list: &Downloads, id| list.get(id).unwrap().status();
-        assert_eq!(status(&list, 1).as_deref(), Some("42%"));
-        assert_eq!(status(&list, 2).as_deref(), Some("12.3 MB"));
-        list.finish(3, true);
-        list.finish(2, false);
-        assert_eq!(status(&list, 3), None);
-        assert_eq!(status(&list, 2).as_deref(), Some("Failed"));
-        // Newest first.
-        let ids: Vec<u64> = list.recent().map(|download| download.id).collect();
-        assert_eq!(ids, [3, 2, 1]);
+        assert_eq!(status(&list, 1), "42% of 1 KB");
+        assert_eq!(status(&list, 2), "12.3 MB");
+        list.finish(3, &DONE);
+        list.finish(2, &FAILED);
+        assert_eq!(status(&list, 3), "Done — 1 KB");
+        assert_eq!(status(&list, 2), "Failed");
+        // Running first, then newest first.
+        let ids: Vec<u64> = list.listed().map(|download| download.id).collect();
+        assert_eq!(ids, [1, 3, 2]);
     }
 
     #[test]

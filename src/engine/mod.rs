@@ -33,9 +33,11 @@ pub enum Shortcut {
     NextTab,
     /// ⌃⇧Tab
     PreviousTab,
-    /// ⌥⌘↓: the next tab in sidebar order.
+    /// ⌃Esc, while ⌃ is held for a ⌃Tab walk: the walk ends where it began.
+    CancelTabSwitch,
+    /// ⌥⌘↓ or ⇧⌘]: the next tab in sidebar order.
     NextTabInList,
-    /// ⌥⌘↑: the previous tab in sidebar order.
+    /// ⌥⌘↑ or ⇧⌘[: the previous tab in sidebar order.
     PreviousTabInList,
     /// ⌘1–⌘9, 1-based.
     SelectTab(u8),
@@ -77,6 +79,12 @@ pub enum Shortcut {
     FindPrevious,
     /// ⌘P: print the page.
     Print,
+    /// ⌘Y: the visited pages, in the command bar. Web apps such as Google
+    /// Docs redo with it, so a focused page gets it first.
+    History,
+    /// ⇧F10 or the context-menu key: the selected tab's menu, as a
+    /// right-click on its row would open.
+    TabMenu,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -152,10 +160,12 @@ pub enum EngineEvent {
         png: Vec<u8>,
     },
     /// A main-frame load failed. `url` is the address that failed: failed
-    /// loads never report it as `Address`.
+    /// loads never report it as `Address`. `code` is Chromium's net error
+    /// (-105 for ERR_NAME_NOT_RESOLVED), `message` its name.
     LoadError {
         tab_id: u64,
         url: String,
+        code: i32,
         message: String,
     },
     /// A page asked for a new tab: a popup, a ⌘-, ⇧- or middle-click, or the
@@ -174,8 +184,15 @@ pub enum EngineEvent {
         tab_id: u64,
         fullscreen: bool,
     },
-    /// Text to put on the clipboard ("Copy Link Address").
-    CopyText(String),
+    /// An address to put on the clipboard, from the page menu's Copy Link
+    /// Address, or Copy Image Address when `image`.
+    CopyText {
+        text: String,
+        image: bool,
+    },
+    /// An image to put on the clipboard, as PNG ("Copy Image"); none if it
+    /// couldn't be fetched.
+    CopyImage(Option<Vec<u8>>),
     /// A mouse button went down on the page. It takes keyboard focus, and
     /// the shell's popovers close as they would on any press outside them.
     /// Only macOS reports it; elsewhere the shell draws the whole window.
@@ -200,15 +217,17 @@ pub enum EngineEvent {
         final_update: bool,
     },
     /// A download started, saved straight to `path` in the Downloads
-    /// folder. `blank_tab`: the tab never showed a page (a link that opened
-    /// a new tab for the file), so it has nothing to keep it open for.
-    /// Events stop once the tab's browser closes: keep it until the
-    /// download finishes.
+    /// folder. `url` is where it comes from, before any redirect, for
+    /// downloading it again. `blank_tab`: the tab never showed a page (a
+    /// link that opened a new tab for the file), so it has nothing to keep
+    /// it open for. Events stop once the tab's browser closes: keep it
+    /// until the download finishes.
     DownloadStarted {
         id: u64,
         tab_id: u64,
         name: String,
         path: PathBuf,
+        url: String,
         blank_tab: bool,
     },
     /// Bytes received so far, coalesced to steps of 5 % or one second.
@@ -217,10 +236,10 @@ pub enum EngineEvent {
         received: u64,
         total: Option<u64>,
     },
-    /// The download completed (`ok`), was cancelled or failed.
+    /// The download completed, was cancelled or failed.
     DownloadFinished {
         id: u64,
-        ok: bool,
+        end: DownloadEnd,
     },
     /// A page asks to use `permissions` (sorted, without repeats). Answer
     /// once with `Engine::respond_permission`.
@@ -247,17 +266,187 @@ pub enum EngineEvent {
         tab_id: u64,
         text: String,
     },
+    /// A site or a proxy asks for a username and password (HTTP Basic or
+    /// Digest sign-in). `host` and `port` are the server's, or the proxy's;
+    /// `realm` names what the sign-in is for and may be empty; `secure` is
+    /// false when the password would cross the network unencrypted;
+    /// `auth_scheme` is how it is sent ("basic", "digest"). Answer once
+    /// with `Engine::respond_sign_in`.
+    SignInRequest {
+        id: u64,
+        tab_id: u64,
+        host: String,
+        port: u16,
+        realm: String,
+        proxy: bool,
+        secure: bool,
+        auth_scheme: String,
+    },
+    /// The certificate of `url`, which the tab is loading, didn't verify.
+    /// `code` is the net error (-202 for ERR_CERT_AUTHORITY_INVALID). The
+    /// load waits for `Engine::respond_certificate`.
+    CertificateError {
+        id: u64,
+        tab_id: u64,
+        url: String,
+        code: i32,
+    },
+    /// The page asks before it is left ("Leave site?"): it has a
+    /// beforeunload handler and unsaved changes. `closing` when the tab is
+    /// closing (`Engine::close_tab_asking`), else a navigation or, with
+    /// `reload`, a reload waits. Answer once with `Engine::respond_leave`.
+    LeavePage {
+        id: u64,
+        tab_id: u64,
+        closing: bool,
+        reload: bool,
+    },
+    /// A sign-in, certificate or leave request ended unanswered: the page
+    /// went elsewhere, crashed or closed.
+    RequestDismissed {
+        id: u64,
+    },
+    /// The tab's page crashed: its view shows nothing until
+    /// `Engine::reload` starts it again.
+    Crashed {
+        tab_id: u64,
+        reason: CrashReason,
+    },
+    /// The tab's page hasn't handled input for 15 seconds. Answer with
+    /// `Engine::respond_unresponsive`; it asks again if waiting didn't help.
+    Unresponsive {
+        tab_id: u64,
+    },
+    /// The page that wasn't responding responds again.
+    Responsive {
+        tab_id: u64,
+    },
+    /// The page tried to open `url` in a pop-up or tab without a click,
+    /// and it was blocked. `url` is empty unless a tab could show it (see
+    /// `opens_in_tab`).
+    PopupBlocked {
+        tab_id: u64,
+        url: String,
+    },
+    /// Whether the page's audio and video elements play sound.
+    Audible {
+        tab_id: u64,
+        audible: bool,
+    },
+    /// The page started or stopped using the camera or the screen
+    /// (`video`) and the microphone (`audio`).
+    MediaAccess {
+        tab_id: u64,
+        video: bool,
+        audio: bool,
+    },
 }
 
-/// Something a page asks permission to use.
+/// Why a page's renderer ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Previews crash for one reason only.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub enum CrashReason {
+    /// It crashed, or something ended it.
+    Crashed,
+    /// It ran out of memory.
+    OutOfMemory,
+}
+
+/// Whether a load may continue past the certificate error `code`, as
+/// Chrome allows: not for revoked, malformed or pinned certificates, known
+/// interception software, nor errors that aren't about the certificate.
+pub fn certificate_error_overridable(code: i32) -> bool {
+    // ERR_CERT_COMMON_NAME_INVALID (-200) up to ERR_CERT_END (-219), less
+    // CONTAINS_ERRORS (-203), REVOKED (-206), INVALID (-207) and
+    // KNOWN_INTERCEPTION_BLOCKED (-217).
+    (-218..=-200).contains(&code) && ![-203, -206, -207, -217].contains(&code)
+}
+
+/// Whether the certificate warning for `url` may offer to continue past the
+/// error `code`. Chrome refuses whenever the host uses HSTS or is pinned,
+/// which CEF 152 doesn't tell its handler (`OnCertificateError` gets no
+/// `strict_enforcement`, and `CefSSLInfo` only the certificate's status), so
+/// only hosts no preload list can hold may continue: IP addresses, whose
+/// HSTS headers Chromium ignores, localhost names, whose headers it ignores
+/// too, and local network names (nas.local, router, but not a top-level
+/// domain such as "dev"), which could only have sent HSTS themselves. Those devices often have self-signed certificates,
+/// and Chrome lets you past them unless the device asked for HSTS.
+pub fn certificate_continue_allowed(code: i32, url: &str) -> bool {
+    let Some(host) = gpui::http_client::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+    else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let unlisted = host.parse::<std::net::IpAddr>().is_ok() || {
+        let host = host.trim_end_matches('.');
+        host == "localhost"
+            || host.ends_with(".localhost")
+            || crate::model::is_local_network_name(host)
+    };
+    unlisted && certificate_error_overridable(code)
+}
+
+/// How a download ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DownloadEnd {
+    /// Saved in full: `size` bytes.
+    Complete { size: u64 },
+    /// Stopped from the library, or by quitting.
+    Cancelled,
+    /// Interrupted; `reason` says why in a few words, when Chromium knows.
+    Failed { reason: Option<&'static str> },
+}
+
+/// Chromium's interrupt reason (cef_download_interrupt_reason_t) for a
+/// download the user cancelled.
+#[cfg(any(target_os = "macos", test))]
+pub const CANCELLED_BY_USER: u32 = 40;
+
+/// Why a download stopped, from Chromium's interrupt reason, in a few
+/// words for the library. `None` without a reason worth showing.
+#[cfg(any(target_os = "macos", test))]
+pub fn download_failure(reason: u32) -> Option<&'static str> {
+    Some(match reason {
+        1 | 10 => "Couldn't save the file",
+        2 => "No permission to save in Downloads",
+        3 => "Not enough disk space",
+        5 => "File name too long",
+        6 => "File too large to save",
+        7 => "A virus was found",
+        11 => "Blocked by the system",
+        12 => "Security check failed",
+        13 | 14 | 38 => "Download incomplete",
+        15 => "The file is already in Downloads",
+        20 | 24 => "Network error",
+        21 => "The connection timed out",
+        22 => "The connection was lost",
+        23 | 37 => "The server can't be reached",
+        30 | 31 | 39 => "Server error",
+        33 => "The file is no longer there",
+        34 => "The server needs you to sign in",
+        35 => "The server's certificate isn't valid",
+        36 => "The server refused it",
+        41 | 50 => "Interrupted",
+        _ => return None,
+    })
+}
+
+/// Something a page asks permission to use. Declared in the order the
+/// permission card names them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 // Previews ask for a few kinds only.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum Permission {
+    /// The camera, and also moving it (pan, tilt and zoom).
     Camera,
     Microphone,
     /// The screen (getDisplayMedia), with or without its sound.
     Screen,
+    /// Scrolling and zooming a tab or window the page captures.
+    CapturedSurfaceControl,
     Location,
     Notifications,
     Clipboard,
@@ -266,6 +455,33 @@ pub enum Permission {
     Downloads,
     /// Embedded content's own cookies and site data.
     StorageAccess,
+    /// More room for the site's data on this Mac.
+    DiskQuota,
+    LocalFonts,
+    /// Placing windows across displays (Window Management API).
+    WindowManagement,
+    IdleDetection,
+    PointerLock,
+    KeyboardLock,
+    /// Devices on the local network.
+    LocalNetwork,
+    /// Apps and services on this Mac (localhost).
+    LoopbackNetwork,
+    /// Motion and orientation sensors.
+    Sensors,
+    /// DRM-protected media.
+    ProtectedMedia,
+    /// Keeping access to files and folders opened in the page.
+    FileSystem,
+    /// Opening links of a kind of its own (web+…, mailto:).
+    ProtocolHandler,
+    /// Installing the site as an app.
+    AppInstallation,
+    /// Signing in to other sites with this one (FedCM).
+    IdentityProvider,
+    VirtualReality,
+    AugmentedReality,
+    HandTracking,
     /// Anything else Chromium asks about.
     Other,
 }
@@ -291,17 +507,37 @@ const MEDIA_PERMISSIONS: [(u32, Permission); 4] = [
 /// cef_permission_request_types_t, for OnShowPermissionPrompt. Other bits
 /// are `Permission::Other`.
 #[cfg(any(target_os = "macos", test))]
-const PROMPT_PERMISSIONS: [(u32, Permission); 10] = [
+const PROMPT_PERMISSIONS: [(u32, Permission); 29] = [
+    (1, Permission::AugmentedReality),
     (2, Permission::Camera),
     (4, Permission::Camera),
+    (8, Permission::CapturedSurfaceControl),
     (16, Permission::Clipboard),
     (32, Permission::StorageAccess),
+    (64, Permission::DiskQuota),
+    (128, Permission::LocalFonts),
     (256, Permission::Location),
+    (512, Permission::HandTracking),
+    (1024, Permission::IdentityProvider),
+    (2048, Permission::IdleDetection),
     (4096, Permission::Microphone),
     (8192, Permission::Midi),
     (16384, Permission::Downloads),
     (32768, Permission::Notifications),
+    (1 << 16, Permission::KeyboardLock),
+    (1 << 17, Permission::PointerLock),
+    (1 << 18, Permission::ProtectedMedia),
+    (1 << 19, Permission::ProtocolHandler),
     (1 << 20, Permission::StorageAccess),
+    (1 << 21, Permission::VirtualReality),
+    (1 << 22, Permission::AppInstallation),
+    (1 << 23, Permission::WindowManagement),
+    (1 << 24, Permission::FileSystem),
+    // Local network access, before and after Chromium split it in two.
+    (1 << 25, Permission::LocalNetwork),
+    (1 << 26, Permission::LocalNetwork),
+    (1 << 27, Permission::LoopbackNetwork),
+    (1 << 28, Permission::Sensors),
 ];
 
 /// The permissions in a CEF media access bit set.
@@ -361,7 +597,6 @@ pub fn download_file_name(suggested: &str) -> String {
 /// `name` if it isn't `taken`, else the first free "name (1).ext",
 /// "name (2).ext"…, as Chrome numbers them. ".tar.gz" and the like stay
 /// whole.
-#[cfg(any(target_os = "macos", test))]
 pub fn unique_file_name(name: &str, taken: impl Fn(&str) -> bool) -> String {
     if !taken(name) {
         return name.to_owned();
@@ -443,7 +678,8 @@ pub fn shortcut_character(characters: &str, ignoring_modifiers: &str, key: u16) 
 /// rest of macOS and the menu bar do, so ⌘Z on AZERTY undoes instead of
 /// closing the tab and ⌘+ zooms on German keyboards. Tab, the arrows, the
 /// brackets and the digits stay on their physical keys, which every layout
-/// has. Every shortcut needs ⌘ or ⌃, so typing is never intercepted.
+/// has. Every shortcut but ⇧F10 and the context-menu key, which type
+/// nothing, needs ⌘ or ⌃, so typing is never intercepted.
 #[cfg(any(target_os = "macos", test))]
 pub fn shortcut_for_key(
     key: u16,
@@ -476,6 +712,7 @@ pub fn shortcut_for_key(
         (true, false, true, false, Some('i')) => Some(Shortcut::DevTools),
         (true, false, false, false, Some('.')) => Some(Shortcut::Stop),
         (true, false, false, false, Some('p')) => Some(Shortcut::Print),
+        (true, false, false, false, Some('y')) => Some(Shortcut::History),
         // "+" needs ⇧ on many layouts, where ⌘= means the same.
         (true, false, false, _, Some('=' | '+')) => Some(Shortcut::ZoomIn),
         (true, false, false, false, Some('-')) => Some(Shortcut::ZoomOut),
@@ -488,8 +725,15 @@ pub fn shortcut_for_key(
     Some(match (command, control, option, shift, key) {
         (false, true, false, false, 48) => Shortcut::NextTab,
         (false, true, false, true, 48) => Shortcut::PreviousTab,
+        // kVK_Escape, with ⌃ (and ⇧ for a walk going the other way) held.
+        // Pages get it first; the browser acts on it only during a walk.
+        (false, true, false, _, 53) => Shortcut::CancelTabSwitch,
         (true, false, true, false, 125) => Shortcut::NextTabInList,
         (true, false, true, false, 126) => Shortcut::PreviousTabInList,
+        // ⇧⌘] and ⇧⌘[ (kVK_ANSI_RightBracket, kVK_ANSI_LeftBracket), as in
+        // Chrome and Safari.
+        (true, false, false, true, 30) => Shortcut::NextTabInList,
+        (true, false, false, true, 33) => Shortcut::PreviousTabInList,
         (true, false, true, false, 123) => Shortcut::PreviousSpace,
         (true, false, true, false, 124) => Shortcut::NextSpace,
         // ⌘← and ⌘→ as in Chrome and Arc. Pages get them first, so text
@@ -498,6 +742,9 @@ pub fn shortcut_for_key(
         (true, false, false, false, 30 | 124) => Shortcut::Forward,
         // kVK_ANSI_0, like the digits for layouts that type no "0" there.
         (true, false, false, false, 29) => Shortcut::ZoomReset,
+        // kVK_F10 with ⇧, and kVK_ContextualMenu (a PC keyboard's menu
+        // key). Neither types anything; a page gets them first.
+        (false, false, false, true, 109) | (false, false, false, false, 110) => Shortcut::TabMenu,
         (true, false, false, false, _) => Shortcut::SelectTab(digit?),
         (false, true, false, false, _) => Shortcut::SelectSpace(digit?),
         _ => return None,
@@ -586,6 +833,35 @@ pub fn navigation_for(url: &str) -> Navigation {
         "mailto" | "tel" | "sms" | "facetime" | "facetime-audio" => Navigation::OpenInApp,
         _ => Navigation::Block,
     }
+}
+
+/// A page's origin as Chromium keeps permissions and site data for it:
+/// scheme, host and any port ("https://meet.example"). `None` for
+/// addresses without a host.
+pub fn site_origin(url: &str) -> Option<String> {
+    let url = gpui::http_client::Url::parse(url).ok()?;
+    url.host_str()?;
+    Some(url.origin().ascii_serialization())
+}
+
+/// Whether `url` is a plain-HTTP page that others on the network could read
+/// or change. Only this Mac's own servers (localhost, loopback addresses)
+/// are trusted, as in Chrome: a .local name is another device, reached
+/// over the network unencrypted.
+pub fn is_insecure(url: &str) -> bool {
+    let Some(host) = gpui::http_client::Url::parse(url)
+        .ok()
+        .filter(|url| url.scheme() == "http")
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+    else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(address) = host.parse::<std::net::IpAddr>() {
+        return !address.is_loopback();
+    }
+    let host = host.trim_end_matches('.');
+    !(host == "localhost" || host.ends_with(".localhost"))
 }
 
 /// How a page asked for a new window (Chromium's window disposition).
@@ -831,7 +1107,8 @@ mod tests {
 
     #[test]
     fn never_intercepts_typing() {
-        for key in 0..=127 {
+        // kVK_F10 and kVK_ContextualMenu type nothing.
+        for key in (0..=127).filter(|key| ![109, 110].contains(key)) {
             for character in [None, Some('t'), Some('w'), Some('1')] {
                 for (option, shift) in [(false, false), (false, true), (true, false), (true, true)]
                 {
@@ -1032,9 +1309,10 @@ mod tests {
             (None, Some(EditCommand::SelectAll))
         );
         assert_eq!(press("w", 6, COMMAND), (Some(Shortcut::CloseTab), None));
-        // QWERTZ ⌘Z (the US Y key) undoes and ⌘Y does nothing.
+        // QWERTZ ⌘Z (the US Y key) undoes and ⌘Y (the US Z key) shows
+        // History.
         assert_eq!(press("z", 16, COMMAND), (None, Some(EditCommand::Undo)));
-        assert_eq!(press("y", 6, COMMAND), (None, None));
+        assert_eq!(press("y", 6, COMMAND), (Some(Shortcut::History), None));
         // Dvorak ⌘, (the US W key) does nothing, ⌘Q (the US X key) doesn't
         // cut, and ⌘T (the US K key) opens the command bar.
         assert_eq!(press(",", 13, COMMAND), (None, None));
@@ -1255,8 +1533,12 @@ mod tests {
             prompt_permissions(4 | 4096 | 32768),
             [Camera, Microphone, Notifications]
         );
-        // Unknown and unnamed bits (window management, idle detection).
-        assert_eq!(prompt_permissions(1 << 23 | 2048 | 16), [Clipboard, Other]);
+        assert_eq!(
+            prompt_permissions(1 << 23 | 2048 | 16),
+            [Clipboard, WindowManagement, IdleDetection]
+        );
+        // Bits Chromium may add later.
+        assert_eq!(prompt_permissions(1 << 30 | 128), [LocalFonts, Other]);
     }
 
     #[test]

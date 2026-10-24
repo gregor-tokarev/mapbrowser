@@ -8,19 +8,20 @@
 use super::{
     UI_FONT,
     command_bar::{self, TRANSPARENT},
-    shadow,
+    elide::fit_address,
+    shadow, text_width,
     theme::Theme,
 };
-use crate::{app::BrowserApp, engine::page::elide_middle, model::TabId};
+use crate::{app::BrowserApp, model::TabId};
 use gpui::{
     AppContext, Bounds, Context, DisplayId, Entity, IntoElement, ParentElement, Pixels, Point,
-    Render, SharedString, Size, Styled, TextRun, Window, WindowHandle, WindowOptions, div, font,
-    point, prelude::FluentBuilder, px, size,
+    Render, SharedString, Size, Styled, Window, WindowHandle, WindowOptions, div, font, point,
+    prelude::FluentBuilder, px, size,
 };
 
-const HEIGHT: f32 = 22.;
+pub(super) const HEIGHT: f32 = 22.;
 /// The pill's distance from the card's left and bottom edges.
-const INSET: f32 = 6.;
+pub(super) const INSET: f32 = 6.;
 const PADDING: f32 = 8.;
 const FONT_SIZE: f32 = 12.;
 /// The widest the pill gets; on narrow cards, half the card.
@@ -32,25 +33,6 @@ const MARGIN: f32 = if TRANSPARENT { 6. } else { 0. };
 /// The address as the pill shows it: secure links without their scheme.
 fn shown_address(address: &str) -> &str {
     address.strip_prefix("https://").unwrap_or(address)
-}
-
-/// `text`, or as much of its start and end around a "…" (`elide_middle`)
-/// as fits in `max_width`, measured with `width`.
-fn fit_middle(text: &str, max_width: f32, width: impl Fn(&str) -> f32) -> String {
-    if width(text) <= max_width {
-        return text.to_owned();
-    }
-    // The most characters that fit, assuming fewer never take more room.
-    let (mut fits, mut too_many) = (1, text.chars().count());
-    while too_many - fits > 1 {
-        let kept = (fits + too_many) / 2;
-        if width(&elide_middle(text, kept)) <= max_width {
-            fits = kept;
-        } else {
-            too_many = kept;
-        }
-    }
-    elide_middle(text, fits)
 }
 
 /// The pill window's top-left corner in the browser window, for `card`.
@@ -126,6 +108,19 @@ struct PillWindow {
 }
 
 impl BrowserApp {
+    /// Whether the pill shows; a toast over the card stands above it then.
+    pub(super) fn link_status_shown(&self) -> bool {
+        self.link_status.tab_id.is_some()
+    }
+
+    /// The pill came or went: a toast over the card moves out of its way
+    /// (`sync_toast_window`), which takes a frame of the browser window.
+    fn link_status_moved_toast(&self, cx: &mut Context<Self>) {
+        if self.toast_window.is_some() {
+            cx.notify();
+        }
+    }
+
     /// Whether the pill may show the hovered link of `tab_id`'s page.
     fn shows_link_status(&self, tab_id: TabId) -> bool {
         self.active_tab_id() == Some(tab_id)
@@ -149,29 +144,20 @@ impl BrowserApp {
             return;
         }
         let card = self.card_bounds(window.viewport_size());
-        let measure = |text: &str| {
-            let run = TextRun {
-                len: text.len(),
-                font: font(UI_FONT),
-                color: gpui::black(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            let line = window
-                .text_system()
-                .layout_line(text, px(FONT_SIZE), &[run], None);
-            f32::from(line.width)
-        };
+        let measure = |text: &str| text_width(text, font(UI_FONT), FONT_SIZE, window);
         let room = (f32::from(card.size.width) / 2.).min(MAX_WIDTH) - 2. * PADDING;
-        let text = fit_middle(shown_address(&address), room, measure);
+        // The host stays whole, as in Chrome's status bubble: a link's
+        // path is cut, never the site it goes to.
+        let text = fit_address(shown_address(&address), room, measure);
         // A point to spare for rounding, so the text is never clipped.
         let width = (measure(&text) + 2. * PADDING + 1.).ceil();
         let size = size(px(width + 2. * MARGIN), px(HEIGHT + 2. * MARGIN));
         let theme = self.theme();
-        #[cfg(target_os = "macos")]
         let shown = self.link_status.tab_id.is_some();
         self.link_status.tab_id = Some(tab_id);
+        if !shown {
+            self.link_status_moved_toast(cx);
+        }
         let Some(pill) = &mut self.link_status.pill else {
             let bounds = Bounds::new(window.bounds().origin + window_origin(card), size);
             let display = window.display(cx).map(|display| display.id());
@@ -238,13 +224,11 @@ impl BrowserApp {
         });
     }
 
-    fn hide_link_status(
-        &mut self,
-        #[cfg_attr(target_os = "macos", allow(unused_variables))] cx: &mut Context<Self>,
-    ) {
+    fn hide_link_status(&mut self, cx: &mut Context<Self>) {
         if self.link_status.tab_id.take().is_none() {
             return;
         }
+        self.link_status_moved_toast(cx);
         // macOS keeps the window for next time; previews can't hide one.
         #[cfg(target_os = "macos")]
         if let Some(view) = self
@@ -309,11 +293,13 @@ mod tests {
 
     #[test]
     fn long_addresses_keep_their_start_and_end() {
+        use crate::ui::elide::{Cut, fit};
         let width = |text: &str| text.chars().count() as f32;
-        assert_eq!(fit_middle("example.com/a", 20., width), "example.com/a");
-        assert_eq!(fit_middle("abcdefghij", 5., width), "ab…ij");
-        assert_eq!(fit_middle("abcdefghij", 9.5, width), "abcd…ghij");
-        assert_eq!(fit_middle("abcdefghij", 0.5, width), "…");
+        let fit_middle = |text, room| fit(text, room, Cut::Middle, width);
+        assert_eq!(fit_middle("example.com/a", 20.), "example.com/a");
+        assert_eq!(fit_middle("abcdefghij", 5.), "ab…ij");
+        assert_eq!(fit_middle("abcdefghij", 9.5), "abcd…ghij");
+        assert_eq!(fit_middle("abcdefghij", 0.5), "…");
         assert_eq!(shown_address("https://a.test/b"), "a.test/b");
         assert_eq!(shown_address("http://a.test/b"), "http://a.test/b");
         assert_eq!(shown_address("mailto:a@b.test"), "mailto:a@b.test");

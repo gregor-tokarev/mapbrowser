@@ -1,8 +1,9 @@
 //! Camera, microphone, screen, location and other permission requests go
 //! to the shell, which asks the user. With Alloy style and no handler CEF
-//! denies media access and ignores every other prompt.
+//! denies media access and ignores every other prompt. The site menu reads
+//! and resets the answers Chromium keeps in each space's profile.
 
-use super::BrowserLink;
+use super::{BrowserLink, Engine};
 use crate::engine::{
     EngineEvent, Permission, PermissionDecision, media_permissions, prompt_permissions,
 };
@@ -21,22 +22,158 @@ const _: () = {
     assert!(Media::CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE as u32 == 2);
     assert!(Media::CEF_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE as u32 == 4);
     assert!(Media::CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE as u32 == 8);
+    assert!(Prompt::CEF_PERMISSION_TYPE_AR_SESSION as u32 == 1);
     assert!(Prompt::CEF_PERMISSION_TYPE_CAMERA_PAN_TILT_ZOOM as u32 == 2);
     assert!(Prompt::CEF_PERMISSION_TYPE_CAMERA_STREAM as u32 == 4);
+    assert!(Prompt::CEF_PERMISSION_TYPE_CAPTURED_SURFACE_CONTROL as u32 == 8);
     assert!(Prompt::CEF_PERMISSION_TYPE_CLIPBOARD as u32 == 16);
     assert!(Prompt::CEF_PERMISSION_TYPE_TOP_LEVEL_STORAGE_ACCESS as u32 == 32);
+    assert!(Prompt::CEF_PERMISSION_TYPE_DISK_QUOTA as u32 == 64);
+    assert!(Prompt::CEF_PERMISSION_TYPE_LOCAL_FONTS as u32 == 128);
     assert!(Prompt::CEF_PERMISSION_TYPE_GEOLOCATION as u32 == 256);
+    assert!(Prompt::CEF_PERMISSION_TYPE_HAND_TRACKING as u32 == 512);
+    assert!(Prompt::CEF_PERMISSION_TYPE_IDENTITY_PROVIDER as u32 == 1024);
+    assert!(Prompt::CEF_PERMISSION_TYPE_IDLE_DETECTION as u32 == 2048);
     assert!(Prompt::CEF_PERMISSION_TYPE_MIC_STREAM as u32 == 4096);
     assert!(Prompt::CEF_PERMISSION_TYPE_MIDI_SYSEX as u32 == 8192);
     assert!(Prompt::CEF_PERMISSION_TYPE_MULTIPLE_DOWNLOADS as u32 == 16384);
     assert!(Prompt::CEF_PERMISSION_TYPE_NOTIFICATIONS as u32 == 32768);
+    assert!(Prompt::CEF_PERMISSION_TYPE_KEYBOARD_LOCK as u32 == 1 << 16);
+    assert!(Prompt::CEF_PERMISSION_TYPE_POINTER_LOCK as u32 == 1 << 17);
+    assert!(Prompt::CEF_PERMISSION_TYPE_PROTECTED_MEDIA_IDENTIFIER as u32 == 1 << 18);
+    assert!(Prompt::CEF_PERMISSION_TYPE_REGISTER_PROTOCOL_HANDLER as u32 == 1 << 19);
     assert!(Prompt::CEF_PERMISSION_TYPE_STORAGE_ACCESS as u32 == 1 << 20);
+    assert!(Prompt::CEF_PERMISSION_TYPE_VR_SESSION as u32 == 1 << 21);
+    assert!(Prompt::CEF_PERMISSION_TYPE_WEB_APP_INSTALLATION as u32 == 1 << 22);
+    assert!(Prompt::CEF_PERMISSION_TYPE_WINDOW_MANAGEMENT as u32 == 1 << 23);
+    assert!(Prompt::CEF_PERMISSION_TYPE_FILE_SYSTEM_ACCESS as u32 == 1 << 24);
+    assert!(Prompt::CEF_PERMISSION_TYPE_LOCAL_NETWORK_ACCESS_DEPRECATED as u32 == 1 << 25);
+    assert!(Prompt::CEF_PERMISSION_TYPE_LOCAL_NETWORK as u32 == 1 << 26);
+    assert!(Prompt::CEF_PERMISSION_TYPE_LOOPBACK_NETWORK as u32 == 1 << 27);
+    assert!(Prompt::CEF_PERMISSION_TYPE_SENSORS as u32 == 1 << 28);
 };
+
+/// The content settings the site menu lists. Each one asks by default, so
+/// an Allow or Block found for a site is an answer someone gave; settings
+/// that allow by default (sensors) would list every site.
+/// `reset_settings` names every setting Reset clears.
+const SITE_SETTINGS: [(ContentSettingTypes, Permission); 10] = [
+    (ContentSettingTypes::MEDIASTREAM_CAMERA, Permission::Camera),
+    (ContentSettingTypes::MEDIASTREAM_MIC, Permission::Microphone),
+    (ContentSettingTypes::GEOLOCATION, Permission::Location),
+    (
+        ContentSettingTypes::NOTIFICATIONS,
+        Permission::Notifications,
+    ),
+    (
+        ContentSettingTypes::CLIPBOARD_READ_WRITE,
+        Permission::Clipboard,
+    ),
+    (ContentSettingTypes::MIDI_SYSEX, Permission::Midi),
+    (
+        ContentSettingTypes::AUTOMATIC_DOWNLOADS,
+        Permission::Downloads,
+    ),
+    (ContentSettingTypes::LOCAL_FONTS, Permission::LocalFonts),
+    (
+        ContentSettingTypes::WINDOW_MANAGEMENT,
+        Permission::WindowManagement,
+    ),
+    (
+        ContentSettingTypes::IDLE_DETECTION,
+        Permission::IdleDetection,
+    ),
+];
+
+impl Engine {
+    /// What the space's profile keeps for the site at `origin`: each
+    /// permission it allows (true) or blocks. Empty for a space whose
+    /// profile isn't open: none of its pages was shown this session.
+    pub fn site_permissions(&self, space_id: u64, origin: &str) -> Vec<(Permission, bool)> {
+        let Some(context) = self.contexts.get(&space_id) else {
+            return Vec::new();
+        };
+        let url = CefString::from(origin);
+        SITE_SETTINGS
+            .iter()
+            .filter_map(|&(kind, permission)| {
+                let value = context.content_setting(Some(&url), Some(&url), kind);
+                if value == ContentSettingValues::ALLOW {
+                    Some((permission, true))
+                } else if value == ContentSettingValues::BLOCK {
+                    Some((permission, false))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Forgets the profile's answer for `permission` at `origin`: the site
+    /// asks again next time.
+    pub fn reset_site_permission(&mut self, space_id: u64, origin: &str, permission: Permission) {
+        let Ok(context) = self.space_context(space_id) else {
+            return;
+        };
+        let url = CefString::from(origin);
+        for &kind in reset_settings(permission) {
+            context.set_content_setting(
+                Some(&url),
+                Some(&url),
+                kind,
+                ContentSettingValues::DEFAULT,
+            );
+        }
+    }
+}
+
+/// Every content setting Chromium keeps an answer to `permission` in, for
+/// Reset: the menu lists answers this session gave to any prompt, not only
+/// `SITE_SETTINGS`. Setting a type Chromium never registered aborts the
+/// browser process, so each one here is checked against Chromium 152's
+/// content_settings_registry.cc: plain MIDI isn't registered there (its
+/// prompt is kept in MIDI_SYSEX), the older LOCAL_NETWORK_ACCESS is.
+fn reset_settings(permission: Permission) -> &'static [ContentSettingTypes] {
+    use ContentSettingTypes as Kind;
+    match permission {
+        // getUserMedia, and moving the camera.
+        Permission::Camera => &[Kind::MEDIASTREAM_CAMERA, Kind::CAMERA_PAN_TILT_ZOOM],
+        Permission::Microphone => &[Kind::MEDIASTREAM_MIC],
+        Permission::CapturedSurfaceControl => &[Kind::CAPTURED_SURFACE_CONTROL],
+        Permission::Location => &[Kind::GEOLOCATION],
+        Permission::Notifications => &[Kind::NOTIFICATIONS],
+        Permission::Clipboard => &[Kind::CLIPBOARD_READ_WRITE],
+        Permission::Midi => &[Kind::MIDI_SYSEX],
+        Permission::Downloads => &[Kind::AUTOMATIC_DOWNLOADS],
+        Permission::StorageAccess => &[Kind::STORAGE_ACCESS, Kind::TOP_LEVEL_STORAGE_ACCESS],
+        Permission::LocalFonts => &[Kind::LOCAL_FONTS],
+        Permission::WindowManagement => &[Kind::WINDOW_MANAGEMENT],
+        Permission::IdleDetection => &[Kind::IDLE_DETECTION],
+        Permission::PointerLock => &[Kind::POINTER_LOCK],
+        Permission::KeyboardLock => &[Kind::KEYBOARD_LOCK],
+        Permission::LocalNetwork => &[Kind::LOCAL_NETWORK, Kind::LOCAL_NETWORK_ACCESS],
+        Permission::LoopbackNetwork => &[Kind::LOOPBACK_NETWORK],
+        Permission::Sensors => &[Kind::SENSORS],
+        Permission::FileSystem => &[Kind::FILE_SYSTEM_WRITE_GUARD],
+        Permission::AppInstallation => &[Kind::WEB_APP_INSTALLATION],
+        Permission::VirtualReality => &[Kind::VR],
+        Permission::AugmentedReality => &[Kind::AR],
+        Permission::HandTracking => &[Kind::HAND_TRACKING],
+        // Asked every time, or not kept as a content setting.
+        Permission::Screen
+        | Permission::DiskQuota
+        | Permission::ProtectedMedia
+        | Permission::ProtocolHandler
+        | Permission::IdentityProvider
+        | Permission::Other => &[],
+    }
+}
 
 /// Requests waiting for the user, shared by every browser's handler and
 /// the engine. Callbacks run on the UI thread, where a prompt's answer can
-/// call straight back into the handler, so they are never answered with
-/// the lock held.
+/// call straight back into the handler, so they are never answered, nor
+/// dropped (an unanswered media request is refused then), with the lock
+/// held.
 #[derive(Clone, Default)]
 pub(super) struct PermissionRequests(Arc<Mutex<Requests>>);
 
@@ -170,12 +307,13 @@ wrap_permission_handler! {
             1
         }
         fn on_dismiss_permission_prompt(&self, _browser: Option<&mut Browser>, prompt_id: u64, _result: PermissionRequestResult) {
-            // Answered, or ended by Chromium (navigation, closing).
-            let ended: Vec<u64> = self.link.permissions.requests().pending
+            // Answered, or ended by Chromium (navigation, closing). What is
+            // left of a request goes once the lock is released.
+            let ended: Vec<(u64, Pending)> = self.link.permissions.requests().pending
                 .extract_if(|_, pending| pending.instance == self.link.instance && pending.prompt_id == Some(prompt_id))
-                .map(|(id, _)| id)
                 .collect();
-            for id in ended {
+            for (id, pending) in ended {
+                drop(pending);
                 self.link.send(EngineEvent::PermissionDismissed { id });
             }
         }

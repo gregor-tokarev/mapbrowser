@@ -1,7 +1,8 @@
 //! Persistent spaces and tabs. Each space owns a distinct Chromium profile.
 
 use crate::favicons::{host_and_parents, normalize_host};
-use serde::{Deserialize, Serialize};
+use gpui::http_client::Url;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions},
@@ -9,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         LazyLock, Mutex, PoisonError,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -28,11 +29,27 @@ const SCHEMA_VERSION: u32 = 2;
 const BLANK_URL: &str = "about:blank";
 /// Space themes are indices below this; the UI owns the palettes.
 pub const THEME_COUNT: u8 = 8;
+/// The order new spaces take the themes in: lavender, green, pink, teal,
+/// peach, periwinkle, amber, grey. Each differs plainly from the one before,
+/// so neighbouring dots in the switcher never look alike (lavender and
+/// periwinkle would).
+const THEME_ORDER: [u8; THEME_COUNT as usize] = [0, 2, 4, 5, 3, 1, 7, 6];
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 228.;
 pub const MIN_SIDEBAR_WIDTH: f32 = 180.;
 pub const MAX_SIDEBAR_WIDTH: f32 = 420.;
-/// Closed Today tabs that ⇧⌘T and the library can bring back.
+/// Closes that ⇧⌘T and the library can undo, per space. Tabs closed
+/// together (Clear, Close Other Tabs) count as one.
 pub const REOPEN_LIMIT: usize = 20;
+/// Once a space's closed tabs number this many, its older closes go, so a
+/// few large Clears don't grow the session without end. The newest close
+/// stays whole, however many tabs it took.
+const CLOSED_TAB_LIMIT: usize = 100;
+/// Finished downloads the library keeps, also after a restart. Running
+/// ones are kept on top of these.
+pub const DOWNLOAD_LIMIT: usize = 20;
+/// The longest download address kept for downloading again. Signed links
+/// to files run long; longer ones carry their data rather than name it.
+const MAX_DOWNLOAD_URL_LEN: usize = 8 * 1024;
 
 /// The sidebar section a tab belongs to. Variants are declared in sidebar
 /// order, so sorting by `Pin` groups favorites, pinned tabs, then Today.
@@ -47,21 +64,88 @@ pub enum Pin {
     Today,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Tab {
     pub id: TabId,
     pub url: String,
     pub title: String,
     #[serde(default)]
     pub pin: Pin,
+    /// A name the user gave the tab, shown instead of the page's title.
+    #[serde(default)]
+    pub custom_title: Option<String>,
+    /// The address a pinned tab or favorite had when it was pinned, which
+    /// "Go to Pinned Page" returns to. Today tabs have none.
+    #[serde(default)]
+    pub pinned_url: Option<String>,
 }
 
-/// A Today tab closed with ⌘W or Clear, which ⇧⌘T and the library bring
-/// back into its space.
+impl Tab {
+    /// What the sidebar calls the tab: the user's name for it, else the
+    /// page's title.
+    pub fn shown_title(&self) -> &str {
+        self.custom_title.as_deref().unwrap_or(&self.title)
+    }
+
+    /// Moves the tab to `pin`'s section. Pinning it remembers its address;
+    /// back in Today it has none.
+    fn repin(&mut self, pin: Pin) {
+        self.pinned_url = match pin {
+            Pin::Today => None,
+            _ => self.pinned_url.take().or_else(|| Some(self.url.clone())),
+        };
+        self.pin = pin;
+    }
+}
+
+/// A tab closed with ⌘W, Clear or Close Tab, which ⇧⌘T and the library
+/// bring back into its space.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClosedTab {
     pub space_id: SpaceId,
     pub tab: Tab,
+    /// Its place in its section when it closed, where it reopens.
+    #[serde(default)]
+    pub index: Option<usize>,
+    /// Tabs closed together (Clear, Close Other Tabs) share the first one's
+    /// id here, and ⇧⌘T reopens them together.
+    #[serde(default)]
+    pub batch: Option<TabId>,
+    /// It was its space's selected tab, and is again when ⇧⌘T undoes the
+    /// close.
+    #[serde(default)]
+    pub selected: bool,
+}
+
+/// Where a download stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DownloadState {
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+/// A download as the library lists it, saved so recent downloads are still
+/// listed after a restart.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedDownload {
+    pub name: String,
+    pub path: PathBuf,
+    /// Where it came from, without credentials, to download it again.
+    #[serde(default)]
+    pub url: String,
+    /// The space whose profile downloads it again.
+    #[serde(default)]
+    pub space_id: Option<SpaceId>,
+    pub state: DownloadState,
+    /// Bytes saved, once done.
+    #[serde(default)]
+    pub size: Option<u64>,
+    /// Why it failed, in a few words.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// `tabs` stays grouped by section, so its order is the sidebar order.
@@ -100,16 +184,35 @@ pub struct BrowserState {
     /// The browser window's frame, to open it there again.
     #[serde(default)]
     pub window: Option<SavedWindow>,
-    /// Recently closed Today tabs, the most recent last. Saved, so a Clear
-    /// can still be undone after a restart.
+    /// Recently closed tabs, the most recent last. Saved, so a Clear can
+    /// still be undone after a restart.
     #[serde(default)]
     closed: Vec<ClosedTab>,
+    /// Where typed searches go.
+    #[serde(default)]
+    search_engine: SearchEngine,
+    /// Recent downloads, the newest first.
+    #[serde(default)]
+    downloads: Vec<SavedDownload>,
     #[serde(skip, default = "data_dir")]
     storage_dir: PathBuf,
     /// Whether this is the session saved last, read from state.json, rather
     /// than a backup or the defaults.
     #[serde(skip)]
     from_state_file: bool,
+    /// How this launch made do without a readable state.json, to tell the
+    /// user once.
+    #[serde(skip)]
+    pub recovery: Option<Recovery>,
+}
+
+/// state.json couldn't be read at launch: the session came from the backup
+/// or, without a readable one, from the defaults.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Recovery {
+    pub from_backup: bool,
+    /// Where the damaged file was set aside, if there was one.
+    pub kept: Option<PathBuf>,
 }
 
 /// Where the browser window was, in points.
@@ -126,6 +229,119 @@ pub struct SavedWindow {
     pub display: Option<String>,
     #[serde(default)]
     pub fullscreen: bool,
+}
+
+/// The search engine typed searches go to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SearchEngine {
+    #[default]
+    Google,
+    DuckDuckGo,
+    Bing,
+    Brave,
+    Kagi,
+    Ecosia,
+}
+
+impl SearchEngine {
+    pub const ALL: [Self; 6] = [
+        Self::Google,
+        Self::DuckDuckGo,
+        Self::Bing,
+        Self::Brave,
+        Self::Kagi,
+        Self::Ecosia,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Google => "Google",
+            Self::DuckDuckGo => "DuckDuckGo",
+            Self::Bing => "Bing",
+            Self::Brave => "Brave Search",
+            Self::Kagi => "Kagi",
+            Self::Ecosia => "Ecosia",
+        }
+    }
+
+    /// Its name where a sentence says what it searches with, as Chrome
+    /// names it: "Search Brave for …", not "Search Brave Search for …".
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Self::Brave => "Brave",
+            engine => engine.name(),
+        }
+    }
+
+    /// What a search with it is called: "Google Search", "Brave Search".
+    pub fn search_label(self) -> String {
+        let name = self.name();
+        if name.ends_with(" Search") {
+            name.to_owned()
+        } else {
+            format!("{name} Search")
+        }
+    }
+
+    /// Its name in state.json.
+    fn id(self) -> &'static str {
+        match self {
+            Self::Google => "google",
+            Self::DuckDuckGo => "duckduckgo",
+            Self::Bing => "bing",
+            Self::Brave => "brave",
+            Self::Kagi => "kagi",
+            Self::Ecosia => "ecosia",
+        }
+    }
+
+    /// The results page's address, up to the encoded query.
+    fn query_url(self) -> &'static str {
+        match self {
+            Self::Google => "https://www.google.com/search?q=",
+            Self::DuckDuckGo => "https://duckduckgo.com/?q=",
+            Self::Bing => "https://www.bing.com/search?q=",
+            Self::Brave => "https://search.brave.com/search?q=",
+            Self::Kagi => "https://kagi.com/search?q=",
+            Self::Ecosia => "https://www.ecosia.org/search?q=",
+        }
+    }
+}
+
+impl Serialize for SearchEngine {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.id())
+    }
+}
+
+/// Lenient: an engine this version doesn't know (saved by a newer one) is
+/// Google, rather than a damaged session.
+impl<'de> Deserialize<'de> for SearchEngine {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(value
+            .as_str()
+            .and_then(|id| Self::ALL.into_iter().find(|engine| engine.id() == id))
+            .unwrap_or_default())
+    }
+}
+
+/// The session's search engine, for the whole process: the page menu's
+/// "Search … for" runs in Chromium's callbacks, away from the session.
+static SEARCH_ENGINE: AtomicU8 = AtomicU8::new(0);
+
+/// The search engine `search_url` uses.
+pub fn current_search_engine() -> SearchEngine {
+    let index = usize::from(SEARCH_ENGINE.load(Ordering::Relaxed));
+    SearchEngine::ALL.get(index).copied().unwrap_or_default()
+}
+
+fn use_search_engine(engine: SearchEngine) {
+    let index = SearchEngine::ALL
+        .iter()
+        .position(|&known| known == engine)
+        .unwrap_or(0);
+    SEARCH_ENGINE.store(index as u8, Ordering::Relaxed);
 }
 
 fn schema_version() -> u32 {
@@ -152,8 +368,8 @@ impl Default for BrowserState {
         Self {
             schema_version: SCHEMA_VERSION,
             spaces: vec![
-                Space::new(1, "Personal".into(), 0),
-                Space::new(2, "Work".into(), 1),
+                Space::new(1, "Personal".into(), THEME_ORDER[0]),
+                Space::new(2, "Work".into(), THEME_ORDER[1]),
             ],
             selected_space_id: 1,
             next_id: 3,
@@ -162,8 +378,11 @@ impl Default for BrowserState {
             blocking_exceptions: BTreeSet::new(),
             window: None,
             closed: Vec::new(),
+            search_engine: SearchEngine::default(),
+            downloads: Vec::new(),
             storage_dir: data_dir(),
             from_state_file: false,
+            recovery: None,
         }
     }
 }
@@ -311,7 +530,7 @@ impl StateSnapshot {
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                    quarantine(&state_path)?
+                    quarantine(&state_path).map(drop)?
                 }
                 Err(error) => return Err(error),
             }
@@ -353,37 +572,42 @@ impl BrowserState {
         forget_written(root);
         let state_path = root.join(STATE_FILE);
         let backup_path = root.join(BACKUP_FILE);
-        let state = match read_state(&state_path, root) {
-            Ok(state) => Self {
-                from_state_file: true,
-                ..state
-            },
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                quarantine(&state_path)?;
-                match read_state(&backup_path, root) {
-                    Ok(state) => state,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => Self::at_root(root),
-                    Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                        quarantine(&backup_path)?;
-                        Self::at_root(root)
-                    }
-                    Err(error) => return Err(error),
-                }
+        // A damaged state.json is set aside; `kept` says where.
+        let (kept, missing) = match read_state(&state_path, root) {
+            Ok(state) => {
+                return Self::loaded(Self {
+                    from_state_file: true,
+                    ..state
+                });
             }
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                (Some(quarantine(&state_path)?), false)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (None, true),
+            Err(error) => return Err(error),
+        };
+        let (state, from_backup, kept) = match read_state(&backup_path, root) {
+            Ok(state) => (state, true, kept),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match read_state(&backup_path, root) {
-                    Ok(state) => state,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => Self::at_root(root),
-                    Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                        quarantine(&backup_path)?;
-                        Self::at_root(root)
-                    }
-                    Err(error) => return Err(error),
-                }
+                (Self::at_root(root), false, kept)
+            }
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                let backup = quarantine(&backup_path)?;
+                (Self::at_root(root), false, kept.or(Some(backup)))
             }
             Err(error) => return Err(error),
         };
+        // A first launch has neither file, and nothing to tell.
+        let first_launch = missing && !from_backup && kept.is_none();
+        Self::loaded(Self {
+            recovery: (!first_launch).then_some(Recovery { from_backup, kept }),
+            ..state
+        })
+    }
+
+    fn loaded(state: Self) -> io::Result<Self> {
         state.ensure_profile_dirs()?;
+        use_search_engine(state.search_engine);
         Ok(state)
     }
 
@@ -396,6 +620,12 @@ impl BrowserState {
 
     pub fn root_dir(&self) -> &Path {
         &self.storage_dir
+    }
+
+    /// Whether the session is the one saved last, read from state.json:
+    /// only then does a space missing from it mean the space was deleted.
+    pub fn from_state_file(&self) -> bool {
+        self.from_state_file
     }
 
     pub fn profile_dir(&self, space_id: SpaceId) -> PathBuf {
@@ -498,6 +728,16 @@ impl BrowserState {
         self.sidebar_width = clamp_sidebar_width(width);
     }
 
+    pub fn search_engine(&self) -> SearchEngine {
+        self.search_engine
+    }
+
+    /// Returns whether the engine changed.
+    pub fn set_search_engine(&mut self, engine: SearchEngine) -> bool {
+        use_search_engine(engine);
+        std::mem::replace(&mut self.search_engine, engine) != engine
+    }
+
     /// Hosts where content blocking is off, as the engine takes them.
     pub fn blocking_exceptions(&self) -> HashSet<String> {
         self.blocking_exceptions.iter().cloned().collect()
@@ -540,12 +780,11 @@ impl BrowserState {
     /// New spaces start empty and selected, with the least-used theme.
     pub fn create_space(&mut self, name: impl Into<String>) -> SpaceId {
         let id = self.allocate_id();
-        let name = name.into();
-        let name = name.trim();
+        let name = space_name(&name.into());
         let name = if name.is_empty() {
-            format!("Space {}", self.spaces.len() + 1)
+            self.unused_space_name()
         } else {
-            name.to_owned()
+            name
         };
         let theme = self.least_used_theme();
         self.spaces.push(Space::new(id, name, theme));
@@ -553,25 +792,61 @@ impl BrowserState {
         id
     }
 
+    /// "Space N" for a space without a name: N counts on from the number of
+    /// spaces, past any name already taken, so two spaces never share one.
+    fn unused_space_name(&self) -> String {
+        let taken = |name: &str| {
+            self.spaces
+                .iter()
+                .any(|space| space.name.eq_ignore_ascii_case(name))
+        };
+        let mut number = self.spaces.len() + 1;
+        loop {
+            let name = format!("Space {number}");
+            if !taken(&name) {
+                return name;
+            }
+            number += 1;
+        }
+    }
+
+    /// The theme fewest spaces have, the earliest in `THEME_ORDER` of those.
     fn least_used_theme(&self) -> u8 {
         let mut uses = [0usize; THEME_COUNT as usize];
         for space in &self.spaces {
             uses[usize::from(space.theme())] += 1;
         }
-        (0..THEME_COUNT)
+        THEME_ORDER
+            .into_iter()
             .min_by_key(|&theme| uses[usize::from(theme)])
             .unwrap_or(0)
     }
 
+    /// Names a space; text with nothing but blanks keeps the old name.
     pub fn rename_space(&mut self, id: SpaceId, name: impl AsRef<str>) -> bool {
-        let name = name.as_ref().trim();
+        let name = space_name(name.as_ref());
         if name.is_empty() {
             return false;
         }
         let Some(space) = self.space_mut(id) else {
             return false;
         };
-        space.name = name.to_owned();
+        space.name = name;
+        true
+    }
+
+    /// Moves a space to `index` in the switcher, the order that ⌃1–9,
+    /// ⌥⌘←/→ and swipes follow. Returns whether the order changed.
+    pub fn move_space(&mut self, id: SpaceId, index: usize) -> bool {
+        let Some(from) = self.spaces.iter().position(|space| space.id == id) else {
+            return false;
+        };
+        let to = index.min(self.spaces.len() - 1);
+        if from == to {
+            return false;
+        }
+        let space = self.spaces.remove(from);
+        self.spaces.insert(to, space);
         true
     }
 
@@ -645,13 +920,58 @@ impl BrowserState {
                 id,
                 url,
                 title,
-                pin: Pin::Today,
+                ..Tab::default()
             },
         );
         if select || space.selected_tab_id.is_none() {
             space.selected_tab_id = Some(id);
         }
         Some(id)
+    }
+
+    /// Opens a copy of the tab right below it, in its section, under a new
+    /// id. The selection stays.
+    pub fn duplicate_tab(&mut self, tab_id: TabId) -> Option<TabId> {
+        self.space_of_tab(tab_id)?;
+        let id = self.allocate_id();
+        let (space, index) = self.locate_tab_mut(tab_id)?;
+        let original = &space.tabs[index];
+        let copy = Tab {
+            id,
+            url: original.url.clone(),
+            title: original.title.clone(),
+            pin: original.pin,
+            custom_title: None,
+            pinned_url: original.pinned_url.clone(),
+        };
+        space.tabs.insert(index + 1, copy);
+        Some(id)
+    }
+
+    /// The tab's place in its section, top to bottom.
+    pub fn section_index(&self, tab_id: TabId) -> Option<usize> {
+        let space = self.space(self.space_of_tab(tab_id)?)?;
+        let pin = space.tabs[space.tab_index(tab_id)?].pin;
+        space.section(pin).position(|tab| tab.id == tab_id)
+    }
+
+    /// Names the tab, or with no name (or a blank one, or the page's title)
+    /// lets it follow its page's title again. Returns whether the name
+    /// changed.
+    pub fn rename_tab(&mut self, tab_id: TabId, name: Option<&str>) -> bool {
+        let Some((space, index)) = self.locate_tab_mut(tab_id) else {
+            return false;
+        };
+        let tab = &mut space.tabs[index];
+        let name = name
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && *name != tab.title)
+            .map(str::to_owned);
+        if tab.custom_title == name {
+            return false;
+        }
+        tab.custom_title = name;
+        true
     }
 
     /// Selects the tab and its space.
@@ -694,7 +1014,7 @@ impl BrowserState {
             return true;
         }
         let mut tab = space.tabs.remove(index);
-        tab.pin = pin;
+        tab.repin(pin);
         let at = if pin == Pin::Today {
             space.section_start(pin)
         } else {
@@ -719,7 +1039,7 @@ impl BrowserState {
             }
         }
         let mut tab = space.tabs.remove(index);
-        tab.pin = pin;
+        tab.repin(pin);
         let at = before
             .and_then(|before| space.tab_index(before))
             .unwrap_or_else(|| space.section_end(pin));
@@ -769,6 +1089,25 @@ impl BrowserState {
         removed
     }
 
+    /// Closes the space's Today tabs among `ids`, as `close_tab` would one
+    /// by one. Returns them top first, each with its place in Today before
+    /// any of them closed.
+    pub fn close_today_tabs(&mut self, space_id: SpaceId, ids: &[TabId]) -> Vec<(Tab, usize)> {
+        let Some(space) = self.space_mut(space_id) else {
+            return Vec::new();
+        };
+        let places: Vec<(TabId, usize)> = space
+            .section(Pin::Today)
+            .enumerate()
+            .filter(|(_, tab)| ids.contains(&tab.id))
+            .map(|(place, tab)| (tab.id, place))
+            .collect();
+        places
+            .into_iter()
+            .filter_map(|(id, place)| Some((space.remove_at(space.tab_index(id)?), place)))
+            .collect()
+    }
+
     /// Browser callbacks can update hidden tabs without selecting their space.
     /// Returns whether the tab's URL or title changed, so unchanged reloads
     /// and repeated titles need no save.
@@ -791,21 +1130,73 @@ impl BrowserState {
         changed
     }
 
-    /// Recently closed Today tabs, the most recent last.
+    /// Recently closed tabs, the most recent last.
     pub fn closed_tabs(&self) -> &[ClosedTab] {
         &self.closed
     }
 
-    /// Remembers a closed Today tab for reopening; past `REOPEN_LIMIT` the
-    /// oldest is forgotten.
+    /// Remembers a closed tab for reopening, with no known place.
+    #[cfg(test)]
     pub fn remember_closed(&mut self, space_id: SpaceId, tab: Tab) {
-        self.closed.push(ClosedTab { space_id, tab });
+        self.remember_closed_at(space_id, tab, None);
+    }
+
+    /// Remembers a closed tab for reopening at `index` in its section.
+    pub fn remember_closed_at(&mut self, space_id: SpaceId, tab: Tab, index: Option<usize>) {
+        self.closed.push(ClosedTab {
+            space_id,
+            tab,
+            index,
+            batch: None,
+            selected: false,
+        });
         self.trim_closed();
     }
 
+    /// Remembers tabs closed together, each with its place in its section,
+    /// as one close that ⇧⌘T undoes at once, and which of them, if any, was
+    /// `selected`. Pushed bottom first, so the library, newest first, lists
+    /// them in sidebar order.
+    pub fn remember_closed_together(
+        &mut self,
+        space_id: SpaceId,
+        tabs: Vec<(Tab, usize)>,
+        selected: Option<TabId>,
+    ) {
+        let batch = tabs.first().map(|(tab, _)| tab.id);
+        self.closed
+            .extend(tabs.into_iter().rev().map(|(tab, index)| ClosedTab {
+                space_id,
+                selected: Some(tab.id) == selected,
+                tab,
+                index: Some(index),
+                batch,
+            }));
+        self.trim_closed();
+    }
+
+    /// Keeps each space's `REOPEN_LIMIT` most recent closes, so one space
+    /// never pushes another's out, and of those only as many as keep it
+    /// near `CLOSED_TAB_LIMIT` tabs. Tabs closed together count once, and
+    /// stay or go together; the newest close always stays.
     fn trim_closed(&mut self) {
-        let excess = self.closed.len().saturating_sub(REOPEN_LIMIT);
-        self.closed.drain(..excess);
+        // Per space: the closes seen, the tabs kept, and whether the close
+        // being looked at is kept.
+        let mut spaces: HashMap<SpaceId, (usize, usize, bool)> = HashMap::new();
+        let mut newer_batch = None;
+        let mut keep = Vec::with_capacity(self.closed.len());
+        for closed in self.closed.iter().rev() {
+            let (closes, tabs, kept) = spaces.entry(closed.space_id).or_default();
+            if closed.batch.is_none() || closed.batch != newer_batch {
+                *closes += 1;
+                *kept = *closes == 1 || (*closes <= REOPEN_LIMIT && *tabs < CLOSED_TAB_LIMIT);
+            }
+            newer_batch = closed.batch;
+            *tabs += usize::from(*kept);
+            keep.push(*kept);
+        }
+        let mut keep = keep.into_iter().rev();
+        self.closed.retain(|_| keep.next().unwrap_or(false));
     }
 
     /// Takes a closed tab, by default the most recent one, off the list.
@@ -814,9 +1205,79 @@ impl BrowserState {
         (index < self.closed.len()).then(|| self.closed.remove(index))
     }
 
+    /// How many tabs the most recent close took: one, or all the tabs closed
+    /// together with it.
+    pub fn last_closed_count(&self) -> usize {
+        let Some(last) = self.closed.last() else {
+            return 0;
+        };
+        match last.batch {
+            Some(batch) => self
+                .closed
+                .iter()
+                .rev()
+                .take_while(|closed| closed.batch == Some(batch))
+                .count(),
+            None => 1,
+        }
+    }
+
+    /// Takes the most recent close off the list: one tab, or all the tabs
+    /// closed together with it.
+    pub fn take_last_closed(&mut self) -> Vec<ClosedTab> {
+        let start = self.closed.len() - self.last_closed_count();
+        self.closed.split_off(start)
+    }
+
+    /// Puts a closed tab back in its space under a new id: in its section,
+    /// at its old place there (or as near as the section allows), else where
+    /// new tabs of that section go. The selection stays unless the space
+    /// was empty.
+    pub fn reopen_closed(&mut self, closed: ClosedTab) -> Option<TabId> {
+        self.space(closed.space_id)?;
+        let id = self.allocate_id();
+        let space = self.space_mut(closed.space_id)?;
+        let pin = closed.tab.pin;
+        let (start, end) = (space.section_start(pin), space.section_end(pin));
+        let at = match (closed.index, pin) {
+            (Some(index), _) => (start + index).min(end),
+            (None, Pin::Today) => start,
+            (None, _) => end,
+        };
+        let mut tab = Tab { id, ..closed.tab };
+        tab.repin(pin);
+        space.tabs.insert(at, tab);
+        space.selected_tab_id.get_or_insert(id);
+        Some(id)
+    }
+
     /// Forgets a closed tab that isn't worth reopening.
     pub fn forget_closed(&mut self, tab_id: TabId) {
         self.closed.retain(|closed| closed.tab.id != tab_id);
+    }
+
+    /// Forgets every closed tab, with the browsing history. Returns whether
+    /// there were any.
+    pub fn clear_closed(&mut self) -> bool {
+        let had_any = !self.closed.is_empty();
+        self.closed.clear();
+        had_any
+    }
+
+    /// Recent downloads as last saved, the newest first.
+    pub fn downloads(&self) -> &[SavedDownload] {
+        &self.downloads
+    }
+
+    /// Saves the library's downloads, the newest first: every running one
+    /// and the `DOWNLOAD_LIMIT` newest others. True if anything changed.
+    pub fn set_downloads(&mut self, mut downloads: Vec<SavedDownload>) -> bool {
+        trim_downloads(&mut downloads);
+        if self.downloads == downloads {
+            return false;
+        }
+        self.downloads = downloads;
+        true
     }
 
     fn validate_and_repair(&mut self) -> io::Result<()> {
@@ -874,11 +1335,21 @@ impl BrowserState {
                     tab.title = sanitized.clone();
                 }
                 tab.url = sanitized;
+                // Tabs pinned before pinned addresses were kept come back
+                // to where they are now.
+                tab.pinned_url = tab.pinned_url.as_deref().map(display_url);
+                tab.repin(tab.pin);
+                tab.custom_title = tab
+                    .custom_title
+                    .take()
+                    .filter(|name| !name.trim().is_empty());
             }
             let position_theme = (index % usize::from(THEME_COUNT)) as u8;
             space.theme = Some(space.theme.unwrap_or(position_theme) % THEME_COUNT);
             space.icon = space.icon.as_deref().and_then(sanitize_icon);
-            if space.name.trim().is_empty() {
+            // Older versions kept pasted tabs and line breaks.
+            space.name = space_name(&space.name);
+            if space.name.is_empty() {
                 space.name = format!("Space {}", index + 1);
             }
         }
@@ -896,8 +1367,30 @@ impl BrowserState {
             .iter()
             .filter_map(|host| normalize_host(host))
             .collect();
+        // A download still running when the app last stopped (a crash, a
+        // quit from the Dock) never finished.
+        for download in &mut self.downloads {
+            if download.state == DownloadState::Running {
+                download.state = DownloadState::Failed;
+                download.error = Some("Interrupted".into());
+            }
+            download.url = download_source(&download.url);
+        }
+        trim_downloads(&mut self.downloads);
         Ok(())
     }
+}
+
+/// Keeps every running download and the `DOWNLOAD_LIMIT` newest others.
+fn trim_downloads(downloads: &mut Vec<SavedDownload>) {
+    let mut others = 0;
+    downloads.retain(|download| {
+        if download.state == DownloadState::Running {
+            return true;
+        }
+        others += 1;
+        others <= DOWNLOAD_LIMIT
+    });
 }
 
 fn clamp_sidebar_width(width: f32) -> f32 {
@@ -910,7 +1403,7 @@ fn clamp_sidebar_width(width: f32) -> f32 {
 
 fn fallback_title(url: &str) -> String {
     if url == BLANK_URL {
-        "New tab".into()
+        "New Tab".into()
     } else {
         url.to_owned()
     }
@@ -941,6 +1434,20 @@ fn orphaned_profiles(profiles: &Path, spaces: &HashSet<SpaceId>) -> io::Result<V
         }
     }
     Ok(orphans)
+}
+
+/// A space's name on one line: tabs and line breaks from a paste, and runs
+/// of blanks, become single spaces; other control characters go.
+fn space_name(name: &str) -> String {
+    name.split_whitespace()
+        .map(|word| {
+            word.chars()
+                .filter(|ch| !ch.is_control())
+                .collect::<String>()
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn sanitize_icon(icon: &str) -> Option<String> {
@@ -974,7 +1481,7 @@ fn read_state(path: &Path, root: &Path) -> io::Result<BrowserState> {
 fn newer_schema() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        "this session was created by a newer version of MapBrowser",
+        "this session was created by a newer version of Map Browser",
     )
 }
 
@@ -990,12 +1497,18 @@ fn unique_suffix() -> String {
     format!("{}-{timestamp}-{count}", std::process::id())
 }
 
-fn quarantine(path: &Path) -> io::Result<()> {
+/// Sets a damaged file aside under a new name, which it returns.
+fn quarantine(path: &Path) -> io::Result<PathBuf> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    fs::rename(
-        path,
-        path.with_file_name(format!("{name}.corrupt-{}", unique_suffix())),
-    )
+    let kept = path.with_file_name(format!("{name}.corrupt-{}", unique_suffix()));
+    fs::rename(path, &kept)?;
+    Ok(kept)
+}
+
+/// Replaces a file of the data directory the way routine session saves do:
+/// complete or not at all, without flushing the drive.
+pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    atomic_write(path, bytes, Durability::Ordered)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8], durability: Durability) -> io::Result<()> {
@@ -1050,6 +1563,21 @@ fn flush_drive(directory: &Path) -> io::Result<()> {
     File::open(directory)?.sync_all()
 }
 
+/// Where a download came from, as kept for downloading it again: a web
+/// address without credentials, or nothing. data: addresses can be
+/// megabytes long and blob: ones end with their page, so neither is kept,
+/// and nothing offers to download them again.
+pub fn download_source(url: &str) -> String {
+    let web = url.split_once("://").is_some_and(|(scheme, _)| {
+        matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https")
+    });
+    if web && url.len() <= MAX_DOWNLOAD_URL_LEN {
+        display_url(url)
+    } else {
+        String::new()
+    }
+}
+
 /// Remove authority credentials from the URL kept in tabs, the address bar and disk.
 /// The original URL can still be sent directly to Chromium for authentication.
 pub fn display_url(url: &str) -> String {
@@ -1083,29 +1611,94 @@ pub fn normalize_address(input: &str) -> String {
     if input.is_empty() {
         return "about:blank".into();
     }
+    if let Some(query) = forced_search(input) {
+        return search_url(query);
+    }
+    // A path with a space in it, as Finder's Copy as Pathname gives one,
+    // opens the file only if it is there: "/r/rust memes" and "/imagine a
+    // red fox" are searched for. The disk is looked at here, as the text
+    // is opened, never as it is typed.
+    if input.contains(char::is_whitespace)
+        && let Some(path) = file_path(input)
+        && std::fs::symlink_metadata(&path).is_ok()
+        && let Ok(url) = Url::from_file_path(path)
+    {
+        return url.into();
+    }
     web_address(input).unwrap_or_else(|| search_url(input))
 }
 
 /// Whether address-bar text is searched for rather than opened as a URL.
 pub fn is_search_query(input: &str) -> bool {
     let input = input.trim();
-    !input.is_empty() && web_address(input).is_none()
+    !input.is_empty() && (forced_search(input).is_some() || web_address(input).is_none())
+}
+
+/// What a leading "?" asks to search for, even if it looks like an
+/// address, as in Chrome: "?example.com" searches for "example.com".
+pub fn forced_search(input: &str) -> Option<&str> {
+    input
+        .trim()
+        .strip_prefix('?')
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+}
+
+/// The words a search for address-bar text looks for.
+pub fn search_text(input: &str) -> &str {
+    forced_search(input).unwrap_or(input.trim())
+}
+
+/// Host names that only mean something on the local network, as with
+/// mDNS (.local) and home routers (.lan, .home.arpa). Pages there rarely
+/// have certificates, so they open over HTTP, as Chrome and Safari do.
+const LOCAL_SUFFIXES: &[&str] = &[
+    ".local",
+    ".lan",
+    ".home",
+    ".home.arpa",
+    ".internal",
+    ".intranet",
+    ".corp",
+    ".localdomain",
+];
+
+/// Whether `host` (lowercase, without a trailing dot) only means something
+/// on the local network: a single label such as "router", or a name under
+/// one of the local suffixes. A single label that is itself a public
+/// suffix ("dev", "app", "google") doesn't count: the HSTS preload list
+/// holds many such top-level domains, and its entry covers the bare label
+/// too. No preload list can hold the names that are left.
+pub fn is_local_network_name(host: &str) -> bool {
+    let single_label = !host.is_empty()
+        && !host.contains('.')
+        && !psl::suffix(host.as_bytes()).is_some_and(|suffix| suffix.is_known());
+    single_label || LOCAL_SUFFIXES.iter().any(|suffix| host.ends_with(suffix))
 }
 
 /// The URL that trimmed, non-empty text names, or `None` for a search query.
 fn web_address(input: &str) -> Option<String> {
+    // A file's path opens the file, as in Chrome and Safari. One with a
+    // space in it reads as words to search for, unless the file is there
+    // (`normalize_address`).
+    if !input.contains(char::is_whitespace)
+        && let Some(path) = file_path(input)
+    {
+        return Url::from_file_path(path).ok().map(String::from);
+    }
     let lower = input.to_ascii_lowercase();
-    if [
-        "http://",
-        "https://",
-        "file://",
-        "about:",
-        "data:",
-        "chrome:",
-        "devtools:",
-    ]
-    .iter()
-    .any(|prefix| lower.starts_with(prefix))
+    // Typed web addresses must be complete: "https://" alone, a space in
+    // the host or a port that isn't a number are searched for instead.
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        let url = Url::parse(input).ok()?;
+        return url
+            .host_str()
+            .is_some_and(|host| !host.is_empty())
+            .then(|| input.to_owned());
+    }
+    if ["file://", "about:", "data:", "chrome:", "devtools:"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
     {
         return Some(input.to_owned());
     }
@@ -1116,62 +1709,132 @@ fn web_address(input: &str) -> Option<String> {
         "mailto:",
         "tel:",
         "sms:",
+        "facetime:",
+        "facetime-audio:",
         "intent:",
     ]
     .iter()
     .any(|prefix| lower.starts_with(prefix));
-    if !non_web_scheme && !input.chars().any(char::is_whitespace) {
-        let schemeless = input.strip_prefix("//").unwrap_or(input);
-        let authority = schemeless
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or(schemeless);
-        // A colon in user:password must not make a URL into a search query.
-        let server = authority.rsplit('@').next().unwrap_or(authority);
-        let host = server
-            .split(':')
-            .next()
-            .unwrap_or(server)
-            .to_ascii_lowercase();
-        let local = host == "localhost"
-            || host.ends_with(".localhost")
-            || host.ends_with(".local")
-            || host == "127.0.0.1"
-            || host == "0.0.0.0"
-            || server.starts_with("[::1]");
-        if local {
-            return Some(format!("http://{schemeless}"));
-        }
-        let has_path = schemeless[authority.len()..].starts_with('/');
-        // "me@example.com" is an email address to search for; a login
-        // has a password or comes with a path.
-        if authority
-            .rsplit_once('@')
-            .is_some_and(|(userinfo, _)| !userinfo.contains(':'))
-            && !has_path
-        {
-            return None;
-        }
-        let has_port = server
-            .split_once(':')
-            .is_some_and(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()));
-        // Dotted words ("node.js", "e.g.") are searched unless they end in
-        // a real domain suffix or come with a path or port.
-        let known_suffix = || {
-            psl::suffix(host.trim_end_matches('.').as_bytes())
-                .is_some_and(|suffix| suffix.is_known())
-        };
-        if server.starts_with('[')
-            || host.parse::<std::net::Ipv4Addr>().is_ok()
-            || (host.contains('.') && (has_path || has_port || known_suffix()))
-        {
-            return Some(format!("https://{schemeless}"));
-        }
+    if non_web_scheme || input.chars().any(char::is_whitespace) {
+        return None;
     }
-    None
+    let schemeless = input.strip_prefix("//").unwrap_or(input);
+    let authority = schemeless
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(schemeless);
+    // A colon in user:password must not make a URL into a search query.
+    let server = authority.rsplit('@').next().unwrap_or(authority);
+    let (host, port) = split_port(server);
+    // "example.com:abc" is no address.
+    if port.is_some_and(|port| port.parse::<u16>().is_err()) {
+        return None;
+    }
+    let host = host.to_ascii_lowercase();
+    let has_path = schemeless[authority.len()..].starts_with('/');
+    let has_port = port.is_some();
+    // IP addresses (routers, NAS boxes, dev servers) and local names are
+    // reached over HTTP; Chrome doesn't upgrade them to HTTPS either.
+    let ip = host.parse::<std::net::Ipv4Addr>().is_ok()
+        || host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .is_some_and(|host| host.parse::<std::net::Ipv6Addr>().is_ok());
+    let name = host.trim_end_matches('.');
+    if ip
+        || name == "localhost"
+        || name.ends_with(".localhost")
+        || LOCAL_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+    {
+        return Some(format!("http://{schemeless}"));
+    }
+    // "me@example.com" is an email address to search for; a login has a
+    // password or comes with a path.
+    if authority
+        .rsplit_once('@')
+        .is_some_and(|(userinfo, _)| !userinfo.contains(':'))
+        && !has_path
+    {
+        return None;
+    }
+    if name.is_empty() || name.starts_with('[') {
+        return None;
+    }
+    // A real domain suffix opens over HTTPS. Other dotted names are
+    // intranet hosts ("wiki.mycompany/page") when they come with a path or
+    // port, else words ("node.js", "e.g.", "café") to search for.
+    let known_suffix =
+        name.contains('.') && psl::suffix(name.as_bytes()).is_some_and(|suffix| suffix.is_known());
+    if known_suffix {
+        Some(format!("https://{schemeless}"))
+    } else if name.contains('.') && (has_path || has_port) {
+        Some(format!("http://{schemeless}"))
+    } else if host_label(name) && (has_port || &schemeless[authority.len()..] == "/") {
+        // A single name is a machine on the network only in the forms a
+        // word with a slash or a colon isn't written in: "router/" and
+        // "nas:5000" open, "tcp/ip", "24/7" and "16:9" are searched for.
+        Some(format!("http://{schemeless}"))
+    } else {
+        None
+    }
 }
 
-/// A Google search for `input`.
+/// Intranet short-link text such as "go/payroll" or "wiki/Onboarding": a
+/// name of two characters or more, then a path. It reads like "tcp/ip"
+/// or "and/or", so Return searches for it; the command bar offers it as
+/// an address as well, and first once the user has been to that name.
+/// Returns the name, lowercase, and the address.
+pub fn short_link(input: &str) -> Option<(String, String)> {
+    let input = input.trim();
+    let (name, path) = input.split_once('/')?;
+    let name = name.to_ascii_lowercase();
+    let short = name.len() >= 2
+        && !path.is_empty()
+        && host_label(&name)
+        && !input.contains(char::is_whitespace)
+        && forced_search(input).is_none()
+        && is_search_query(input);
+    short.then(|| (name, format!("http://{input}")))
+}
+
+/// Whether `name` can be a machine's name on the network: letters, digits
+/// and hyphens, with a letter among them ("24" is a number).
+fn host_label(name: &str) -> bool {
+    !name.starts_with('-')
+        && !name.ends_with('-')
+        && name.bytes().any(|byte| byte.is_ascii_alphabetic())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// The file a typed path names: an absolute path, or one in the home
+/// folder ("~/Desktop/page.html"). "//host/path" is an address.
+fn file_path(input: &str) -> Option<PathBuf> {
+    if let Some(path) = input.strip_prefix("~/") {
+        return dirs::home_dir().map(|home| home.join(path));
+    }
+    (input.starts_with('/') && !input.starts_with("//")).then(|| PathBuf::from(input))
+}
+
+/// Splits "host:port" and "[ipv6]:port"; the port is `None` without a colon.
+fn split_port(server: &str) -> (&str, Option<&str>) {
+    if server.starts_with('[') {
+        return match server.find(']') {
+            Some(end) => {
+                let (host, rest) = server.split_at(end + 1);
+                (host, rest.strip_prefix(':'))
+            }
+            None => (server, None),
+        };
+    }
+    match server.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (server, None),
+    }
+}
+
+/// A search for `input` with the chosen search engine.
 pub fn search_url(input: &str) -> String {
     let mut query = String::new();
     for byte in input.bytes() {
@@ -1186,7 +1849,7 @@ pub fn search_url(input: &str) -> String {
             }
         }
     }
-    format!("https://www.google.com/search?q={query}")
+    format!("{}{query}", current_search_engine().query_url())
 }
 
 #[cfg(test)]
@@ -1414,13 +2077,13 @@ mod tests {
     fn new_spaces_are_empty_selected_and_use_the_least_used_theme() {
         let mut state = BrowserState::default();
         assert_eq!(state.spaces[0].theme(), 0);
-        assert_eq!(state.spaces[1].theme(), 1);
+        assert_eq!(state.spaces[1].theme(), 2);
         let research = state.create_space("  Research ");
         let space = state.space(research).unwrap();
         assert_eq!(space.name, "Research");
         assert!(space.tabs.is_empty());
         assert_eq!(space.selected_tab_id, None);
-        assert_eq!(space.theme(), 2);
+        assert_eq!(space.theme(), 4);
         assert_eq!(state.selected_space_id, research);
         assert_eq!(state.active_tab(), None);
 
@@ -1440,7 +2103,7 @@ mod tests {
             .map(Space::theme)
             .collect::<HashSet<_>>();
         assert_eq!(themes.len(), usize::from(THEME_COUNT));
-        // With every theme used once, the lowest index wins.
+        // With every theme used once, the first in the order wins.
         let ninth = state.create_space("Ninth");
         assert_eq!(state.space(ninth).unwrap().theme(), 0);
     }
@@ -1866,7 +2529,7 @@ mod tests {
         );
         let blank = state.new_tab(space, "  ").unwrap();
         assert_eq!(state.tab(blank).unwrap().url, BLANK_URL);
-        assert_eq!(state.tab(blank).unwrap().title, "New tab");
+        assert_eq!(state.tab(blank).unwrap().title, "New Tab");
     }
 
     #[test]
@@ -1926,9 +2589,10 @@ mod tests {
             ("example.com.", "https://example.com."),
             ("localhost:8000", "http://localhost:8000"),
             ("raspberrypi.local", "http://raspberrypi.local"),
-            ("192.168.1.1", "https://192.168.1.1"),
-            ("intranet.corp/wiki", "https://intranet.corp/wiki"),
-            ("build.internal:8080", "https://build.internal:8080"),
+            // IP addresses and intranet names open over HTTP.
+            ("192.168.1.1", "http://192.168.1.1"),
+            ("intranet.corp/wiki", "http://intranet.corp/wiki"),
+            ("build.internal:8080", "http://build.internal:8080"),
             // Dotted words and email addresses are searched.
             ("node.js", "https://www.google.com/search?q=node.js"),
             ("next.js", "https://www.google.com/search?q=next.js"),
@@ -2231,7 +2895,7 @@ mod tests {
             id,
             url: format!("https://{id}.test/"),
             title: id.to_string(),
-            pin: Pin::Today,
+            ..Tab::default()
         }
     }
 

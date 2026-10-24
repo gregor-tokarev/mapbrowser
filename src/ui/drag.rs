@@ -12,13 +12,15 @@ use gpui::{
     Bounds, Context, Image, IntoElement, ParentElement, Pixels, Point, Render, SharedString, Size,
     Styled, Window, div, img, point, prelude::FluentBuilder, px, size,
 };
-use std::sync::Arc;
+use std::{cell::Cell, rc::Rc, sync::Arc};
 
 /// The edge handle's width; it lies inside the sidebar, against its edge.
 pub const EDGE_HANDLE: f32 = 6.;
 /// Dragging the edge further left than this hides the sidebar, like Arc.
 const HIDE_BELOW: f32 = 120.;
 const INDICATOR: f32 = 2.;
+/// A dragged tab's size over the space switcher.
+const COMPACT_PREVIEW: f32 = 30.;
 
 /// A tab being dragged; the sidebar drops it where its indicator shows.
 pub struct DraggedTab(pub TabId);
@@ -172,7 +174,11 @@ fn tile_index(tiles: &[Bounds<Pixels>], pointer: Point<Pixels>) -> usize {
         .unwrap_or(tiles.len())
 }
 
-/// A dragged tab under the pointer: its row or favorite tile, lifted.
+/// A dragged tab under the pointer: its row or favorite tile, lifted. Over
+/// the space switcher it shrinks to its icon beside the pointer, leaving
+/// the space it would move to in sight. GPUI draws it above everything,
+/// the sidebar's drop indicator too, so it draws that line again over
+/// itself: where the tab lands stays in sight right under the pointer.
 #[derive(Clone)]
 pub struct TabPreview {
     pub title: SharedString,
@@ -181,11 +187,18 @@ pub struct TabPreview {
     pub theme: Theme,
     pub size: Size<Pixels>,
     pub tile: bool,
+    /// Where the pointer holds it.
+    pub cursor: Point<Pixels>,
+    /// Set while the pointer is over the space switcher.
+    pub over_spaces: Rc<Cell<bool>>,
+    /// The drop indicator the sidebar draws, in window coordinates.
+    pub line: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 impl Render for TabPreview {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let icon_size = if self.tile { 20. } else { 16. };
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let compact = self.over_spaces.get();
+        let icon_size = if self.tile || compact { 20. } else { 16. };
         let favicon = match self.favicon.clone() {
             Some(image) => img(image)
                 .size(px(icon_size))
@@ -193,6 +206,38 @@ impl Render for TabPreview {
                 .into_any_element(),
             None => placeholder_favicon(self.host.as_deref(), &self.theme).into_any_element(),
         };
+        if compact {
+            return div().w(self.size.width).h(self.size.height).child(
+                div()
+                    .absolute()
+                    .left(self.cursor.x + px(8.))
+                    .top(self.cursor.y - px(COMPACT_PREVIEW + 8.))
+                    .size(px(COMPACT_PREVIEW))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.))
+                    .bg(self.theme.surface())
+                    .border_1()
+                    .border_color(self.theme.ink(0.08))
+                    .shadow(vec![shadow(4., 14., 0.16)])
+                    .child(favicon),
+            );
+        }
+        // GPUI places the preview with the pointer at `cursor` in it; the
+        // line is in window coordinates, and the preview's border moves
+        // what it holds 1 pt in.
+        let origin = window.mouse_position() - self.cursor + point(px(1.), px(1.));
+        let line = self.line.get().map(|line| {
+            div()
+                .absolute()
+                .left(line.left() - origin.x)
+                .top(line.top() - origin.y)
+                .w(line.size.width)
+                .h(line.size.height)
+                .rounded_full()
+                .bg(self.theme.focus())
+        });
         div()
             .font_family(UI_FONT)
             .flex()
@@ -205,6 +250,7 @@ impl Render for TabPreview {
             .border_color(self.theme.ink(0.08))
             .shadow(vec![shadow(4., 14., 0.16)])
             .opacity(0.92)
+            .children(line)
             .map(|preview| {
                 if self.tile {
                     preview.justify_center().child(favicon)

@@ -1,6 +1,6 @@
 //! Menu commands for a tab's page: zoom, printing and developer tools.
 
-use super::{BrowserLink, Engine, popups};
+use super::{Engine, popups};
 use crate::engine::{ZoomStep, zoom_percent};
 use cef::*;
 
@@ -14,6 +14,13 @@ impl Engine {
             ZoomStep::Out => ZoomCommand::OUT,
             ZoomStep::Reset => ZoomCommand::RESET,
         });
+        Some(zoom_percent(host.zoom_level()))
+    }
+
+    /// The tab's page zoom in percent, as Chromium applies it to the site
+    /// (also after a navigation); `None` without a browser.
+    pub fn zoom_percent(&self, tab_id: u64) -> Option<u32> {
+        let host = self.live_browser(tab_id)?.host()?;
         Some(zoom_percent(host.zoom_level()))
     }
 
@@ -36,16 +43,7 @@ impl Engine {
             host.close_dev_tools();
             return;
         }
-        let mut client = popups::tools_client(BrowserLink {
-            tab_id,
-            instance: 0,
-            events: self.events.clone(),
-            pending: self.pending.clone(),
-            keys: self.keys.clone(),
-            live_browsers: self.live_browsers.clone(),
-            downloads: self.downloads.clone(),
-            permissions: self.permissions.clone(),
-        });
+        let mut client = popups::tools_client(self.link(tab_id, 0));
         host.show_dev_tools(
             Some(&WindowInfo::default()),
             Some(&mut client),

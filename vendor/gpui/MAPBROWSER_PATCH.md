@@ -112,3 +112,10 @@ early instead of asserting once `MacPlatform::run` has returned and cleared the
 platform pointer. Map Browser runs Chromium's shutdown after GPUI's loop ends,
 and that shutdown can spin the AppKit loop again; a menu validation, Dock click,
 opened URL or keyboard-layout change arriving then used to abort the process.
+
+`applicationShouldHandleReopen:hasVisibleWindows:` returns YES. Upstream
+declared it without a return value, so AppKit read whatever the register held
+and might skip its own reopen work, such as bringing back a minimized window
+when the Dock icon is clicked. A menu named "Help" becomes AppKit's Help menu
+(`NSApp.helpMenu`), which gets the menu search field, as "Window" already
+becomes its Windows menu.

@@ -6,17 +6,30 @@
 //! back to the browser window. Popups get the opener's profile, so a sign-in
 //! lands in the right space. Their handlers keep their titles, addresses and
 //! loads away from the opener's tab, and quitting waits for them to close.
+//! They download files and ask for permissions as tabs do, on behalf of
+//! the tab that opened them, with a browser instance number of their own.
 //! DevTools windows are tracked the same way.
 
 use super::{
-    BrowserLink, TabRequests, browser_view, context_menu::TabMenu, page_keys::PageKeys, request_tab,
+    BrowserLink, TabRequests, browser_view, context_menu::TabMenu, downloads::TabDownloads,
+    frame_url, page_keys::PageKeys, permissions::TabPermissions, request_tab,
 };
-use crate::engine::{NewWindow, ScreenRect, WindowRequest, new_window_for, popup_rect};
+use crate::engine::{
+    EngineEvent, NewWindow, ScreenRect, WindowRequest, new_window_for, opens_in_tab, popup_rect,
+};
 use cef::*;
 use objc2::{MainThreadMarker, rc::Retained};
 use objc2_app_kit::{NSScreen, NSView, NSWindow};
 use objc2_foundation::NSString;
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+
+/// Popups' and DevTools windows' browser instance numbers, apart from the
+/// tabs' (which count up from 1), so that their downloads and requests end
+/// with them and never with a tab.
+static NEXT_POPUP_INSTANCE: AtomicU64 = AtomicU64::new(1 << 40);
 
 /// Decides `on_before_popup` for the tab `link` stands for, or for one of
 /// its popups: true cancels the popup.
@@ -65,7 +78,24 @@ pub(super) fn before_popup(
             request_tab(link, opener, url, background);
             true
         }
-        NewWindow::Blocked => true,
+        NewWindow::Blocked => {
+            link.send(EngineEvent::PopupBlocked {
+                tab_id: link.tab_id,
+                url: blocked_url(url, opener),
+            });
+            true
+        }
+    }
+}
+
+/// What a blocked pop-up's notice may offer to open as a tab: `url` if a
+/// tab can show it, else nothing (about:blank pop-ups a script fills,
+/// javascript: and data: addresses).
+pub(super) fn blocked_url(url: String, opener: Option<&Frame>) -> String {
+    if opens_in_tab(&url, &frame_url(opener)) {
+        url
+    } else {
+        String::new()
     }
 }
 
@@ -109,6 +139,8 @@ wrap_client! {
         display: Option<DisplayHandler>,
         requests: Option<RequestHandler>,
         menu: Option<ContextMenuHandler>,
+        downloads: Option<DownloadHandler>,
+        permissions: Option<PermissionHandler>,
     }
     impl Client {
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
@@ -126,27 +158,47 @@ wrap_client! {
         fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
             self.menu.clone()
         }
+        fn download_handler(&self) -> Option<DownloadHandler> {
+            self.downloads.clone()
+        }
+        fn permission_handler(&self) -> Option<PermissionHandler> {
+            self.permissions.clone()
+        }
     }
 }
 
 /// A popup opened from the tab `link` stands for. Its links open tabs, and
 /// its own popups windows, as the tab's do.
 fn popup_client(link: BrowserLink) -> Client {
+    let link = BrowserLink {
+        instance: NEXT_POPUP_INSTANCE.fetch_add(1, Ordering::Relaxed),
+        ..link
+    };
     PopupClient::new(
         PopupLife::new(link.clone()),
         PageKeys::new(link.clone(), true),
         Some(PopupDisplay::new()),
         // Their loads show nowhere: the tab's page state isn't theirs.
-        Some(TabRequests::new(link.clone(), Arc::default())),
-        Some(TabMenu::new(link, true)),
+        Some(TabRequests::new(link.clone(), Arc::default(), true)),
+        Some(TabMenu::new(link.clone())),
+        Some(TabDownloads::new(link.clone(), true)),
+        Some(TabPermissions::new(link)),
     )
 }
 
-/// A tab's DevTools window, which Chromium titles and runs itself.
+/// A tab's DevTools window, which Chromium titles and runs itself. It gets
+/// an instance number of its own: closing it must not end the tab's
+/// questions (sign-ins, permissions, "Leave site?") nor its downloads.
 pub(super) fn tools_client(link: BrowserLink) -> Client {
+    let link = BrowserLink {
+        instance: NEXT_POPUP_INSTANCE.fetch_add(1, Ordering::Relaxed),
+        ..link
+    };
     PopupClient::new(
         PopupLife::new(link.clone()),
         PageKeys::new(link, true),
+        None,
+        None,
         None,
         None,
         None,
@@ -170,9 +222,24 @@ wrap_life_span_handler! {
             let url = target_url.map(ToString::to_string).unwrap_or_default();
             i32::from(before_popup(&self.link, frame.as_deref(), url, target_disposition, user_gesture != 0, popup_features, window_info, client))
         }
-        // do_close is left to CEF, which closes the popup's window.
+        // CEF closes the popup's window, unless the popup still downloads:
+        // then the window goes and the browser, which reports the download,
+        // stays until the download ends. Quitting cancels downloads.
+        fn do_close(&self, browser: Option<&mut Browser>) -> i32 {
+            let Some(browser) = browser else { return 0; };
+            if self.link.pending().shutting_down || !self.link.downloads.running_for(self.link.instance) {
+                return 0;
+            }
+            if let Some(window) = popup_window(browser) {
+                window.orderOut(None);
+            }
+            self.link.downloads.close_when_done(self.link.instance, browser.clone());
+            1
+        }
         fn on_before_close(&self, browser: Option<&mut Browser>) {
             self.link.live_browsers.fetch_sub(1, Ordering::SeqCst);
+            self.link.permissions.drop_page(&self.link);
+            self.link.requests.drop_page(&self.link, true);
             let ready_to_quit = {
                 let mut pending = self.link.pending();
                 if let Some(browser) = browser {
@@ -205,6 +272,6 @@ wrap_display_handler! {
     }
 }
 
-fn popup_window(browser: &Browser) -> Option<Retained<NSWindow>> {
+pub(super) fn popup_window(browser: &Browser) -> Option<Retained<NSWindow>> {
     browser_view(browser)?.window()
 }

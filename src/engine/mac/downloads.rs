@@ -1,11 +1,16 @@
 //! Downloads go straight to ~/Downloads, without a dialog. Without a
 //! handler CEF 152 hands them to Chrome's download code, which saves them
 //! there too but reports nothing to the app, and holds files it would ask
-//! about in a download bubble Alloy browsers don't have.
+//! about in a download bubble Alloy browsers don't have. Popup windows
+//! download the same way. A popup closed while downloading, or a tab
+//! whose page let go while downloading (`TabLife::do_close`), keeps its
+//! browser, hidden, until its downloads end, since CEF reports a download
+//! only while the browser that started it lives.
 
-use super::{BrowserLink, frame_url};
+use super::{BrowserLink, Engine, frame_url, popups::popup_window};
 use crate::engine::{
-    EngineEvent, download_file_name, download_progress_worth_reporting, unique_file_name,
+    CANCELLED_BY_USER, DownloadEnd, EngineEvent, download_failure, download_file_name,
+    download_progress_worth_reporting, unique_file_name,
 };
 use cef::*;
 use std::{
@@ -26,6 +31,9 @@ pub(super) struct Downloads(Arc<Mutex<State>>);
 struct State {
     next_id: u64,
     active: HashMap<(u64, u32), Active>,
+    /// Popups and pages closed while downloading, by browser instance:
+    /// they close once their downloads end.
+    closing: HashMap<u64, Browser>,
 }
 
 struct Active {
@@ -34,6 +42,9 @@ struct Active {
     reported: Option<(Instant, u64)>,
     /// The latest callback, which can still cancel the download.
     callback: Option<DownloadItemCallback>,
+    /// Cancelled before Chromium handed over a callback: it cancels with
+    /// the first one.
+    cancel: bool,
 }
 
 impl Downloads {
@@ -60,6 +71,7 @@ impl Downloads {
                 path: path.clone(),
                 reported: None,
                 callback: None,
+                cancel: false,
             },
         );
         (id, path)
@@ -71,33 +83,101 @@ impl Downloads {
         item: &DownloadItem,
         callback: Option<&DownloadItemCallback>,
     ) -> Option<EngineEvent> {
+        // A callback replaced, or left by the download that ended, goes once
+        // the lock is released, as every callback here is answered.
+        let released: Option<DownloadItemCallback>;
         let mut state = self.state();
         let active = state.active.get_mut(&key)?;
         let id = active.id;
-        if item.is_complete() != 0 || item.is_canceled() != 0 || item.is_interrupted() != 0 {
-            state.active.remove(&key);
-            return Some(EngineEvent::DownloadFinished {
-                id,
-                ok: item.is_complete() != 0,
-            });
+        let received = u64::try_from(item.received_bytes()).unwrap_or(0);
+        let end = if item.is_complete() != 0 {
+            Some(DownloadEnd::Complete { size: received })
+        } else if item.is_canceled() != 0 {
+            Some(DownloadEnd::Cancelled)
+        } else if item.is_interrupted() != 0 {
+            let reason = item.interrupt_reason().get_raw();
+            Some(if reason == CANCELLED_BY_USER {
+                DownloadEnd::Cancelled
+            } else {
+                DownloadEnd::Failed {
+                    reason: download_failure(reason),
+                }
+            })
+        } else {
+            None
+        };
+        if let Some(end) = end {
+            released = state.active.remove(&key).and_then(|active| active.callback);
+            drop(state);
+            drop(released);
+            return Some(EngineEvent::DownloadFinished { id, end });
         }
         if let Some(callback) = callback {
-            active.callback = Some(callback.clone());
+            if active.cancel {
+                // Cancelling can call back in here: not with the lock held.
+                let callback = callback.clone();
+                drop(state);
+                callback.cancel();
+                return None;
+            }
+            released = active.callback.replace(callback.clone());
+        } else {
+            released = None;
         }
-        let received = u64::try_from(item.received_bytes()).unwrap_or(0);
         let total = u64::try_from(item.total_bytes())
             .ok()
             .filter(|&total| total > 0);
         let now = Instant::now();
-        if !download_progress_worth_reporting(active.reported, now, received, total) {
-            return None;
+        let report = download_progress_worth_reporting(active.reported, now, received, total);
+        if report {
+            active.reported = Some((now, received));
         }
-        active.reported = Some((now, received));
-        Some(EngineEvent::DownloadProgress {
+        drop(state);
+        drop(released);
+        report.then_some(EngineEvent::DownloadProgress {
             id,
             received,
             total,
         })
+    }
+
+    /// Cancels download `id`. Chromium deletes what it saved so far, and
+    /// `DownloadFinished` follows.
+    fn cancel(&self, id: u64) {
+        let callback = {
+            let mut state = self.state();
+            let Some(active) = state.active.values_mut().find(|active| active.id == id) else {
+                return;
+            };
+            active.cancel = true;
+            active.callback.take()
+        };
+        if let Some(callback) = callback {
+            callback.cancel();
+        }
+    }
+
+    /// Whether a download of the browser `instance` is in progress.
+    pub(super) fn running_for(&self, instance: u64) -> bool {
+        self.state()
+            .active
+            .keys()
+            .any(|&(owner, _)| owner == instance)
+    }
+
+    /// Closes `browser` (`instance`), a popup or a page that let go, once
+    /// its downloads end.
+    pub(super) fn close_when_done(&self, instance: u64, browser: Browser) {
+        self.state().closing.insert(instance, browser);
+    }
+
+    /// The browser waiting for the downloads of `instance`, now they ended.
+    fn done_closing(&self, instance: u64) -> Option<Browser> {
+        let mut state = self.state();
+        if state.active.keys().any(|&(owner, _)| owner == instance) {
+            return None;
+        }
+        state.closing.remove(&instance)
     }
 
     /// Cancels every download in progress, for quitting: Chromium would
@@ -114,6 +194,23 @@ impl Downloads {
         for callback in callbacks {
             callback.cancel();
         }
+    }
+}
+
+impl Engine {
+    /// Cancels a download in progress (the library's ×).
+    pub fn cancel_download(&self, id: u64) {
+        self.downloads.cancel(id);
+    }
+
+    /// Downloads `url` again through the tab's browser, so with its space's
+    /// profile, as a new download. False when the tab has no browser.
+    pub fn start_download(&self, tab_id: u64, url: &str) -> bool {
+        let Some(host) = self.live_browser(tab_id).and_then(|browser| browser.host()) else {
+            return false;
+        };
+        host.start_download(Some(&CefString::from(url)));
+        true
     }
 }
 
@@ -134,8 +231,20 @@ fn path_string(path: &Path) -> CefString {
     CefString::from(path.to_string_lossy().as_ref())
 }
 
+/// Where a download comes from, before redirects: signed links that
+/// redirect expire, the address that hands them out doesn't.
+fn source_url(item: &DownloadItem) -> String {
+    let original = CefString::from(&item.original_url()).to_string();
+    if original.is_empty() {
+        CefString::from(&item.url()).to_string()
+    } else {
+        original
+    }
+}
+
+// `popup`: a popup window's, which leaves its opener tab alone.
 wrap_download_handler! {
-    pub(super) struct TabDownloads { link: BrowserLink }
+    pub(super) struct TabDownloads { link: BrowserLink, popup: bool }
     impl DownloadHandler {
         fn can_download(&self, _browser: Option<&mut Browser>, _url: Option<&CefString>, _request_method: Option<&CefString>) -> i32 {
             1
@@ -145,19 +254,36 @@ wrap_download_handler! {
             let name = download_file_name(&suggested_name.map(ToString::to_string).unwrap_or_default());
             let (id, path) = self.link.downloads.start((self.link.instance, item.id()), &name);
             callback.cont(Some(&path_string(&path)), 0);
+            let blank = shows_no_page(browser.as_deref());
             self.link.send(EngineEvent::DownloadStarted {
                 id,
                 tab_id: self.link.tab_id,
                 name: path.file_name().map_or(name, |name| name.to_string_lossy().into_owned()),
                 path,
-                blank_tab: shows_no_page(browser.as_deref()),
+                url: source_url(item),
+                blank_tab: blank && !self.popup,
             });
+            // A popup opened only for a file has nothing to show: it goes,
+            // and closes once the file is in.
+            if blank && self.popup && let Some(browser) = browser {
+                if let Some(window) = popup_window(browser) {
+                    window.orderOut(None);
+                }
+                self.link.downloads.close_when_done(self.link.instance, browser.clone());
+            }
             1
         }
         fn on_download_updated(&self, _browser: Option<&mut Browser>, download_item: Option<&mut DownloadItem>, callback: Option<&mut DownloadItemCallback>) {
             let Some(item) = download_item else { return; };
             if let Some(event) = self.link.downloads.update((self.link.instance, item.id()), item, callback.as_deref()) {
                 self.link.send(event);
+            }
+            // A page's browser closes again, now through to its view
+            // (`TabLife::do_close`).
+            if let Some(browser) = self.link.downloads.done_closing(self.link.instance)
+                && let Some(host) = browser.host()
+            {
+                host.close_browser(1);
             }
         }
     }

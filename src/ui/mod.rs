@@ -5,13 +5,17 @@ pub mod command_bar;
 mod content;
 pub mod downloads;
 pub mod drag;
+pub mod elide;
 pub mod find_bar;
+mod fullscreen_hint;
 pub mod icons;
 pub mod link_status;
 pub mod menu;
+pub mod page_notice;
 pub mod permissions;
 pub mod redraw;
-mod sidebar;
+pub mod shortcuts;
+pub mod sidebar;
 pub mod swipe;
 pub mod theme;
 pub mod toast_window;
@@ -20,10 +24,11 @@ pub mod window_frame;
 use crate::{Dismiss, app::BrowserApp};
 use drag::DraggedEdge;
 use gpui::{
-    AnyView, App, AppContext, Bounds, BoxShadow, Context, Div, DragMoveEvent, FontWeight,
-    InteractiveElement, IntoElement, ModifiersChangedEvent, MouseButton, ParentElement, Pixels,
-    Render, SharedString, StatefulInteractiveElement, Styled, Window, div, point,
-    prelude::FluentBuilder, px, size,
+    AnyView, App, AppContext, Bounds, BoxShadow, Context, Div, DragMoveEvent, Font, FontWeight,
+    InteractiveElement, IntoElement, KeyDownEvent, LineFragment, ModifiersChangedEvent,
+    MouseButton, MouseMoveEvent, ParentElement, Pixels, Render, SharedString,
+    StatefulInteractiveElement, Styled, TextRun, Window, div, font, point, prelude::FluentBuilder,
+    px, size,
 };
 use theme::Theme;
 
@@ -48,10 +53,15 @@ pub struct SlideFrame {
 
 impl BrowserApp {
     /// The sidebar's width, unless it is hidden or a page is fullscreen. A
-    /// hidden sidebar shows while the page on screen asks for a permission:
-    /// the question is in it.
+    /// hidden sidebar shows while the page on screen asks for a permission,
+    /// and while a space or a tab is named: the question and the name are
+    /// in it. It also peeks out from the window's edge.
     pub fn sidebar_width(&self) -> Option<f32> {
-        let shown = !self.state.sidebar_hidden || self.permission_shown().is_some();
+        let shown = !self.state.sidebar_hidden
+            || self.sidebar_peek
+            || self.permission_shown().is_some()
+            || self.renaming.is_some()
+            || self.renaming_tab.is_some();
         (shown && !self.fullscreen).then(|| self.state.sidebar_width())
     }
 
@@ -124,6 +134,7 @@ impl Render for BrowserApp {
         if !cx.has_active_drag() {
             self.tab_drag = None;
         }
+        self.prepare_sidebar(window, cx);
         let viewport = window.viewport_size();
         let (frame, slide_finished) = self.slide_frame(window);
         let theme = match (frame, &self.slide) {
@@ -134,11 +145,18 @@ impl Render for BrowserApp {
         };
         let card = self.card_bounds(viewport);
         self.sync_find_bar(card, window, cx);
+        self.sync_command_bar(card, window, cx);
         self.sync_toast_window(card, window, cx);
         self.sync_link_status(card, window, cx);
+        self.sync_fullscreen_hint(card, window, cx);
+        self.sync_menu_bar(cx);
+        if let Some(width) = self.sidebar_width() {
+            self.fit_toast(width, window);
+        }
+        self.sync_traffic_lights();
         let sidebar = self
             .sidebar_width()
-            .map(|width| self.render_sidebar(width, &theme, frame, cx));
+            .map(|width| self.render_sidebar(width, &theme, frame, window, cx));
         let menu = self
             .menu
             .as_ref()
@@ -147,9 +165,18 @@ impl Render for BrowserApp {
             .size_full()
             .relative()
             .font_family(UI_FONT)
-            .key_context("Browser")
+            .key_context(self.key_context())
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|this, _: &Dismiss, _, cx| this.dismiss(cx)))
+            .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
+            .map(|root| menu::handle_menu_keys(root, cx))
+            .when(self.sidebar_peek, |root| {
+                root.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                    this.peek_pointer_moved(event.position.x, cx)
+                }))
+            })
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.tab_through_card(event, window, cx)
+            }))
             .on_modifiers_changed(
                 cx.listener(|this, event: &ModifiersChangedEvent, window, cx| {
                     if !event.modifiers.control {
@@ -167,9 +194,10 @@ impl Render for BrowserApp {
             // The whole window background is one gradient quad.
             .bg(theme.background())
             .children(self.render_card_shadow(card))
-            .child(self.render_card(card, &theme, frame, slide_finished, viewport))
+            .child(self.render_card(card, &theme, frame, slide_finished, viewport, window, cx))
             .children(self.render_progress(card, &theme))
             .children(sidebar)
+            .children(self.render_peek_edge(cx))
             .children(menu)
     }
 }
@@ -235,12 +263,31 @@ pub fn placeholder_favicon(host: Option<&str>, theme: &Theme) -> Div {
         .child(initial)
 }
 
+/// How many lines `text` takes in `font` at `size`, wrapped at `width`
+/// the way GPUI lays out text.
+pub fn wrapped_lines(text: &str, font: Font, size: f32, width: f32, cx: &App) -> usize {
+    let mut wrapper = cx.text_system().line_wrapper(font, px(size));
+    wrapper
+        .wrap_line(&[LineFragment::text(text)], px(width))
+        .count()
+        + 1
+}
+
 /// Gap between the pointer and a tooltip, a tooltip's height, and the room
 /// it keeps from the sidebar's edges.
 const TOOLTIP_GAP: f32 = 6.;
 const TOOLTIP_HEIGHT: f32 = 26.;
 const TOOLTIP_EDGE: f32 = 6.;
 const TOOLTIP_MAX_WIDTH: f32 = 180.;
+const TOOLTIP_TEXT_SIZE: f32 = 12.;
+/// Wrapping tooltips: the line height, and the most lines shown, enough
+/// for a whole address: its end, the domain that owns it, matters most.
+const TOOLTIP_LINE: f32 = 16.;
+const TOOLTIP_MAX_LINES: usize = 10;
+/// A tooltip's padding and border on each side, and the gap before its
+/// shortcut.
+const TOOLTIP_PADDING: f32 = 8. + 1.;
+const TOOLTIP_SHORTCUT_GAP: f32 = 6.;
 
 /// Small text tooltips with the control's shortcut, like Arc's. Anything
 /// drawn over the card is hidden behind the page on macOS, so they stay
@@ -254,6 +301,8 @@ pub struct Tooltip {
     width: f32,
     /// The pointer's x when the tooltip opened.
     pointer: f32,
+    /// For text that wraps rather than ending in "…": its lines and width.
+    wrapped: Option<(usize, f32)>,
 }
 
 impl Tooltip {
@@ -264,9 +313,42 @@ impl Tooltip {
         theme: &Theme,
         width: f32,
     ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
-        let (text, theme) = (text.into(), *theme);
+        Self::builder(text.into(), shortcut, *theme, width, false)
+    }
+
+    /// Like `build`, for text that should show in full, such as a long
+    /// space name: it wraps onto a few lines instead of ending in "…".
+    pub fn build_wrapping(
+        text: impl Into<SharedString>,
+        shortcut: &'static str,
+        theme: &Theme,
+        width: f32,
+    ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+        Self::builder(text.into(), shortcut, *theme, width, true)
+    }
+
+    fn builder(
+        text: SharedString,
+        shortcut: &'static str,
+        theme: Theme,
+        width: f32,
+        wrap: bool,
+    ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
         move |window, cx| {
             let pointer = f32::from(window.mouse_position().x);
+            // Measured when it opens, so drawing the sidebar costs nothing.
+            let wrapped = wrap
+                .then(|| {
+                    let mut room = Self::max_width(width) - 2. * TOOLTIP_PADDING;
+                    if !shortcut.is_empty() {
+                        let shortcut =
+                            text_width(shortcut, font(UI_FONT), TOOLTIP_TEXT_SIZE, window);
+                        room -= shortcut.ceil() + TOOLTIP_SHORTCUT_GAP;
+                    }
+                    let lines = wrapped_lines(&text, font(UI_FONT), TOOLTIP_TEXT_SIZE, room, cx);
+                    (lines.min(TOOLTIP_MAX_LINES), room)
+                })
+                .filter(|&(lines, _)| lines > 1);
             let text = text.clone();
             cx.new(|_| Self {
                 text,
@@ -274,60 +356,112 @@ impl Tooltip {
                 theme,
                 width,
                 pointer,
+                wrapped,
             })
             .into()
         }
     }
+
+    /// The widest a tooltip gets in a sidebar `width` wide.
+    fn max_width(width: f32) -> f32 {
+        TOOLTIP_MAX_WIDTH.min((width - 2. * TOOLTIP_EDGE).max(0.))
+    }
+}
+
+/// The width of one line of `text` in `font` at `size`.
+pub fn text_width(text: &str, font: Font, size: f32, window: &Window) -> f32 {
+    let run = TextRun {
+        len: text.len(),
+        font,
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let width = window
+        .text_system()
+        .layout_line(text, px(size), &[run], None)
+        .width;
+    f32::from(width)
+}
+
+/// A tooltip's bubble, for `Tooltip` and the tab rows' own.
+fn tooltip_bubble(theme: &Theme) -> Div {
+    div()
+        .font_family(UI_FONT)
+        .flex()
+        .flex_none()
+        .px(px(8.))
+        .rounded(px(6.))
+        .bg(theme.surface())
+        .border_1()
+        .border_color(gpui::black().opacity(0.1))
+        .shadow(vec![shadow(2., 8., 0.12)])
+}
+
+/// Places a tooltip's `bubble`, `height` tall, beside the pointer at x
+/// `pointer` in a sidebar `width` wide. GPUI puts a tooltip's top-left 1 pt
+/// right of the pointer. With no width of its own GPUI never flips it; the
+/// bubble sits in a row across the sidebar instead, beside the pointer,
+/// where a spacer that shrinks first keeps it from running past either edge.
+fn beside_pointer(bubble: Div, pointer: f32, width: f32, height: f32) -> Div {
+    let span = (width - 2. * TOOLTIP_EDGE).max(0.);
+    let origin = pointer + 1.;
+    let spacer = |width: f32| div().min_w_0().w(px(width.max(0.)));
+    let row = div()
+        .absolute()
+        .top(px(TOOLTIP_GAP))
+        .left(px(TOOLTIP_EDGE - origin))
+        .w(px(span))
+        .flex()
+        .items_start();
+    let row = if pointer > width / 2. {
+        row.justify_end()
+            .child(bubble)
+            .child(spacer(width - TOOLTIP_EDGE - pointer))
+    } else {
+        row.child(spacer(origin - TOOLTIP_EDGE)).child(bubble)
+    };
+    div().w_0().h(px(TOOLTIP_GAP + height)).child(row)
 }
 
 impl Render for Tooltip {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &self.theme;
-        let span = (self.width - 2. * TOOLTIP_EDGE).max(0.);
-        let bubble = div()
-            .font_family(UI_FONT)
-            .flex()
-            .gap(px(6.))
-            .h(px(TOOLTIP_HEIGHT))
-            .items_center()
-            .px(px(8.))
-            .rounded(px(6.))
-            .bg(theme.surface())
-            .border_1()
-            .border_color(gpui::black().opacity(0.1))
-            .shadow(vec![shadow(2., 8., 0.12)])
-            .flex_none()
-            .max_w(px(TOOLTIP_MAX_WIDTH.min(span)))
-            .text_size(px(12.))
+        let height = match self.wrapped {
+            Some((lines, _)) => lines as f32 * TOOLTIP_LINE + 2. * 5. + 2.,
+            None => TOOLTIP_HEIGHT,
+        };
+        let bubble = tooltip_bubble(theme)
+            .gap(px(TOOLTIP_SHORTCUT_GAP))
+            .h(px(height))
+            .max_w(px(Self::max_width(self.width)))
+            .text_size(px(TOOLTIP_TEXT_SIZE))
             .text_color(theme.title())
-            .child(truncated(self.text.clone()).min_w_0())
+            .map(|bubble| match self.wrapped {
+                Some((lines, room)) => bubble.items_start().py(px(5.)).child(
+                    div()
+                        .w(px(room))
+                        .line_height(px(TOOLTIP_LINE))
+                        .line_clamp(lines)
+                        .text_ellipsis()
+                        .child(self.text.clone()),
+                ),
+                None => bubble
+                    .items_center()
+                    .child(truncated(self.text.clone()).min_w_0()),
+            })
             .when(!self.shortcut.is_empty(), |bubble| {
                 bubble.child(
                     div()
                         .flex_none()
+                        .when(self.wrapped.is_some(), |shortcut| {
+                            shortcut.line_height(px(TOOLTIP_LINE))
+                        })
                         .text_color(theme.tertiary())
                         .child(self.shortcut),
                 )
             });
-        // GPUI puts a tooltip's top-left 1 pt right of the pointer. With no
-        // width of its own GPUI never flips it; the bubble sits in a row
-        // across the sidebar instead, beside the pointer, where a spacer
-        // that shrinks first keeps it from running past either edge.
-        let origin = self.pointer + 1.;
-        let spacer = |width: f32| div().min_w_0().w(px(width.max(0.)));
-        let row = div()
-            .absolute()
-            .top(px(TOOLTIP_GAP))
-            .left(px(TOOLTIP_EDGE - origin))
-            .w(px(span))
-            .flex();
-        let row = if self.pointer > self.width / 2. {
-            row.justify_end()
-                .child(bubble)
-                .child(spacer(self.width - TOOLTIP_EDGE - self.pointer))
-        } else {
-            row.child(spacer(origin - TOOLTIP_EDGE)).child(bubble)
-        };
-        div().w_0().h(px(TOOLTIP_GAP + TOOLTIP_HEIGHT)).child(row)
+        beside_pointer(bubble, self.pointer, self.width, height)
     }
 }

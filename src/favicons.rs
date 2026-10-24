@@ -39,7 +39,18 @@ pub struct FaviconStore {
     replaced: Vec<Arc<Image>>,
     /// Hosts already looked up on disk, found or not, so each is read once.
     looked_up: HashSet<String>,
-    writer: Option<mpsc::Sender<(PathBuf, Vec<u8>)>>,
+    writer: Option<mpsc::Sender<Job>>,
+}
+
+/// Work for the thread that keeps the disk cache.
+enum Job {
+    Write(PathBuf, Vec<u8>),
+    /// Deletes every icon file in `dir` but those named `keep`, including
+    /// any still waiting to be written.
+    Prune {
+        dir: PathBuf,
+        keep: HashSet<String>,
+    },
 }
 
 impl FaviconStore {
@@ -86,12 +97,14 @@ impl FaviconStore {
     }
 
     /// Returns whether any icon was added. Icons stored while the read was
-    /// running are newer and win.
-    pub fn insert_loaded(&mut self, loaded: LoadedIcons) -> bool {
+    /// running are newer and win. Hosts `retain_hosts` forgot meanwhile
+    /// stay forgotten: their icons are taken out of `loaded`.
+    pub fn insert_loaded(&mut self, loaded: &mut LoadedIcons) -> bool {
+        loaded.retain(|(host, _)| self.looked_up.contains(host));
         let mut added = false;
-        for (host, image) in loaded {
-            if let Entry::Vacant(entry) = self.icons.entry(host) {
-                entry.insert(image);
+        for (host, image) in loaded.iter() {
+            if let Entry::Vacant(entry) = self.icons.entry(host.clone()) {
+                entry.insert(image.clone());
                 added = true;
             }
         }
@@ -135,10 +148,45 @@ impl FaviconStore {
         }
     }
 
+    /// Forgets the icons of every host but `keep`, in memory and on disk,
+    /// after Clear History or Delete Space: the cache would otherwise name
+    /// every site ever visited. Call `release_replaced` afterwards.
+    pub fn retain_hosts(&mut self, keep: &HashSet<String>) {
+        let gone: Vec<String> = self
+            .icons
+            .keys()
+            .chain(self.recent.keys())
+            .filter(|host| !keep.contains(*host))
+            .cloned()
+            .collect();
+        let mut dropped = Vec::new();
+        for host in gone {
+            dropped.extend(self.icons.remove(&host));
+            dropped.extend(self.recent.remove(&host).into_iter().flatten());
+        }
+        for image in dropped {
+            let shown = |other: &Arc<Image>| other.id() == image.id();
+            if !self.icons.values().any(shown) && !self.recent.values().flatten().any(shown) {
+                self.replaced.push(image);
+            }
+        }
+        self.looked_up.retain(|host| keep.contains(host));
+        let keep = keep.iter().filter_map(|host| file_name(host)).collect();
+        // After any icon already sent, so none comes back.
+        self.send(Job::Prune {
+            dir: self.dir.clone(),
+            keep,
+        });
+    }
+
     fn write_in_background(&mut self, path: PathBuf, png: Vec<u8>) {
+        self.send(Job::Write(path, png));
+    }
+
+    fn send(&mut self, job: Job) {
         let writer = self.writer.get_or_insert_with(spawn_writer);
         // A failed send means the thread couldn't start; the cache is optional.
-        let _ = writer.send((path, png));
+        let _ = writer.send(job);
     }
 }
 
@@ -154,6 +202,15 @@ struct WriteQueue {
 impl WriteQueue {
     fn offer(&mut self, path: PathBuf, png: Vec<u8>) {
         self.waiting.insert(path, png);
+    }
+
+    /// Drops the waiting icons of files not named in `keep`.
+    fn retain(&mut self, keep: &HashSet<String>) {
+        self.waiting.retain(|path, _| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| keep.contains(name))
+        });
     }
 
     /// The icons whose turn has come at `now`.
@@ -188,8 +245,8 @@ impl WriteQueue {
 /// One thread writes icons in order, so a host's newest icon always lands last.
 /// It sleeps until a write is due, and exits once the store is dropped and the
 /// waiting icons are written.
-fn spawn_writer() -> mpsc::Sender<(PathBuf, Vec<u8>)> {
-    let (sender, receiver) = mpsc::channel::<(PathBuf, Vec<u8>)>();
+fn spawn_writer() -> mpsc::Sender<Job> {
+    let (sender, receiver) = mpsc::channel::<Job>();
     let spawned = thread::Builder::new()
         .name("favicon-cache".into())
         .spawn(move || {
@@ -209,7 +266,11 @@ fn spawn_writer() -> mpsc::Sender<(PathBuf, Vec<u8>)> {
                         .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
                 };
                 match received {
-                    Ok((path, png)) => queue.offer(path, png),
+                    Ok(Job::Write(path, png)) => queue.offer(path, png),
+                    Ok(Job::Prune { dir, keep }) => {
+                        queue.retain(&keep);
+                        prune(&dir, &keep);
+                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         queue.waiting.into_iter().for_each(write);
@@ -276,6 +337,26 @@ fn read_icon(dir: &Path, host: &str) -> Option<Vec<u8>> {
     }
     let png = fs::read(path).ok()?;
     is_png(&png).then_some(png)
+}
+
+/// Deletes the icon files in `dir` not named in `keep`. Files this version
+/// doesn't write, and the directory itself, stay.
+fn prune(dir: &Path, keep: &HashSet<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.ends_with(".png")
+            && !keep.contains(name)
+            && let Err(error) = fs::remove_file(entry.path())
+        {
+            eprintln!("Couldn't delete a cached favicon: {error}");
+        }
+    }
 }
 
 /// The rename keeps readers from seeing partial files. No fsync: losing an
@@ -415,7 +496,8 @@ mod tests {
         // An older disk read never replaces an icon stored meanwhile.
         let stale = Arc::new(Image::from_bytes(ImageFormat::Png, png(1)));
         let other = Arc::new(Image::from_bytes(ImageFormat::Png, png(3)));
-        assert!(store.insert_loaded(vec![
+        store.looked_up.insert("other.com".into());
+        assert!(store.insert_loaded(&mut vec![
             ("example.com".into(), stale),
             ("other.com".into(), other)
         ]));

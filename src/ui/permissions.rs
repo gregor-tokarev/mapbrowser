@@ -3,23 +3,31 @@
 //! the active tab's requests show; the others wait until their tab does.
 //! Answers hold for the rest of the session, per space, site and
 //! permission (Chromium also keeps prompt answers, such as location, in
-//! the space's profile; camera and microphone it never keeps).
+//! the space's profile; camera and microphone it never keeps). The site
+//! menu beside the address lists both and resets them.
+//!
+//! The card cuts a long host from its start, so the domain that owns it
+//! always shows. Block, Allow and × are reached with Tab and pressed with
+//! Return or Space. None of them takes keyboard focus by itself, so typing
+//! can't answer a request that appears under the fingers.
 
 use super::{
+    Tooltip, UI_FONT,
+    elide::{Cut, breakable, elided},
     icons::{Icon, icon},
-    press_only, shadow,
+    press_only, shadow, text_width,
     theme::Theme,
-    truncated,
+    toast_window::ToastKind,
 };
 use crate::{
     app::BrowserApp,
-    engine::{Permission, PermissionDecision},
+    engine::{Permission, PermissionDecision, site_origin},
     favicons::host_of,
     model::{SpaceId, TabId},
 };
 use gpui::{
-    Context, Div, FontWeight, InteractiveElement, ParentElement, StatefulInteractiveElement,
-    Styled, Window, div, px,
+    Context, Div, Font, FontWeight, InteractiveElement, KeyDownEvent, ParentElement,
+    StatefulInteractiveElement, Styled, Window, div, font, prelude::FluentBuilder, px,
 };
 use std::collections::HashMap;
 
@@ -40,7 +48,8 @@ pub struct PermissionRequest {
 pub struct PermissionPrompts {
     /// Unanswered requests, oldest first.
     queue: Vec<PermissionRequest>,
-    /// This session's answers: allowed or blocked.
+    /// This session's answers, allowed or blocked, by space, site
+    /// (`site_key`) and permission.
     decisions: HashMap<(SpaceId, String, Permission), bool>,
 }
 
@@ -50,17 +59,30 @@ fn remembered(permission: Permission) -> bool {
     permission != Permission::Screen
 }
 
+/// Chromium keeps the answers to everything but the camera, microphone and
+/// screen in the space's profile, also after quitting.
+fn kept_by_profile(permission: Permission) -> bool {
+    !matches!(
+        permission,
+        Permission::Camera | Permission::Microphone | Permission::Screen
+    )
+}
+
+/// The site an origin or address belongs to, as answers are filed:
+/// requests name origins with a trailing slash, tabs whole addresses.
+fn site_key(origin: &str) -> String {
+    site_origin(origin).unwrap_or_else(|| origin.trim_end_matches('/').to_owned())
+}
+
 impl PermissionPrompts {
     /// The session's answer to all of `permissions`: blocked if any is,
     /// allowed if all are.
     fn decided(&self, space_id: SpaceId, origin: &str, permissions: &[Permission]) -> Option<bool> {
+        let site = site_key(origin);
         let mut allowed = true;
         for &permission in permissions {
             match remembered(permission)
-                .then(|| {
-                    self.decisions
-                        .get(&(space_id, origin.to_owned(), permission))
-                })
+                .then(|| self.decisions.get(&(space_id, site.clone(), permission)))
                 .flatten()
             {
                 Some(false) => return Some(false),
@@ -72,12 +94,25 @@ impl PermissionPrompts {
     }
 
     fn remember(&mut self, request: &PermissionRequest, allow: bool) {
+        let site = site_key(&request.origin);
         for &permission in request.permissions.iter().filter(|&&p| remembered(p)) {
-            self.decisions.insert(
-                (request.space_id, request.origin.clone(), permission),
-                allow,
-            );
+            self.decisions
+                .insert((request.space_id, site.clone(), permission), allow);
         }
+    }
+
+    /// This session's answers for `site` in a space.
+    fn site_decisions(&self, space_id: SpaceId, site: &str) -> Vec<(Permission, bool)> {
+        self.decisions
+            .iter()
+            .filter(|((space, key, _), _)| *space == space_id && key == site)
+            .map(|(&(_, _, permission), &allow)| (permission, allow))
+            .collect()
+    }
+
+    fn forget(&mut self, space_id: SpaceId, site: &str, permission: Permission) {
+        self.decisions
+            .remove(&(space_id, site.to_owned(), permission));
     }
 
     /// Queued requests the session's answers now settle.
@@ -108,6 +143,74 @@ impl PermissionPrompts {
     }
 }
 
+/// What a site wants to do with `permission`, after "wants to".
+fn phrase(permission: Permission) -> &'static str {
+    match permission {
+        Permission::Camera => "use your camera",
+        Permission::Microphone => "use your microphone",
+        Permission::Screen => "share your screen",
+        Permission::CapturedSurfaceControl => "scroll and zoom what you share",
+        Permission::Location => "know your location",
+        Permission::Notifications => "show notifications",
+        Permission::Clipboard => "see text and images you copy",
+        Permission::Midi => "use your MIDI devices",
+        Permission::Downloads => "download multiple files",
+        Permission::StorageAccess => "use its cookies and site data",
+        Permission::DiskQuota => "store more data on this Mac",
+        Permission::LocalFonts => "use the fonts on this Mac",
+        Permission::WindowManagement => "manage windows on all your displays",
+        Permission::IdleDetection => "know when you're using this Mac",
+        Permission::PointerLock => "lock and hide your pointer",
+        Permission::KeyboardLock => "capture your keyboard shortcuts",
+        Permission::LocalNetwork => "find and connect to devices on your local network",
+        Permission::LoopbackNetwork => "connect to apps and services on this Mac",
+        Permission::Sensors => "use your motion sensors",
+        Permission::ProtectedMedia => "play protected content",
+        Permission::FileSystem => "keep editing files you opened with it",
+        Permission::ProtocolHandler => "open certain kinds of links",
+        Permission::AppInstallation => "install itself as an app",
+        Permission::IdentityProvider => "sign you in to other sites",
+        Permission::VirtualReality => "use your virtual reality devices",
+        Permission::AugmentedReality => "create a 3D map of your surroundings",
+        Permission::HandTracking => "track your hands",
+        Permission::Other => "use other features of this Mac",
+    }
+}
+
+/// The site menu's name for `permission`.
+pub fn permission_name(permission: Permission) -> &'static str {
+    match permission {
+        Permission::Camera => "Camera",
+        Permission::Microphone => "Microphone",
+        Permission::Screen => "Screen Sharing",
+        Permission::CapturedSurfaceControl => "Shared Tab Control",
+        Permission::Location => "Location",
+        Permission::Notifications => "Notifications",
+        Permission::Clipboard => "Clipboard",
+        Permission::Midi => "MIDI Devices",
+        Permission::Downloads => "Automatic Downloads",
+        Permission::StorageAccess => "Embedded Site Data",
+        Permission::DiskQuota => "Extra Storage",
+        Permission::LocalFonts => "Fonts",
+        Permission::WindowManagement => "Window Management",
+        Permission::IdleDetection => "Idle Detection",
+        Permission::PointerLock => "Pointer Lock",
+        Permission::KeyboardLock => "Keyboard Lock",
+        Permission::LocalNetwork => "Local Network",
+        Permission::LoopbackNetwork => "Apps on This Mac",
+        Permission::Sensors => "Motion Sensors",
+        Permission::ProtectedMedia => "Protected Content",
+        Permission::FileSystem => "File Editing",
+        Permission::ProtocolHandler => "Link Handling",
+        Permission::AppInstallation => "App Installation",
+        Permission::IdentityProvider => "Sign-In Provider",
+        Permission::VirtualReality => "Virtual Reality",
+        Permission::AugmentedReality => "Augmented Reality",
+        Permission::HandTracking => "Hand Tracking",
+        Permission::Other => "Other Features",
+    }
+}
+
 /// "use your camera and microphone", "know your location"…
 fn request_text(permissions: &[Permission]) -> String {
     let both = [Permission::Camera, Permission::Microphone]
@@ -115,20 +218,11 @@ fn request_text(permissions: &[Permission]) -> String {
         .all(|permission| permissions.contains(permission));
     let phrases: Vec<&str> = permissions
         .iter()
-        .filter_map(|permission| {
+        .filter_map(|&permission| {
             Some(match permission {
                 Permission::Camera if both => "use your camera and microphone",
                 Permission::Microphone if both => return None,
-                Permission::Camera => "use your camera",
-                Permission::Microphone => "use your microphone",
-                Permission::Screen => "share your screen",
-                Permission::Location => "know your location",
-                Permission::Notifications => "show notifications",
-                Permission::Clipboard => "see text and images you copy",
-                Permission::Midi => "use your MIDI devices",
-                Permission::Downloads => "download multiple files",
-                Permission::StorageAccess => "use its cookies and site data",
-                Permission::Other => "use other features of this device",
+                permission => phrase(permission),
             })
         })
         .collect();
@@ -140,17 +234,64 @@ fn request_text(permissions: &[Permission]) -> String {
     format!("wants to {text}")
 }
 
-fn request_icon(permissions: &[Permission]) -> Icon {
-    match permissions.first() {
-        Some(Permission::Camera) => Icon::Camera,
-        Some(Permission::Microphone) => Icon::Mic,
-        Some(Permission::Screen) => Icon::Monitor,
-        Some(Permission::Location) => Icon::MapPin,
-        Some(Permission::Notifications) => Icon::Bell,
-        Some(Permission::Clipboard) => Icon::Clipboard,
-        Some(Permission::Downloads) => Icon::ArrowDown,
-        _ => Icon::Shield,
+/// Each kind of request has a glyph of its own; none is the shield, which
+/// is Site Settings and ad blocking.
+pub fn permission_icon(permission: Permission) -> Icon {
+    match permission {
+        Permission::Camera => Icon::Camera,
+        Permission::Microphone => Icon::Mic,
+        Permission::Screen | Permission::CapturedSurfaceControl | Permission::WindowManagement => {
+            Icon::Monitor
+        }
+        Permission::Location => Icon::MapPin,
+        Permission::Notifications => Icon::Bell,
+        Permission::Clipboard => Icon::Clipboard,
+        Permission::Midi => Icon::Music,
+        Permission::Downloads => Icon::ArrowDown,
+        Permission::StorageAccess => Icon::Cookie,
+        Permission::DiskQuota => Icon::HardDrive,
+        Permission::LocalFonts => Icon::Type,
+        Permission::IdleDetection => Icon::Timer,
+        Permission::PointerLock => Icon::Pointer,
+        Permission::KeyboardLock => Icon::Keyboard,
+        Permission::LocalNetwork => Icon::Network,
+        Permission::LoopbackNetwork => Icon::Laptop,
+        Permission::Sensors => Icon::Activity,
+        Permission::ProtectedMedia => Icon::Key,
+        Permission::FileSystem => Icon::File,
+        Permission::ProtocolHandler => Icon::Link,
+        Permission::AppInstallation => Icon::AppWindow,
+        Permission::IdentityProvider => Icon::SignIn,
+        Permission::VirtualReality | Permission::AugmentedReality => Icon::Glasses,
+        Permission::HandTracking => Icon::Hand,
+        Permission::Other => Icon::Question,
     }
+}
+
+fn request_icon(permissions: &[Permission]) -> Icon {
+    permissions
+        .first()
+        .map_or(Icon::Question, |&permission| permission_icon(permission))
+}
+
+/// How long an answer to `permissions` holds, in the space called `space`.
+fn answer_lasts(permissions: &[Permission], space: &str) -> String {
+    if !permissions.iter().any(|&permission| remembered(permission)) {
+        "You'll be asked again next time.".to_owned()
+    } else if permissions
+        .iter()
+        .any(|&permission| kept_by_profile(permission))
+    {
+        format!("Your answer is kept for this site in {space}.")
+    } else {
+        format!("Your answer holds in {space} until you quit.")
+    }
+}
+
+/// Return or Space on a focused button, without modifiers.
+fn presses(event: &KeyDownEvent) -> bool {
+    matches!(event.keystroke.key.as_str(), "enter" | "space")
+        && !event.keystroke.modifiers.modified()
 }
 
 impl BrowserApp {
@@ -181,7 +322,7 @@ impl BrowserApp {
         if self.permission_shown().is_some_and(|shown| shown.id == id) {
             // Esc reaches the card through the shell's key context. Only
             // GPUI's focus moves: a page keeps its keyboard focus.
-            if self.renaming.is_none() && self.menu.is_none() {
+            if !self.naming() && self.menu.is_none() {
                 window.focus(&self.focus_handle);
             }
             cx.notify();
@@ -216,6 +357,20 @@ impl BrowserApp {
         cx.notify();
     }
 
+    /// An answer from the card's buttons. The button had keyboard focus if
+    /// it was pressed with the keyboard: it goes back to the page.
+    fn answer_from_card(
+        &mut self,
+        id: u64,
+        answer: PermissionDecision,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.answer_permission(id, answer, cx);
+        window.focus(&self.focus_handle);
+        self.focus_page(window, cx);
+    }
+
     fn respond_permission(&self, id: u64, answer: PermissionDecision) {
         self.engine.borrow().respond_permission(id, answer);
     }
@@ -224,13 +379,126 @@ impl BrowserApp {
         self.permissions.shown(self.active_tab_id())
     }
 
-    /// Esc: closes the open menu, else dismisses the permission card.
-    pub fn dismiss(&mut self, cx: &mut Context<Self>) {
+    /// Esc: closes the open menu, else dismisses the permission card, else
+    /// leaves page fullscreen (on macOS the key monitor sees Esc first).
+    pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.menu.is_some() {
-            self.close_menu(cx);
+            self.close_menu(window, cx);
         } else if let Some(id) = self.permission_shown().map(|request| request.id) {
             self.answer_permission(id, PermissionDecision::Dismiss, cx);
+        } else if self.fullscreen {
+            self.exit_page_fullscreen();
         }
+    }
+
+    /// Dismisses every request of the tab on screen, for hiding the sidebar
+    /// they hold open (⌘S), and says so over the page: the sites can ask
+    /// again, which many do only as the page loads.
+    pub(crate) fn dismiss_shown_permissions(&mut self, cx: &mut Context<Self>) {
+        let mut dismissed = false;
+        while let Some(id) = self.permission_shown().map(|request| request.id) {
+            self.answer_permission(id, PermissionDecision::Dismiss, cx);
+            dismissed = true;
+        }
+        if dismissed {
+            self.show_toast_kind(
+                ToastKind::Info,
+                "Request dismissed · reload the page to be asked again",
+                cx,
+            );
+        }
+    }
+
+    /// Tab and ⇧Tab move between the card's buttons while it shows. An
+    /// open menu keeps them for its own choices.
+    pub(crate) fn tab_through_card(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modifiers = event.keystroke.modifiers;
+        if event.keystroke.key != "tab"
+            || modifiers.control
+            || modifiers.alt
+            || modifiers.platform
+            || self.menu.is_some()
+            || self.permission_shown().is_none()
+        {
+            return;
+        }
+        if modifiers.shift {
+            window.focus_prev();
+        } else {
+            window.focus_next();
+        }
+        cx.stop_propagation();
+    }
+
+    /// The tab's site ("https://host") and space, for the site menu.
+    fn site_of_tab(&self, tab_id: TabId) -> Option<(SpaceId, String)> {
+        let space_id = self.state.space_of_tab(tab_id)?;
+        let site = site_origin(&self.state.tab(tab_id)?.url)?;
+        Some((space_id, site))
+    }
+
+    /// The answers the tab's site has in its space, allowed or blocked:
+    /// this session's and those the space's profile keeps.
+    pub(crate) fn site_permissions(&self, tab_id: TabId) -> Vec<(Permission, bool)> {
+        let Some((space_id, site)) = self.site_of_tab(tab_id) else {
+            return Vec::new();
+        };
+        let mut answers = self.permissions.site_decisions(space_id, &site);
+        for (permission, allow) in self.engine.borrow().site_permissions(space_id, &site) {
+            if !answers.iter().any(|&(known, _)| known == permission) {
+                answers.push((permission, allow));
+            }
+        }
+        answers.sort();
+        answers
+    }
+
+    /// Whether the tab's site was blocked from something this session,
+    /// which the address shows.
+    pub(crate) fn site_blocked_something(&self, tab_id: TabId) -> bool {
+        self.site_of_tab(tab_id).is_some_and(|(space_id, site)| {
+            self.permissions
+                .site_decisions(space_id, &site)
+                .iter()
+                .any(|&(_, allow)| !allow)
+        })
+    }
+
+    /// Forgets the answer for `permission` of the tab's site, this
+    /// session's and the profile's: the site asks again next time.
+    pub(crate) fn reset_site_permission(
+        &mut self,
+        tab_id: TabId,
+        permission: Permission,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((space_id, site)) = self.site_of_tab(tab_id) else {
+            return;
+        };
+        self.permissions.forget(space_id, &site, permission);
+        self.engine
+            .borrow_mut()
+            .reset_site_permission(space_id, &site, permission);
+        cx.notify();
+    }
+
+    /// Deletes the cookies and stored data of the tab's site in its space;
+    /// the page reloads without them.
+    pub(crate) fn clear_site_data(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        let Some((space_id, site)) = self.site_of_tab(tab_id) else {
+            return;
+        };
+        self.error = None;
+        self.engine
+            .borrow_mut()
+            .clear_site_data(space_id, tab_id, &site);
+        let host = host_of(&site).unwrap_or(site);
+        self.show_toast_about(ToastKind::Done, "Cleared data for ", &host, Cut::Start, cx);
     }
 
     /// "meet.google.com wants to use your camera and microphone", with
@@ -239,30 +507,72 @@ impl BrowserApp {
         &self,
         width: f32,
         theme: &Theme,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<Div> {
         let request = self.permission_shown()?;
         let id = request.id;
         let host = host_of(&request.origin).unwrap_or_else(|| request.origin.clone());
+        let origin = site_key(&request.origin);
+        let space = self
+            .state
+            .space(request.space_id)
+            .map_or_else(|| "this space".to_owned(), |space| space.name.clone());
         // The text wraps within a known width: the card's, less its padding
         // and the icon. The close button sits in the corner, beside the host.
-        let text_width = width - 16. - 2. * CARD_PADDING - ICON_TILE - ICON_GAP;
-        let button = |label: &'static str, answer: PermissionDecision| {
+        let column = width - 16. - 2. * CARD_PADDING - ICON_TILE - ICON_GAP;
+        let host_room = column - CLOSE_BUTTON;
+        // A host too long for its line splits in two: as much of its start
+        // as fits, cut from the left, above the domain that owns it
+        // ("attacker.example"), which is always shown whole. A domain too
+        // long for the card's first line takes it.
+        let bold = Font {
+            weight: FontWeight::SEMIBOLD,
+            ..font(UI_FONT)
+        };
+        let (first_line, domain) = match psl::domain_str(&host) {
+            Some(domain) if text_width(&host, bold.clone(), 13., window) > host_room => {
+                let domain = domain.to_owned();
+                (host[..host.len() - domain.len()].to_owned(), Some(domain))
+            }
+            _ => (host, None),
+        };
+        let (first_line, domain_room) = if first_line.is_empty() {
+            (None, host_room)
+        } else {
+            (Some(first_line), column)
+        };
+        let beside_close = first_line.is_none();
+        let domain = domain.map(|domain| {
+            domain_lines(domain, domain_room, &bold, window)
+                .when(beside_close, |lines| lines.mr(px(CLOSE_BUTTON)))
+        });
+        let button = |label: &'static str, answer: PermissionDecision, index: isize| {
             let primary = answer == PermissionDecision::Allow;
             let (fill, hover) = if primary {
                 (theme.focus(), theme.focus().opacity(0.88))
             } else {
                 (theme.control(), theme.control_hover())
             };
+            // A ring that shows on the button's own colour.
+            let ring = if primary {
+                theme.title()
+            } else {
+                theme.focus()
+            };
             press_only(
                 div()
                     .id(label)
+                    .tab_index(index)
                     .flex()
                     .flex_1()
                     .items_center()
                     .justify_center()
                     .h(px(28.))
                     .rounded(px(7.))
+                    .border_2()
+                    .border_color(gpui::transparent_black())
+                    .focus(move |style| style.border_color(ring))
                     .bg(fill)
                     .hover(move |style| style.bg(hover))
                     .text_size(px(13.))
@@ -278,9 +588,20 @@ impl BrowserApp {
                     })
                     .child(label),
             )
-            .on_click(cx.listener(move |this, _, _, cx| this.answer_permission(id, answer, cx)))
+            .on_click(
+                cx.listener(move |this, _, window, cx| {
+                    this.answer_from_card(id, answer, window, cx)
+                }),
+            )
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if presses(event) {
+                    cx.stop_propagation();
+                    this.answer_from_card(id, answer, window, cx);
+                }
+            }))
         };
         let close_hover = theme.hover();
+        let close_ring = theme.focus();
         Some(
             div()
                 .relative()
@@ -318,19 +639,39 @@ impl BrowserApp {
                             div()
                                 .flex()
                                 .flex_col()
-                                .w(px(text_width.max(40.)))
+                                .w(px(column.max(40.)))
                                 .text_size(px(13.))
                                 .line_height(px(17.))
+                                // The whole origin on hover: the lines show
+                                // the end of a long host.
                                 .child(
-                                    truncated(host)
-                                        .mr(px(CLOSE_BUTTON))
+                                    div()
+                                        .id("permission-host")
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(theme.title()),
+                                        .text_color(theme.title())
+                                        .tooltip(Tooltip::build_wrapping(
+                                            breakable(&origin),
+                                            "",
+                                            theme,
+                                            width,
+                                        ))
+                                        .children(first_line.map(|first_line| {
+                                            elided(first_line, Cut::Start, 17.).mr(px(CLOSE_BUTTON))
+                                        }))
+                                        .children(domain),
                                 )
                                 .child(
                                     div()
                                         .text_color(theme.muted())
                                         .child(request_text(&request.permissions)),
+                                )
+                                .child(
+                                    div()
+                                        .mt(px(4.))
+                                        .text_size(px(11.5))
+                                        .line_height(px(15.))
+                                        .text_color(theme.tertiary())
+                                        .child(answer_lasts(&request.permissions, &space)),
                                 ),
                         ),
                 )
@@ -338,6 +679,7 @@ impl BrowserApp {
                     press_only(
                         div()
                             .id("permission-close")
+                            .tab_index(2)
                             .absolute()
                             .top(px(8.))
                             .right(px(8.))
@@ -346,23 +688,57 @@ impl BrowserApp {
                             .justify_center()
                             .size(px(CLOSE_BUTTON))
                             .rounded(px(5.))
+                            .border_2()
+                            .border_color(gpui::transparent_black())
+                            .focus(move |style| style.border_color(close_ring))
                             .hover(move |style| style.bg(close_hover))
                             .child(icon(Icon::Close, 15., theme.icon())),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.answer_permission(id, PermissionDecision::Dismiss, cx)
-                    })),
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.answer_from_card(id, PermissionDecision::Dismiss, window, cx)
+                    }))
+                    .on_key_down(cx.listener(
+                        move |this, event: &KeyDownEvent, window, cx| {
+                            if presses(event) {
+                                cx.stop_propagation();
+                                this.answer_from_card(id, PermissionDecision::Dismiss, window, cx);
+                            }
+                        },
+                    )),
                 )
                 .child(
                     div()
                         .flex()
                         .gap(px(8.))
-                        .child(button("Block", PermissionDecision::Block))
-                        .child(button("Allow", PermissionDecision::Allow)),
+                        .child(button("Block", PermissionDecision::Block, 0))
+                        .child(button("Allow", PermissionDecision::Allow, 1)),
                 )
                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation()),
         )
     }
+}
+
+/// The domain that owns a host, on lines `room` wide: whole on one line, a
+/// size smaller if need be, else broken between its labels (and at the
+/// hyphens of a label longer than a line), never at any other character,
+/// so it can't read as another domain.
+fn domain_lines(domain: String, room: f32, bold: &Font, window: &Window) -> Div {
+    for size in [13., 12., 11.] {
+        if text_width(&domain, bold.clone(), size, window) <= room {
+            return div().whitespace_nowrap().text_size(px(size)).child(domain);
+        }
+    }
+    let labels: Vec<String> = domain
+        .split_inclusive('.')
+        .map(|label| {
+            if text_width(label, bold.clone(), 13., window) > room {
+                label.replace('-', "-\u{200B}")
+            } else {
+                label.to_owned()
+            }
+        })
+        .collect();
+    div().child(labels.join("\u{200B}"))
 }
 
 fn decision(allow: bool) -> PermissionDecision {
@@ -405,7 +781,7 @@ mod tests {
             "wants to use your camera, know your location and show notifications"
         );
         assert_eq!(request_icon(&[Location]), Icon::MapPin);
-        assert_eq!(request_icon(&[Other]), Icon::Shield);
+        assert_eq!(request_icon(&[Other]), Icon::Question);
     }
 
     #[test]

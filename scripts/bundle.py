@@ -18,6 +18,19 @@ from xml.parsers.expat import ExpatError
 
 ROOT = Path(__file__).resolve().parent.parent
 FRAMEWORK = "Chromium Embedded Framework.framework"
+# Rendered from assets/AppIcon.svg by scripts/make_icon.py.
+APP_ICON = "AppIcon.icns"
+# Files Finder, the Dock and `open -a` may open with the app: the kinds a
+# browser shows, and web locations (.webloc). The app is an alternative
+# for them, never their owner.
+DOCUMENT_TYPES = (
+    ("Web page", ["public.html", "public.xhtml"]),
+    ("PDF document", ["com.adobe.pdf"]),
+    ("Web location", ["com.apple.web-internet-location"]),
+    ("SVG image", ["public.svg-image"]),
+    ("Image", ["public.png", "public.jpeg", "com.compuserve.gif", "org.webmproject.webp", "public.avif", "com.microsoft.bmp"]),
+    ("Plain text", ["public.plain-text"]),
+)
 # Keep in step with LISTS in src/blocker.rs.
 FILTER_LISTS = ("easylist.txt", "easyprivacy.txt")
 BROWSER_PASSKEY_ENTITLEMENT = "com.apple.developer.web-browser.public-key-credential"
@@ -211,17 +224,47 @@ def write_plist(path, value):
         plistlib.dump(value, f)
 
 
+def package_version(metadata):
+    """The app's version, from Cargo.toml through cargo metadata."""
+    for package in metadata.get("packages", []):
+        if package.get("name") == "mapbrowser":
+            return package["version"]
+    return "0.0.0"
+
+
+def document_types():
+    return [
+        {
+            "CFBundleTypeName": name,
+            "CFBundleTypeRole": "Viewer",
+            "LSHandlerRank": "Alternate",
+            "LSItemContentTypes": types,
+        }
+        for name, types in DOCUMENT_TYPES
+    ]
+
+
+def copy_app_icon(resources):
+    """Copies the icon into `resources`; returns whether there was one."""
+    icon = ROOT / "assets" / APP_ICON
+    if not icon.is_file():
+        print(f"warning: {icon} is missing; the app will have the generic icon", file=sys.stderr)
+        return False
+    shutil.copy2(icon, resources / APP_ICON)
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--release", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
-    parser.add_argument("--name", default="Mapbrowser")
+    parser.add_argument("--name", default="Map Browser")
     parser.add_argument("--identifier", default="dev.mapbrowser.browser")
     parser.add_argument("--sign-identity", help="Opt in with a valid installed identity's exact name or full SHA-1 fingerprint; requires --provisioning-profile")
     parser.add_argument("--provisioning-profile", type=Path, help="Apple-issued macOS profile for this explicit app ID with the browser passkey entitlement; requires --sign-identity")
     args = parser.parse_args()
     if sys.platform != "darwin":
-        raise SystemExit("Mapbrowser currently supports macOS only.")
+        raise SystemExit("Map Browser currently supports macOS only.")
     try:
         signing = load_signing_plan(args.sign_identity, args.provisioning_profile, args.identifier)
     except SigningError as error:
@@ -258,6 +301,8 @@ def main():
     if (ROOT / "licenses").is_dir():
         shutil.copytree(ROOT / "licenses", contents / "Resources" / "licenses", dirs_exist_ok=True)
     copy_filter_lists(contents / "Resources")
+    has_icon = copy_app_icon(contents / "Resources")
+    version = package_version(metadata)
     shutil.copy2(profile / "mapbrowser", macos / "mapbrowser")
     destination = frameworks / FRAMEWORK
     # rsync updates binaries and preserves framework symlinks on repeat builds.
@@ -269,8 +314,8 @@ def main():
         "CFBundleExecutable": "mapbrowser",
         "CFBundlePackageType": "APPL",
         "CFBundleInfoDictionaryVersion": "6.0",
-        "CFBundleVersion": "0.1.0",
-        "CFBundleShortVersionString": "0.1.0",
+        "CFBundleVersion": version,
+        "CFBundleShortVersionString": version,
         "LSMinimumSystemVersion": "12.0",
         "NSHighResolutionCapable": True,
         "NSSupportsAutomaticGraphicsSwitching": True,
@@ -293,25 +338,39 @@ def main():
             "LSHandlerRank": "Alternate",
             "CFBundleURLSchemes": ["http", "https"],
         }],
+        "CFBundleDocumentTypes": document_types(),
     }
+    if has_icon:
+        info["CFBundleIconFile"] = Path(APP_ICON).stem
     write_plist(contents / "Info.plist", info)
     helpers = []
     for suffix in ["", " (GPU)", " (Renderer)", " (Plugin)", " (Alerts)"]:
+        # CEF finds its helpers by the executable's name, "mapbrowser".
         name = "mapbrowser Helper" + suffix
         helper = frameworks / (name + ".app")
         helper_bin = helper / "Contents" / "MacOS" / name
         helper_bin.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(profile / "mapbrowser-helper", helper_bin)
+        kind = suffix.strip().strip("()").lower()
+        alerts = kind == "alerts"
         helper_info = dict(info)
         helper_info.update({
             "CFBundleName": name,
-            "CFBundleDisplayName": name,
+            # Web notifications come from the Alerts helper; macOS shows
+            # them under its display name and icon.
+            "CFBundleDisplayName": args.name if alerts else name,
             "CFBundleExecutable": name,
             "CFBundleIdentifier": args.identifier + ".helper" + suffix.strip().replace("(", "").replace(")", "").lower(),
             "LSUIElement": True,
         })
         helper_info.pop("NSPrincipalClass")
         helper_info.pop("CFBundleURLTypes")
+        helper_info.pop("CFBundleDocumentTypes")
+        if alerts and has_icon:
+            (helper / "Contents" / "Resources").mkdir(parents=True, exist_ok=True)
+            shutil.copy2(contents / "Resources" / APP_ICON, helper / "Contents" / "Resources" / APP_ICON)
+        else:
+            helper_info.pop("CFBundleIconFile", None)
         write_plist(helper / "Contents" / "Info.plist", helper_info)
         helpers.append(helper)
     main_entitlements, helper_entitlements = prepare_signing_artifacts(app, helpers, signing)

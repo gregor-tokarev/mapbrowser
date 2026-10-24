@@ -1,23 +1,89 @@
-//! Popover menus for tabs, spaces, the library and "+". They are drawn in
-//! GPUI and kept inside the sidebar, where no native web view covers them.
+//! Popover menus for tabs, spaces, the library, the site by the address and
+//! "+". They are drawn in GPUI and kept inside the sidebar, where no native
+//! web view covers them. Like AppKit's menus they work from the keyboard too: ↑ and ↓ move a
+//! highlight, → and ← enter and leave "Move to Space", Return chooses, typing
+//! the start of an item's name jumps to it, and Esc closes. ⇧F10 (or the
+//! context-menu key) opens the selected tab's menu.
 
 use super::{
+    Tooltip, UI_FONT,
     downloads::DownloadState,
+    drag::DraggedTab,
+    elide::{Cut, advance_width, breakable, elided},
     icons::{Icon, icon},
+    permissions::{permission_icon, permission_name},
     press_only, shadow,
-    sidebar::space_icons,
+    sidebar::{space_icons, space_shortcut},
     theme::Theme,
-    truncated,
+    truncated, wrapped_lines,
 };
 use crate::{
     app::BrowserApp,
+    engine::{Permission, Shortcut, ZoomStep, site_origin},
+    favicons::host_of,
     model::{Pin, SpaceId, THEME_COUNT, TabId},
+    ui::page_notice::Leaving,
 };
 use gpui::{
-    AnyElement, Bounds, Context, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, Point, SharedString, Size, StatefulInteractiveElement, StyleRefinement,
-    Styled, Window, deferred, div, point, prelude::FluentBuilder, px,
+    AnyElement, App, Bounds, ClickEvent, Context, Div, Font, FontWeight, Hsla, InteractiveElement,
+    IntoElement, KeyBinding, KeyContext, KeyDownEvent, MouseButton, MouseMoveEvent, ParentElement,
+    Pixels, Point, ScrollHandle, SharedString, Size, Stateful, StatefulInteractiveElement, Styled,
+    Window, actions, deferred, div, font, point, prelude::FluentBuilder, px, relative,
 };
+use std::{
+    cell::Cell,
+    time::{Duration, Instant},
+};
+
+actions!(
+    menu,
+    [
+        SelectPrevious,
+        SelectNext,
+        SelectFirst,
+        SelectLast,
+        SelectLeft,
+        SelectRight,
+        NextControl,
+        PreviousControl,
+        Choose,
+        ChooseDestructive,
+        ShowTabMenu,
+        RemoveFromList
+    ]
+);
+
+/// While a menu is open the browser window's root has the "Menu" context
+/// as well as "Browser", whose Esc closes it.
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("up", SelectPrevious, Some("Menu")),
+        KeyBinding::new("down", SelectNext, Some("Menu")),
+        KeyBinding::new("home", SelectFirst, Some("Menu")),
+        KeyBinding::new("end", SelectLast, Some("Menu")),
+        KeyBinding::new("pageup", SelectFirst, Some("Menu")),
+        KeyBinding::new("pagedown", SelectLast, Some("Menu")),
+        KeyBinding::new("left", SelectLeft, Some("Menu")),
+        KeyBinding::new("right", SelectRight, Some("Menu")),
+        KeyBinding::new("tab", NextControl, Some("Menu")),
+        KeyBinding::new("shift-tab", PreviousControl, Some("Menu")),
+        // Space doesn't choose, as in AppKit's menus: it may be part of a
+        // name being typed ("side p" for Side Project). In a question it
+        // presses the ringed button (`type_in_menu`).
+        KeyBinding::new("enter", Choose, Some("Menu")),
+        // Return never deletes: in the delete prompt it means Cancel, as
+        // destructive buttons are never the default on macOS.
+        KeyBinding::new("cmd-backspace", ChooseDestructive, Some("Menu")),
+        // The keyboard's way to a right-click, while the shell has focus;
+        // on macOS the key monitor sends it from a focused page too
+        // (`Shortcut::TabMenu`).
+        KeyBinding::new("shift-f10", ShowTabMenu, Some("Browser")),
+        KeyBinding::new("menu", ShowTabMenu, Some("Browser")),
+        // In the library, a download that ended leaves the list.
+        KeyBinding::new("backspace", RemoveFromList, Some("Menu")),
+        KeyBinding::new("delete", RemoveFromList, Some("Menu")),
+    ]);
+}
 
 const PADDING: f32 = 5.;
 const ITEM_HEIGHT: f32 = 24.;
@@ -26,28 +92,63 @@ const HEADER_HEIGHT: f32 = 22.;
 const SWATCH_ROW_HEIGHT: f32 = 30.;
 const ICON_ROW_HEIGHT: f32 = 28.;
 const ICONS_PER_ROW: usize = 7;
-/// A question: its title line and two lines of explanation.
-const PROMPT_HEIGHT: f32 = 64.;
+/// A question: a title, which for a long space name wraps onto as many
+/// lines as it takes (a menu taller than the window scrolls), and its
+/// explanation. Its padding above, between and below them, and their sizes.
+const PROMPT_SPACING: f32 = 4. + 2. + 8.;
+const PROMPT_PADDING: f32 = 9.;
+const PROMPT_TITLE_LINE: f32 = 18.;
+const PROMPT_TITLE_SIZE: f32 = 13.;
+const PROMPT_DETAIL_LINE: f32 = 16.;
+const PROMPT_DETAIL_SIZE: f32 = 12.;
+const SPACE_NAME_HEIGHT: f32 = 28.;
 const CONFIRM_HEIGHT: f32 = 32.;
-const CLOSED_LIMIT: usize = 10;
+/// A download: its name, and its progress or how it ended below.
+const DOWNLOAD_HEIGHT: f32 = 40.;
+/// The site menu's first row: the host, and a warning line for plain HTTP.
+const SITE_HEIGHT: f32 = 28.;
+const SITE_WARNING_HEIGHT: f32 = 16.;
+const PERMISSION_HEIGHT: f32 = 28.;
+const ZOOM_HEIGHT: f32 = 30.;
 /// Distance the menu keeps from the sidebar's edges.
 const EDGE: f32 = 6.;
 /// Distance between a tab's row and its menu.
 const ROW_GAP: f32 = 3.;
+/// The library's width, in a sidebar wide enough.
+const LIBRARY_WIDTH: f32 = 212.;
+/// Recently closed tabs the library lists, the newest; ⇧⌘T and the
+/// command bar reach the others.
+const LIBRARY_CLOSED_ROWS: usize = 20;
+/// Where the library opens from the keyboard: as from a click on its
+/// button, at the sidebar's bottom left, this far above the window's
+/// bottom edge.
+const LIBRARY_ANCHOR: Point<f32> = Point { x: 9.5, y: 42. };
+/// Menus asked for this close to the window's bottom edge belong to the
+/// bottom bar, and move with it when the window's height changes.
+const BOTTOM_BAR_REACH: f32 = 64.;
+/// Keys typed closer together than this build up one name to jump to.
+const TYPE_SELECT_PAUSE: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuKind {
     Tab(TabId),
     Space(SpaceId),
+    /// Every space, from the "…" ending a switcher too crowded for them all.
+    Spaces,
     /// The bottom bar's "+".
     Plus,
-    /// This session's downloads and the recently closed tabs, from the
-    /// library button.
+    /// Recent downloads and the recently closed tabs, from the library
+    /// button.
     Library,
     /// Asks before deleting a space, in place of the space menu.
     DeleteSpace(SpaceId),
     /// The spaces a tab can move to, in place of the tab menu.
     MoveTab(TabId),
+    /// The site the tab shows, from the shield by the address: blocking,
+    /// permissions, zoom and its data in this space.
+    Site(TabId),
+    /// Asks before clearing the site's data, in place of the site menu.
+    ClearSiteData(TabId),
 }
 
 pub struct OpenMenu {
@@ -56,20 +157,106 @@ pub struct OpenMenu {
     /// or, when there is no room, above `above`.
     pub anchor: Point<Pixels>,
     pub above: Pixels,
+    /// For menus of the bottom bar, the window's height when they opened.
+    bottom_bar: Option<Pixels>,
+    /// The entry the pointer or the keyboard is on; without one, the menu's
+    /// default (`default_highlight`).
+    highlight: Option<Highlight>,
+    /// Menus taller than the window scroll.
+    scroll: ScrollHandle,
+    /// The start of a name typed to jump to an item, lowercased, and when
+    /// its last key came (`type_in_menu`).
+    typed: String,
+    typed_at: Option<Instant>,
+    /// Where it was last drawn, in window coordinates: the spaces "…"
+    /// lists for a dragged tab close once the drag leaves them.
+    pub(super) drawn: Cell<Option<Bounds<Pixels>>>,
+}
+
+impl OpenMenu {
+    pub fn new(kind: MenuKind, anchor: Point<Pixels>, window_height: Pixels) -> Self {
+        Self {
+            kind,
+            anchor,
+            above: anchor.y,
+            bottom_bar: (anchor.y > window_height - px(BOTTOM_BAR_REACH)).then_some(window_height),
+            highlight: None,
+            scroll: ScrollHandle::new(),
+            typed: String::new(),
+            typed_at: None,
+            drawn: Cell::new(None),
+        }
+    }
+
+    /// Turns the menu into another in place ("Delete Space…", "Move to
+    /// Space ›"), with nothing highlighted and scrolled to its top.
+    fn become_menu(&mut self, kind: MenuKind) {
+        self.kind = kind;
+        self.highlight = None;
+        self.scroll = ScrollHandle::new();
+        self.typed.clear();
+    }
+
+    /// Where the menu was asked for, in a window now `window_height` tall:
+    /// the bottom bar's menus keep their distance from its bottom edge.
+    fn anchors(&self, window_height: Pixels) -> (Point<Pixels>, Pixels) {
+        let shift = self
+            .bottom_bar
+            .map_or(px(0.), |opened| window_height - opened);
+        (self.anchor + point(px(0.), shift), self.above + shift)
+    }
+}
+
+/// A highlighted entry, and in a row of choices (theme swatches, icons, the
+/// delete prompt's buttons) which one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Highlight {
+    entry: usize,
+    part: usize,
+}
+
+/// A question highlights its Cancel button, so Return can't delete by
+/// accident; other menus start with nothing highlighted, as AppKit's do.
+fn default_highlight(entries: &[Entry]) -> Option<Highlight> {
+    entries
+        .iter()
+        .position(|entry| matches!(entry, Entry::Confirm { .. }))
+        .map(|entry| Highlight { entry, part: 0 })
+}
+
+/// A key moving the highlight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    Previous,
+    Next,
+    First,
+    Last,
+    Left,
+    Right,
+    /// Tab and ⇧Tab: every choice in turn, those in rows too.
+    NextControl,
+    PreviousControl,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum Action {
     TogglePin(TabId),
     ToggleFavorite(TabId),
-    CopyLink(TabId),
+    RenameTab(TabId),
+    ResetTabName(TabId),
+    GoToPinnedPage(TabId),
+    CopyUrl(TabId),
     Duplicate(TabId),
     Reload(TabId),
+    ToggleMute(TabId),
     Close(TabId),
     Delete(TabId),
+    CloseOtherTabs(TabId),
+    CloseTabsBelow(TabId),
     Rename(SpaceId),
     Theme(SpaceId, u8),
     SpaceIcon(SpaceId, Option<&'static str>),
+    SwitchSpace(SpaceId),
     NewSpace,
     UnloadSpace(SpaceId),
     NewTab,
@@ -77,10 +264,25 @@ enum Action {
     /// "Delete Space…": the menu asks first.
     AskDeleteSpace(SpaceId),
     DeleteSpace(SpaceId),
+    OpenDownload(u64),
     RevealDownload(u64),
+    CancelDownload(u64),
+    RetryDownload(u64),
+    /// Takes a download that ended off the list (⌫ on its row).
+    RemoveDownload(u64),
+    ClearDownloads,
     /// "Move to Space ›": the menu lists the spaces.
     AskMoveTab(TabId),
     MoveTab(TabId, SpaceId),
+    ToggleBlocking(TabId),
+    ResetPermission(TabId, Permission),
+    /// The page zoom a step in, out or back to 100%.
+    Zoom(ZoomStep),
+    /// "Clear Site Data…": the menu asks first.
+    AskClearSiteData(TabId),
+    ClearSiteData(TabId),
+    /// A question's Cancel: the menu closes.
+    Cancel,
 }
 
 enum Entry {
@@ -92,34 +294,79 @@ enum Entry {
     },
     Separator,
     Header(&'static str),
+    /// Which space a space menu is for: its icon or dot, and its name.
+    SpaceName {
+        name: SharedString,
+        icon: Option<String>,
+        theme: u8,
+    },
     Swatches(SpaceId, u8),
-    Icons(SpaceId, Option<String>),
+    /// The icon choices for a space, and its theme, whose dot is the
+    /// choice of no icon.
+    Icons(SpaceId, Option<String>, u8),
     Closed {
         index: usize,
         title: SharedString,
+        /// The space it reopens in, if not the one on screen.
+        elsewhere: Option<SharedString>,
     },
     Empty(&'static str),
+    /// A question; its title and its explanation wrap onto `lines` lines
+    /// each (`fit_prompts`).
     Prompt {
         title: SharedString,
         detail: &'static str,
+        lines: (usize, usize),
     },
     /// Cancel, and a red button that runs `action`.
     Confirm {
         label: &'static str,
         action: Action,
     },
-    /// A download; finished and running ones show in Finder when clicked.
+    /// A download, with × while it runs and ↻ once stopped; finished ones
+    /// open when chosen, and show in Finder with the magnifier. `space`
+    /// names the space it downloads with, when there are several.
     Download {
         id: u64,
         name: SharedString,
-        status: Option<String>,
-        failed: bool,
+        status: String,
+        state: DownloadState,
+        missing: bool,
+        can_retry: bool,
+        space: Option<SharedString>,
+        /// Its space's name and theme, if not the one on screen: its icon
+        /// wears the space's dot, and the status names it where it fits.
+        elsewhere: Option<(SharedString, u8)>,
     },
-    /// A space, with its icon or its theme's dot.
+    /// The site a site menu is about, and whether its connection is plain
+    /// HTTP.
+    Site {
+        host: String,
+        origin: String,
+        insecure: bool,
+    },
+    /// A setting, with a check mark while it is on.
+    Check {
+        label: &'static str,
+        checked: bool,
+        action: Action,
+    },
+    /// A permission the site was given or refused, with Reset.
+    Permission {
+        permission: Permission,
+        allowed: bool,
+        action: Action,
+    },
+    /// The page's zoom, with − and +; the percentage resets it.
+    Zoom(u32),
+    /// A space, with its icon or its theme's dot; `current` marks the
+    /// active one.
     Space {
         name: SharedString,
         icon: Option<String>,
         theme: u8,
+        shortcut: &'static str,
+        current: bool,
         action: Action,
     },
     /// A line of explanation.
@@ -149,24 +396,232 @@ impl Entry {
             Entry::Item { .. }
             | Entry::Closed { .. }
             | Entry::Empty(_)
-            | Entry::Download { .. }
+            | Entry::Check { .. }
             | Entry::Space { .. }
             | Entry::Note(_) => ITEM_HEIGHT,
+            Entry::Download { .. } => DOWNLOAD_HEIGHT,
+            Entry::Site { insecure, .. } => {
+                SITE_HEIGHT + if *insecure { SITE_WARNING_HEIGHT } else { 0. }
+            }
+            Entry::Permission { .. } => PERMISSION_HEIGHT,
+            Entry::Zoom(_) => ZOOM_HEIGHT,
             Entry::Separator => SEPARATOR_HEIGHT,
             Entry::Header(_) => HEADER_HEIGHT,
+            Entry::SpaceName { .. } => SPACE_NAME_HEIGHT,
             Entry::Swatches(..) => SWATCH_ROW_HEIGHT,
             Entry::Icons(..) => {
                 ICON_ROW_HEIGHT * (space_icons().len() + 1).div_ceil(ICONS_PER_ROW) as f32
             }
-            Entry::Prompt { .. } => PROMPT_HEIGHT,
+            Entry::Prompt {
+                lines: (title, detail),
+                ..
+            } => {
+                PROMPT_SPACING
+                    + *title as f32 * PROMPT_TITLE_LINE
+                    + *detail as f32 * PROMPT_DETAIL_LINE
+            }
             Entry::Confirm { .. } => CONFIRM_HEIGHT,
+        }
+    }
+
+    /// How many choices the entry holds: one for an item, one per swatch,
+    /// icon or zoom button, two for Cancel and the red button, none for
+    /// text.
+    fn parts(&self) -> usize {
+        match self {
+            Entry::Item { enabled, .. } => usize::from(*enabled),
+            Entry::Closed { .. }
+            | Entry::Space { .. }
+            | Entry::Check { .. }
+            | Entry::Permission { .. } => 1,
+            // A file that is there: open it, or show it in Finder. Any
+            // other download is one choice: stop it, download it again,
+            // or, with nothing to do, only take ⌫ to leave the list.
+            Entry::Download {
+                state: DownloadState::Done,
+                missing: false,
+                ..
+            } => 2,
+            Entry::Download { .. } => 1,
+            Entry::Swatches(..) => usize::from(THEME_COUNT),
+            Entry::Icons(..) => space_icons().len() + 1,
+            Entry::Zoom(_) => 3,
+            Entry::Confirm { .. } => 2,
+            Entry::Separator
+            | Entry::Header(_)
+            | Entry::SpaceName { .. }
+            | Entry::Empty(_)
+            | Entry::Prompt { .. }
+            | Entry::Site { .. }
+            | Entry::Note(_) => 0,
+        }
+    }
+
+    /// What choosing `part` of the entry does.
+    fn action(&self, part: usize) -> Option<Action> {
+        match self {
+            Entry::Item {
+                action,
+                enabled: true,
+                ..
+            }
+            | Entry::Space { action, .. }
+            | Entry::Check { action, .. }
+            | Entry::Permission { action, .. } => Some(*action),
+            Entry::Closed { index, .. } => Some(Action::Reopen(*index)),
+            // Open a file that is there or show it in Finder, stop one
+            // that downloads, or download a stopped one again.
+            Entry::Download {
+                id,
+                state,
+                missing,
+                can_retry,
+                ..
+            } => match (state, part) {
+                (DownloadState::Done, 0) if !missing => Some(Action::OpenDownload(*id)),
+                (DownloadState::Done, 1) if !missing => Some(Action::RevealDownload(*id)),
+                (DownloadState::Running, 0) => Some(Action::CancelDownload(*id)),
+                (DownloadState::Failed | DownloadState::Cancelled, 0) if *can_retry => {
+                    Some(Action::RetryDownload(*id))
+                }
+                _ => None,
+            },
+            Entry::Zoom(_) => [ZoomStep::Out, ZoomStep::Reset, ZoomStep::In]
+                .get(part)
+                .map(|&step| Action::Zoom(step)),
+            Entry::Swatches(space, _) => u8::try_from(part)
+                .ok()
+                .filter(|&theme| theme < THEME_COUNT)
+                .map(|theme| Action::Theme(*space, theme)),
+            Entry::Icons(space, ..) => match part {
+                0 => Some(Action::SpaceIcon(*space, None)),
+                _ => Some(Action::SpaceIcon(
+                    *space,
+                    Some(*space_icons().get(part - 1)?),
+                )),
+            },
+            Entry::Confirm { action, .. } => Some(if part == 0 { Action::Cancel } else { *action }),
+            _ => None,
+        }
+    }
+
+    /// The part a row of choices starts on: the current theme or icon, or
+    /// the zoom's percentage, between − and +.
+    fn current_part(&self) -> usize {
+        match self {
+            Entry::Swatches(_, current) => usize::from(*current),
+            Entry::Zoom(_) => 1,
+            Entry::Icons(_, Some(current), _) => space_icons()
+                .iter()
+                .position(|icon| icon == current)
+                .map_or(0, |index| index + 1),
+            _ => 0,
+        }
+    }
+
+    /// The text a typed letter is matched against.
+    fn label(&self) -> Option<&str> {
+        match self {
+            Entry::Item {
+                label,
+                enabled: true,
+                ..
+            } => Some(label),
+            Entry::Closed { title: label, .. } | Entry::Space { name: label, .. } => Some(label),
+            Entry::Download { name, .. } => Some(name),
+            Entry::Check { label, .. } => Some(label),
+            Entry::Permission { permission, .. } => Some(permission_name(*permission)),
+            _ => None,
+        }
+    }
+}
+
+/// A space's icon, or a dot in its colour as the switcher shows it, in a
+/// 16 pt slot. On a highlighted row the dot has a white ring: the
+/// highlight may be the very same colour.
+fn space_mark(icon: Option<String>, theme: u8, dark: bool, lit: bool) -> gpui::Div {
+    let dot = Theme::new(theme, dark).dot();
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(16.))
+        .map(|slot| match icon {
+            Some(emoji) => slot.text_size(px(13.)).child(emoji),
+            None => slot.child(
+                div()
+                    .size(px(if lit { 9. } else { 7. }))
+                    .rounded_full()
+                    .bg(dot)
+                    .when(lit, |dot| dot.border_1().border_color(gpui::white())),
+            ),
+        })
+}
+
+/// The least of " · <space>" a recently closed tab of another space keeps
+/// while its title is cut: a few letters of the name.
+const SPACE_MARKER_LEAST: f32 = 34.;
+
+/// `text` on one line, then, for a row of another space, " · <space>" in
+/// `marker`'s colour, in `room` points at `size`: the space's name loses
+/// its end first, down to `least` points, and only then the text its end.
+fn with_space(
+    text: SharedString,
+    space: Option<SharedString>,
+    room: f32,
+    size: f32,
+    least: f32,
+    marker: Hsla,
+    cx: &App,
+) -> Div {
+    // Alone, the text is the line: inside a flex row it measured nothing
+    // and the row's second line went missing.
+    let Some(space) = space else {
+        return truncated(text).min_w_0();
+    };
+    let line = div().flex().items_center().min_w_0().overflow_hidden();
+    let space = format!(" · {space}");
+    let width = |text: &str| advance_width(text, &font(UI_FONT), size, cx).ceil();
+    let text_room = width(&text).min((room - width(&space).min(least)).max(0.));
+    line.child(truncated(text).flex_none().w(px(text_room)))
+        .child(
+            truncated(space)
+                .flex_none()
+                .w(px((room - text_room).max(0.)))
+                .text_color(marker),
+        )
+}
+
+/// Counts the lines of each question in a menu `width` wide, so the whole
+/// name of a space to delete shows, and the menu is placed by its real
+/// height.
+fn fit_prompts(entries: &mut [Entry], width: f32, cx: &App) {
+    // Inside the menu's 1 pt border, its padding and the question's.
+    let room = width - 2. * (1. + PADDING + PROMPT_PADDING);
+    let bold = Font {
+        weight: FontWeight::SEMIBOLD,
+        ..font(UI_FONT)
+    };
+    for entry in entries {
+        if let Entry::Prompt {
+            title,
+            detail,
+            lines,
+        } = entry
+        {
+            *lines = (
+                wrapped_lines(title, bold.clone(), PROMPT_TITLE_SIZE, room, cx),
+                wrapped_lines(detail, font(UI_FONT), PROMPT_DETAIL_SIZE, room, cx),
+            );
         }
     }
 }
 
 /// Top-left corner of a `size` menu opening below `anchor`, or above
 /// `above` when there is no room, kept `EDGE` inside the sidebar (`width`
-/// wide) and the window (`height` tall).
+/// wide) and the window (`height` tall), also after the window shrank
+/// under an open menu. Menus are never taller than the window allows.
 fn place(
     anchor: Point<Pixels>,
     above: Pixels,
@@ -179,9 +634,14 @@ fn place(
     let top = if y + menu.height <= height - EDGE {
         y
     } else {
-        (f32::from(above) - menu.height).max(EDGE)
+        f32::from(above) - menu.height
     };
-    point(px(left), px(top))
+    point(px(left), px(top.min(height - EDGE - menu.height).max(EDGE)))
+}
+
+/// The tallest a menu may be in a window `height` tall; taller ones scroll.
+fn max_height(height: f32) -> f32 {
+    (height - 2. * EDGE).max(ITEM_HEIGHT + 2. * PADDING)
 }
 
 impl BrowserApp {
@@ -199,6 +659,29 @@ impl BrowserApp {
         if let (Some(menu), Some(row)) = (&mut self.menu, row) {
             menu.anchor.y = row.bottom() + px(ROW_GAP);
             menu.above = row.top() - px(ROW_GAP);
+            // Rows don't move with the window's bottom edge.
+            menu.bottom_bar = None;
+        }
+    }
+
+    /// The space menu from the title row opens below the row, like a tab's
+    /// menu below its own, leaving the name in sight.
+    pub fn open_space_title_menu(
+        &mut self,
+        space_id: SpaceId,
+        pointer: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = self.drop_zones.borrow().title;
+        self.open_menu(MenuKind::Space(space_id), pointer, window, cx);
+        if let Some(menu) = &mut self.menu
+            && !title.is_empty()
+        {
+            menu.anchor.y = title.bottom() + px(ROW_GAP);
+            menu.above = title.top() - px(ROW_GAP);
+            // The title doesn't move with the window's bottom edge.
+            menu.bottom_bar = None;
         }
     }
 
@@ -216,41 +699,81 @@ impl BrowserApp {
                 let Some(tab) = self.state.tab(id) else {
                     return Vec::new();
                 };
-                // ⌘D pins Today tabs and returns pinned tabs and favorites to Today.
-                let mut entries = vec![
-                    Entry::item(
-                        if tab.pin == Pin::Today {
-                            "Pin Tab"
-                        } else {
-                            "Unpin Tab"
-                        },
-                        "⌘D",
-                        Action::TogglePin(id),
-                    ),
-                    Entry::item(
-                        if tab.pin == Pin::Favorite {
-                            "Remove from Favorites"
-                        } else {
-                            "Add to Favorites"
-                        },
-                        "",
-                        Action::ToggleFavorite(id),
-                    ),
-                    Entry::Separator,
-                    Entry::item("Copy Link", "⇧⌘C", Action::CopyLink(id)),
-                    Entry::item("Duplicate", "", Action::Duplicate(id)),
-                ];
+                // ⌘D pins Today tabs and returns pinned tabs and favorites
+                // to Today; a favorite can also step down to Pinned.
+                let mut entries = match tab.pin {
+                    Pin::Today => vec![
+                        Entry::item("Pin Tab", "⌘D", Action::TogglePin(id)),
+                        Entry::item("Add to Favorites", "", Action::ToggleFavorite(id)),
+                    ],
+                    Pin::Pinned => vec![
+                        Entry::item("Unpin Tab", "⌘D", Action::TogglePin(id)),
+                        Entry::item("Add to Favorites", "", Action::ToggleFavorite(id)),
+                    ],
+                    Pin::Favorite => vec![
+                        Entry::item("Remove from Favorites", "⌘D", Action::TogglePin(id)),
+                        Entry::item("Move to Pinned", "", Action::ToggleFavorite(id)),
+                    ],
+                };
+                entries.push(Entry::Separator);
+                // Favorite tiles show no title to rename.
+                if tab.pin != Pin::Favorite {
+                    entries.push(Entry::item("Rename Tab", "", Action::RenameTab(id)));
+                    if tab.custom_title.is_some() {
+                        entries.push(Entry::item("Reset Name", "", Action::ResetTabName(id)));
+                    }
+                }
+                if tab.pin != Pin::Today {
+                    let away = tab.pinned_url.as_ref().is_some_and(|url| *url != tab.url);
+                    entries.push(
+                        Entry::item("Go to Pinned Page", "", Action::GoToPinnedPage(id))
+                            .enabled(away),
+                    );
+                }
+                entries.extend([
+                    Entry::item("Copy URL", "⇧⌘C", Action::CopyUrl(id)),
+                    Entry::item("Duplicate Tab", "", Action::Duplicate(id)),
+                ]);
                 if self.state.spaces.len() > 1 {
                     entries.push(Entry::item("Move to Space", "›", Action::AskMoveTab(id)));
                 }
-                entries.extend([
-                    Entry::item("Reload", "⌘R", Action::Reload(id)),
-                    Entry::Separator,
-                    Entry::item("Close Tab", "⌘W", Action::Close(id)),
-                ]);
-                // Closing a pinned tab only unloads it; this removes it.
-                if tab.pin != Pin::Today {
-                    entries.push(Entry::item("Delete Tab", "", Action::Delete(id)));
+                entries.push(Entry::item("Reload", "⌘R", Action::Reload(id)));
+                // Only a page that is open can play sound.
+                if self.is_loaded(id) {
+                    let label = if self.page(id).muted {
+                        "Unmute Tab"
+                    } else {
+                        "Mute Tab"
+                    };
+                    entries.push(Entry::item(label, "", Action::ToggleMute(id)));
+                }
+                entries.push(Entry::Separator);
+                if tab.pin == Pin::Today {
+                    let today: Vec<TabId> = self
+                        .state
+                        .space_of_tab(id)
+                        .and_then(|space| self.state.space(space))
+                        .map(|space| space.section(Pin::Today).map(|tab| tab.id).collect())
+                        .unwrap_or_default();
+                    let below = today
+                        .iter()
+                        .position(|&other| other == id)
+                        .is_some_and(|at| at + 1 < today.len());
+                    entries.extend([
+                        Entry::item("Close Tab", "⌘W", Action::Close(id)),
+                        Entry::item("Close Other Tabs", "", Action::CloseOtherTabs(id))
+                            .enabled(today.len() > 1),
+                        Entry::item("Close Tabs Below", "", Action::CloseTabsBelow(id))
+                            .enabled(below),
+                    ]);
+                } else {
+                    // ⌘W only puts a pinned tab or favorite to sleep; Close
+                    // Tab removes it, and ⇧⌘T brings it back to its place.
+                    entries.extend([
+                        Entry::item("Unload Tab", "⌘W", Action::Close(id))
+                            .enabled(self.is_loaded(id)),
+                        Entry::item("Close Tab", "", Action::Delete(id)),
+                    ]);
                 }
                 entries
             }
@@ -258,20 +781,24 @@ impl BrowserApp {
                 let Some(space) = self.state.space(id) else {
                     return Vec::new();
                 };
-                let mut entries = Vec::new();
                 // Names are edited in the title row, which only the active
-                // space has on screen.
-                if id == self.state.selected_space_id {
-                    entries.extend([
-                        Entry::item("Rename Space", "", Action::Rename(id)),
-                        Entry::Separator,
-                    ]);
-                }
+                // space has on screen. Another space's menu, from its small
+                // dot, says which space it is for.
+                let mut entries = vec![if id == self.state.selected_space_id {
+                    Entry::item("Rename Space", "", Action::Rename(id))
+                } else {
+                    Entry::SpaceName {
+                        name: space.name.clone().into(),
+                        icon: space.icon.clone(),
+                        theme: space.theme(),
+                    }
+                }];
                 entries.extend([
+                    Entry::Separator,
                     Entry::Header("Theme"),
                     Entry::Swatches(id, space.theme()),
                     Entry::Header("Icon"),
-                    Entry::Icons(id, space.icon.clone()),
+                    Entry::Icons(id, space.icon.clone(), space.theme()),
                     Entry::Separator,
                     Entry::item("New Space", "", Action::NewSpace),
                     Entry::item("Unload Space", "", Action::UnloadSpace(id)),
@@ -281,35 +808,163 @@ impl BrowserApp {
                 ]);
                 entries
             }
+            MenuKind::Spaces => {
+                let selected = self.state.selected_space_id;
+                let spaces =
+                    self.state
+                        .spaces
+                        .iter()
+                        .enumerate()
+                        .map(|(index, space)| Entry::Space {
+                            name: space.name.clone().into(),
+                            icon: space.icon.clone(),
+                            theme: space.theme(),
+                            shortcut: space_shortcut(index),
+                            current: space.id == selected,
+                            action: Action::SwitchSpace(space.id),
+                        });
+                std::iter::once(Entry::Header("Spaces"))
+                    .chain(spaces)
+                    .chain([
+                        Entry::Separator,
+                        Entry::item("New Space", "", Action::NewSpace),
+                    ])
+                    .collect()
+            }
             MenuKind::Plus => vec![
                 Entry::item("New Tab", "⌘T", Action::NewTab),
                 Entry::item("New Space", "", Action::NewSpace),
             ],
             MenuKind::Library => {
-                let mut entries = Vec::new();
-                let downloads = self.downloads.recent().map(|download| Entry::Download {
-                    id: download.id,
-                    name: download.name.clone(),
-                    status: download.status(),
-                    failed: download.state == DownloadState::Failed,
-                });
-                entries.extend(downloads);
-                if !entries.is_empty() {
-                    entries.insert(0, Entry::Header("Downloads"));
-                    entries.push(Entry::Separator);
+                let mut entries = vec![Entry::Header("Downloads")];
+                // Downloads of every space, each with its own space's
+                // logins: with several spaces, rows say which.
+                let several = self.state.spaces.len() > 1;
+                let downloads: Vec<Entry> = self
+                    .downloads
+                    .listed()
+                    .map(|download| {
+                        let space = download
+                            .space_id
+                            .and_then(|id| self.state.space(id))
+                            .filter(|_| several);
+                        // Another space's says which, after how it went.
+                        let elsewhere = space
+                            .filter(|space| space.id != self.state.selected_space_id)
+                            .map(|space| (space.name.clone().into(), space.theme()));
+                        Entry::Download {
+                            id: download.id,
+                            name: download.name.clone(),
+                            status: download.status(),
+                            elsewhere,
+                            state: download.state,
+                            missing: download.missing,
+                            can_retry: download.can_retry()
+                                && download
+                                    .space_id
+                                    .is_some_and(|id| self.state.space(id).is_some()),
+                            space: space.map(|space| space.name.clone().into()),
+                        }
+                    })
+                    .collect();
+                if downloads.is_empty() {
+                    entries.push(Entry::Empty("No downloads yet"));
                 }
-                entries.push(Entry::Header("Recently Closed"));
+                entries.extend(downloads);
+                if self.downloads.any_finished() {
+                    entries.push(Entry::item("Clear Downloads", "", Action::ClearDownloads));
+                }
+                entries.extend([Entry::Separator, Entry::Header("Recently Closed")]);
+                // The tabs ⇧⌘T brings back next, the most recent first.
                 let closed = self.state.closed_tabs();
-                entries.extend(closed.iter().enumerate().rev().take(CLOSED_LIMIT).map(
-                    |(index, closed)| Entry::Closed {
-                        index,
-                        title: closed.tab.title.clone().into(),
-                    },
-                ));
+                entries.extend(
+                    closed
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .take(LIBRARY_CLOSED_ROWS)
+                        .map(|(index, closed)| Entry::Closed {
+                            index,
+                            title: closed.tab.shown_title().to_owned().into(),
+                            // Choosing it switches to its space.
+                            elsewhere: (several && closed.space_id != self.state.selected_space_id)
+                                .then(|| self.state.space(closed.space_id))
+                                .flatten()
+                                .map(|space| space.name.clone().into()),
+                        }),
+                );
                 if closed.is_empty() {
                     entries.push(Entry::Empty("No recently closed tabs"));
                 }
                 entries
+            }
+            MenuKind::Site(id) => {
+                let Some((url, host)) = self
+                    .state
+                    .tab(id)
+                    .and_then(|tab| Some((tab.url.clone(), host_of(&tab.url)?)))
+                else {
+                    return Vec::new();
+                };
+                let mut entries = vec![
+                    Entry::Site {
+                        host: host.clone(),
+                        origin: site_origin(&url).unwrap_or_default(),
+                        insecure: self.page_insecure(id, &url),
+                    },
+                    Entry::Separator,
+                    Entry::Check {
+                        label: "Ad Blocking",
+                        checked: !self.state.is_blocking_disabled(&host),
+                        action: Action::ToggleBlocking(id),
+                    },
+                    Entry::Separator,
+                    Entry::Header("Permissions"),
+                ];
+                let permissions = self.site_permissions(id);
+                if permissions.is_empty() {
+                    entries.push(Entry::Empty("Nothing allowed or blocked"));
+                }
+                entries.extend(permissions.into_iter().map(|(permission, allowed)| {
+                    Entry::Permission {
+                        permission,
+                        allowed,
+                        action: Action::ResetPermission(id, permission),
+                    }
+                }));
+                if let Some(percent) = self.engine.borrow().zoom_percent(id) {
+                    entries.extend([Entry::Separator, Entry::Zoom(percent)]);
+                }
+                entries.extend([
+                    Entry::Separator,
+                    Entry::item("Clear Site Data…", "", Action::AskClearSiteData(id)),
+                ]);
+                entries
+            }
+            MenuKind::ClearSiteData(id) => {
+                let Some((url, host)) = self
+                    .state
+                    .tab(id)
+                    .and_then(|tab| Some((tab.url.clone(), host_of(&tab.url)?)))
+                else {
+                    return Vec::new();
+                };
+                vec![
+                    Entry::Site {
+                        host,
+                        origin: site_origin(&url).unwrap_or_default(),
+                        insecure: false,
+                    },
+                    Entry::Prompt {
+                        title: "Clear this site's data?".into(),
+                        detail: "It signs you out of the site in this space and reloads the page.",
+                        lines: (1, 2),
+                    },
+                    Entry::Confirm {
+                        label: "Clear",
+                        action: Action::ClearSiteData(id),
+                    },
+                ]
             }
             MenuKind::DeleteSpace(id) => {
                 let Some(space) = self.state.space(id) else {
@@ -318,7 +973,12 @@ impl BrowserApp {
                 vec![
                     Entry::Prompt {
                         title: format!("Delete {}?", space.name).into(),
-                        detail: "Its tabs and site data will be removed.",
+                        detail: if space.tabs.is_empty() {
+                            "Its site data will be removed."
+                        } else {
+                            "Its tabs and site data will be removed."
+                        },
+                        lines: (1, 2),
                     },
                     Entry::Confirm {
                         label: "Delete",
@@ -336,6 +996,8 @@ impl BrowserApp {
                         name: space.name.clone().into(),
                         icon: space.icon.clone(),
                         theme: space.theme(),
+                        shortcut: "",
+                        current: false,
                         action: Action::MoveTab(id, space.id),
                     }))
                     // Each space is a profile of its own.
@@ -358,18 +1020,52 @@ impl BrowserApp {
         let sidebar = self.sidebar_width().unwrap_or(f32::from(viewport.width));
         let width: f32 = match menu.kind {
             MenuKind::Tab(_) | MenuKind::Plus | MenuKind::MoveTab(_) => 200.,
-            MenuKind::Space(_) | MenuKind::Library | MenuKind::DeleteSpace(_) => 212.,
+            MenuKind::Space(_)
+            | MenuKind::Spaces
+            | MenuKind::Library
+            | MenuKind::DeleteSpace(_) => 212.,
+            MenuKind::Site(_) | MenuKind::ClearSiteData(_) => 236.,
         };
         let width = width.min(sidebar - 2. * EDGE);
-        let entries = self.menu_entries(menu.kind);
-        let height = 2. * PADDING + entries.iter().map(Entry::height).sum::<f32>();
+        let mut entries = self.menu_entries(menu.kind);
+        fit_prompts(&mut entries, width, cx);
+        let content = entries.iter().map(Entry::height).sum::<f32>();
+        let (anchor, above) = menu.anchors(viewport.height);
+        // The menu fits wholly below its anchor or wholly above `above`,
+        // scrolling inside, so it never covers what opened it: a second
+        // press on the library button closes a long library.
+        let room = (f32::from(viewport.height) - EDGE - f32::from(anchor.y))
+            .max(f32::from(above) - EDGE)
+            .max(ITEM_HEIGHT + 2. * PADDING);
+        let height = (content + 2. * PADDING)
+            .min(max_height(f32::from(viewport.height)))
+            .min(room);
         let origin = place(
-            menu.anchor,
-            menu.above,
+            anchor,
+            above,
             Size { width, height },
             sidebar,
             f32::from(viewport.height),
         );
+        menu.drawn
+            .set(Some(Bounds::new(origin, gpui::size(px(width), px(height)))));
+        let highlight = menu.highlight.or_else(|| default_highlight(&entries));
+        let list = div()
+            .id("menu-list")
+            .flex()
+            .flex_col()
+            .h(px(height - 2. * PADDING))
+            .overflow_y_scroll()
+            .track_scroll(&menu.scroll)
+            .children(entries.into_iter().enumerate().map(|(index, entry)| {
+                let lit = highlight
+                    .filter(|highlight| highlight.entry == index)
+                    .map(|highlight| highlight.part);
+                // Kept at their height, so a list taller than the menu scrolls.
+                div()
+                    .flex_none()
+                    .child(self.render_entry(index, entry, lit, theme, cx))
+            }));
         let panel = div()
             .id("menu")
             .absolute()
@@ -377,8 +1073,6 @@ impl BrowserApp {
             .top(origin.y)
             .w(px(width))
             .p(px(PADDING))
-            .flex()
-            .flex_col()
             .rounded(px(8.))
             .bg(theme.surface())
             .border_1()
@@ -386,12 +1080,7 @@ impl BrowserApp {
             .shadow(vec![shadow(6., 24., 0.18)])
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .children(
-                entries
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, entry)| self.render_entry(index, entry, theme, cx)),
-            );
+            .child(list);
         // Behind the menu: a press anywhere else closes it.
         deferred(
             div()
@@ -401,11 +1090,11 @@ impl BrowserApp {
                 .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, _, _, cx| this.close_menu(cx)),
+                    cx.listener(|this, _, window, cx| this.close_menu(window, cx)),
                 )
                 .on_mouse_down(
                     MouseButton::Right,
-                    cx.listener(|this, _, _, cx| this.close_menu(cx)),
+                    cx.listener(|this, _, window, cx| this.close_menu(window, cx)),
                 )
                 .child(panel),
         )
@@ -413,33 +1102,45 @@ impl BrowserApp {
         .into_any_element()
     }
 
+    /// Draws `entry`, the `index`th of the menu; `lit` is its highlighted
+    /// part, if it has the highlight.
     fn render_entry(
         &self,
         index: usize,
         entry: Entry,
+        lit: Option<usize>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let height = entry.height();
         let focus = theme.focus();
+        let target = |part: usize| Highlight { entry: index, part };
         let item = |id: usize, enabled: bool| {
+            let lit = enabled && lit.is_some();
             div()
                 .id(("menu-item", id))
-                .group("menu-item")
                 .flex()
                 .items_center()
                 .h(px(ITEM_HEIGHT))
                 .px(px(9.))
                 .rounded(px(5.))
                 .text_size(px(13.))
-                .text_color(if enabled {
-                    theme.title()
-                } else {
+                .text_color(if !enabled {
                     theme.disabled()
+                } else if lit {
+                    gpui::white()
+                } else {
+                    theme.title()
                 })
-                .when(enabled, |item| {
-                    item.hover(move |style| style.bg(focus).text_color(gpui::white()))
-                })
+                .when(lit, |item| item.bg(focus))
         };
+        // Secondary text in a row turns white with the row's highlight.
+        let secondary = if lit.is_some() {
+            gpui::white()
+        } else {
+            theme.tertiary()
+        };
+        let (choice, second) = (entry.action(0), entry.action(1));
         match entry {
             Entry::Item {
                 label,
@@ -449,29 +1150,42 @@ impl BrowserApp {
             } => item(index, enabled)
                 .child(div().flex_1().child(label))
                 .when(!shortcut.is_empty(), |row| {
-                    row.child(
-                        div()
-                            .text_color(theme.tertiary())
-                            .group_hover("menu-item", |style| {
-                                style.text_color(gpui::white().opacity(0.8))
-                            })
-                            .child(shortcut),
-                    )
+                    row.child(div().text_color(secondary).child(shortcut))
                 })
                 .when(enabled, |row| {
-                    row.on_click(cx.listener(move |this, _, window, cx| {
-                        this.run_menu_action(action, window, cx)
-                    }))
+                    highlights(row, target(0), cx).on_click(cx.listener(
+                        move |this, _, window, cx| this.run_menu_action(action, window, cx),
+                    ))
                 })
                 .into_any_element(),
-            Entry::Closed { index, title } => {
-                let tab = &self.state.closed_tabs()[index].tab;
-                item(1000 + index, true)
+            Entry::Closed {
+                index: closed,
+                title,
+                elsewhere,
+            } => {
+                let tab = &self.state.closed_tabs()[closed].tab;
+                let sidebar = self.sidebar_width().unwrap_or_default();
+                // Inside the library's padding and the row's, beside the
+                // icon and its gap.
+                let room = LIBRARY_WIDTH.min(sidebar - 2. * EDGE) - 2. * PADDING - 18. - 22.;
+                let row = item(1000 + closed, true)
                     .gap(px(8.))
                     .child(self.favicon(tab, 14., theme))
-                    .child(truncated(title).flex_1().min_w_0())
+                    .child(
+                        with_space(
+                            title,
+                            elsewhere,
+                            room,
+                            13.,
+                            SPACE_MARKER_LEAST,
+                            secondary,
+                            cx,
+                        )
+                        .flex_1(),
+                    );
+                highlights(row, target(0), cx)
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.run_menu_action(Action::Reopen(index), window, cx)
+                        this.run_menu_action(Action::Reopen(closed), window, cx)
                     }))
                     .into_any_element()
             }
@@ -479,34 +1193,335 @@ impl BrowserApp {
                 id,
                 name,
                 status,
-                failed,
+                state,
+                space,
+                elsewhere,
+                ..
             } => {
-                let muted = theme.tertiary();
-                let highlighted =
-                    |style: StyleRefinement| style.text_color(gpui::white().opacity(0.8));
-                // A failed download has nothing to show in Finder.
-                item(2000 + index, !failed)
+                let sidebar = self.sidebar_width().unwrap_or_default();
+                // A file that is there opens: the whole row is the choice,
+                // and the magnifier shows it in Finder. Otherwise × or ↻
+                // is, or nothing.
+                let open = matches!(choice, Some(Action::OpenDownload(_)));
+                let button = match second.or(choice.filter(|_| !open)) {
+                    Some(action @ Action::RevealDownload(_)) => Some((
+                        "download-reveal",
+                        Icon::Search,
+                        SharedString::from("Show in Finder"),
+                        action,
+                        1,
+                    )),
+                    Some(action @ Action::CancelDownload(_)) => Some((
+                        "download-cancel",
+                        Icon::Close,
+                        "Cancel Download".into(),
+                        action,
+                        0,
+                    )),
+                    // Downloads again with the logins of the space it came
+                    // from, which may not be the one on screen.
+                    Some(action @ Action::RetryDownload(_)) => Some((
+                        "download-retry",
+                        Icon::Reload,
+                        space.map_or_else(
+                            || "Download Again".into(),
+                            |space| format!("Download Again in {space}").into(),
+                        ),
+                        action,
+                        0,
+                    )),
+                    _ => None,
+                };
+                // The row itself is the choice when it opens the file, and
+                // when there is nothing to press, so that ⌫ can still
+                // remove it.
+                let row_choice = open || button.is_none();
+                let row_lit = row_choice && lit == Some(0);
+                // The room for the name: the library's width (`render_menu`)
+                // less its padding and the row's: 9 + 4, the icon and the
+                // button (16 and 24), and the gaps beside the name.
+                let room = LIBRARY_WIDTH.min(sidebar - 2. * EDGE) - 2. * PADDING - 69.;
+                let name_cut = advance_width(&name, &font(UI_FONT), 13., cx) > room;
+                // The whole status line, where the row cuts it, and always
+                // for another space's download.
+                let line = match &elsewhere {
+                    Some((space, _)) => format!("{status} · {space}"),
+                    None => status.clone(),
+                };
+                let status_cut =
+                    elsewhere.is_some() || advance_width(&line, &font(UI_FONT), 11.5, cx) > room;
+                let muted = if row_lit {
+                    gpui::white().opacity(0.8)
+                } else {
+                    theme.tertiary()
+                };
+                let status_color = if state == DownloadState::Failed && !row_lit {
+                    theme.error()
+                } else {
+                    muted
+                };
+                div()
+                    .id(("download", id))
+                    .flex()
+                    .items_center()
                     .gap(px(8.))
-                    .when(!failed, |row| {
+                    .h(px(DOWNLOAD_HEIGHT))
+                    .pl(px(9.))
+                    .pr(px(4.))
+                    .rounded(px(5.))
+                    .text_color(if row_lit {
+                        gpui::white()
+                    } else {
+                        theme.title()
+                    })
+                    .when(row_lit, |row| row.bg(focus))
+                    // The whole name, where the row cuts it in the middle,
+                    // and the whole status line, where it is cut.
+                    .when(name_cut || status_cut, |row| {
+                        let text = if status_cut {
+                            format!("{name} — {line}")
+                        } else {
+                            name.to_string()
+                        };
+                        row.tooltip(Tooltip::build_wrapping(text, "", theme, sidebar))
+                    })
+                    // GPUI hides a tooltip only as it redraws: a row that
+                    // doesn't change on hover still redraws as the pointer
+                    // leaves it, so its tooltip goes with it.
+                    .hover(|style| style)
+                    .when(row_choice, |row| {
+                        let row_target = target(0);
+                        highlights(row, row_target, cx)
+                            // Back on the row from its magnifier, which
+                            // keeps its moves to itself.
+                            .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                                this.hover_menu(row_target, true, cx)
+                            }))
+                    })
+                    .when(open, |row| {
                         row.on_click(cx.listener(move |this, _, window, cx| {
-                            this.run_menu_action(Action::RevealDownload(id), window, cx)
+                            this.run_menu_action(Action::OpenDownload(id), window, cx)
                         }))
                     })
+                    // Another space's download wears that space's dot, as
+                    // its switcher button does: the status line may have no
+                    // room left to name the space.
                     .child(
-                        icon(Icon::File, 14., muted)
-                            .when(!failed, |icon| icon.group_hover("menu-item", highlighted)),
+                        div()
+                            .relative()
+                            .flex_none()
+                            .size(px(16.))
+                            .child(icon(Icon::File, 16., muted))
+                            .children(elsewhere.as_ref().map(|&(_, space_theme)| {
+                                div()
+                                    .absolute()
+                                    .right(px(-2.))
+                                    .bottom(px(-1.))
+                                    .size(px(8.))
+                                    .rounded_full()
+                                    .bg(Theme::new(space_theme, theme.dark).dot())
+                                    .border_1()
+                                    .border_color(if row_lit { focus } else { theme.surface() })
+                            })),
                     )
-                    .child(truncated(name).flex_1().min_w_0())
-                    .children(status.map(|status| {
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(elided(name, Cut::Middle, 17.).text_size(px(13.)))
+                            .child(
+                                // How it went keeps its room; the space's
+                                // name takes what is left.
+                                with_space(
+                                    status.into(),
+                                    elsewhere.map(|(space, _)| space),
+                                    room,
+                                    11.5,
+                                    0.,
+                                    muted,
+                                    cx,
+                                )
+                                .text_size(px(11.5))
+                                .line_height(px(15.))
+                                .text_color(status_color),
+                            ),
+                    )
+                    .children(button.map(|(button_id, glyph, label, action, part)| {
+                        let button = press_only(
+                            icon_button(button_id, lit == Some(part), theme)
+                                .size(px(24.))
+                                .child(icon(glyph, 15., theme.icon())),
+                        )
+                        .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                        .tooltip(Tooltip::build(label, "", theme, sidebar))
+                        .on_click(cx.listener(
+                            move |this, _: &ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.run_menu_action(action, window, cx)
+                            },
+                        ));
+                        highlights(button, target(part), cx)
+                    }))
+                    .into_any_element()
+            }
+            Entry::Site {
+                host,
+                origin,
+                insecure,
+            } => {
+                let sidebar = self.sidebar_width().unwrap_or_default();
+                let warning = theme.error();
+                div()
+                    .id("site")
+                    .flex()
+                    .flex_col()
+                    .px(px(9.))
+                    // The whole origin: the line keeps the end of a long host.
+                    .tooltip(Tooltip::build_wrapping(
+                        breakable(&origin),
+                        "",
+                        theme,
+                        sidebar,
+                    ))
+                    // Redraws as the pointer leaves, which hides the tooltip.
+                    .hover(|style| style)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(7.))
+                            .h(px(SITE_HEIGHT))
+                            .child(icon(Icon::Globe, 15., theme.icon()))
+                            .child(
+                                elided(host, Cut::Start, 18.)
+                                    .flex_1()
+                                    .text_size(px(13.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.title()),
+                            ),
+                    )
+                    .when(insecure, |site| {
+                        site.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .h(px(SITE_WARNING_HEIGHT))
+                                .mt(px(-4.))
+                                .text_size(px(11.5))
+                                .text_color(warning)
+                                .child(icon(Icon::LockOpen, 12., warning))
+                                .child("Connection isn't secure"),
+                        )
+                    })
+                    .into_any_element()
+            }
+            Entry::Check {
+                label,
+                checked,
+                action,
+            } => {
+                let check = if lit.is_some() { gpui::white() } else { focus };
+                let row = item(index, true)
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .size(px(14.))
+                            .when(checked, |slot| slot.child(icon(Icon::Check, 14., check))),
+                    )
+                    .child(div().flex_1().child(label));
+                highlights(row, target(0), cx)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.run_menu_action(action, window, cx)
+                    }))
+                    .into_any_element()
+            }
+            Entry::Permission {
+                permission,
+                allowed,
+                action,
+            } => {
+                let sidebar = self.sidebar_width().unwrap_or_default();
+                let reset =
+                    press_only(
+                        icon_button("reset-permission", lit.is_some(), theme)
+                            .size(px(24.))
+                            .child(icon(Icon::Reopen, 14., theme.icon())),
+                    )
+                    // Asked again next time.
+                    .tooltip(Tooltip::build("Reset", "", theme, sidebar))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.run_menu_action(action, window, cx)
+                    }));
+                div()
+                    .id(("permission", index))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .h(px(PERMISSION_HEIGHT))
+                    .pl(px(9.))
+                    .pr(px(4.))
+                    .text_size(px(13.))
+                    .text_color(theme.title())
+                    .child(icon(permission_icon(permission), 14., theme.icon()))
+                    .child(truncated(permission_name(permission)).flex_1().min_w_0())
+                    .child(
                         div()
                             .flex_none()
                             .text_size(px(11.5))
-                            .text_color(muted)
-                            .when(!failed, |status| {
-                                status.group_hover("menu-item", highlighted)
+                            .text_color(if allowed {
+                                theme.tertiary()
+                            } else {
+                                theme.error()
                             })
-                            .child(status)
-                    }))
+                            .child(if allowed { "Allowed" } else { "Blocked" }),
+                    )
+                    .child(highlights(reset, target(0), cx))
+                    .into_any_element()
+            }
+            Entry::Zoom(percent) => {
+                let sidebar = self.sidebar_width().unwrap_or_default();
+                let mut button = |id: &'static str, part: usize, step: ZoomStep| {
+                    let button = press_only(icon_button(id, lit == Some(part), theme).h(px(24.)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.run_menu_action(Action::Zoom(step), window, cx)
+                        }));
+                    highlights(button, target(part), cx)
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.))
+                    .h(px(ZOOM_HEIGHT))
+                    .pl(px(9.))
+                    .pr(px(4.))
+                    .text_size(px(13.))
+                    .text_color(theme.title())
+                    .child(div().flex_1().child("Zoom"))
+                    .child(
+                        button("zoom-out", 0, ZoomStep::Out)
+                            .w(px(24.))
+                            .tooltip(Tooltip::build("Zoom Out", "⌘−", theme, sidebar))
+                            .child(icon(Icon::Minus, 15., theme.icon())),
+                    )
+                    .child(
+                        button("zoom-reset", 1, ZoomStep::Reset)
+                            .min_w(px(48.))
+                            .px(px(6.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .tooltip(Tooltip::build("Actual Size", "⌘0", theme, sidebar))
+                            .child(format!("{percent}%")),
+                    )
+                    .child(
+                        button("zoom-in", 2, ZoomStep::In)
+                            .w(px(24.))
+                            .tooltip(Tooltip::build("Zoom In", "⌘+", theme, sidebar))
+                            .child(icon(Icon::Plus, 15., theme.icon())),
+                    )
                     .into_any_element()
             }
             Entry::Separator => div()
@@ -527,6 +1542,22 @@ impl BrowserApp {
                 .text_color(theme.tertiary())
                 .child(text)
                 .into_any_element(),
+            Entry::SpaceName {
+                name,
+                icon: space_icon,
+                theme: space_theme,
+            } => div()
+                .h(px(SPACE_NAME_HEIGHT))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(9.))
+                .text_size(px(13.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.title())
+                .child(space_mark(space_icon, space_theme, theme.dark, false))
+                .child(truncated(name).flex_1().min_w_0())
+                .into_any_element(),
             Entry::Empty(text) => div()
                 .h(px(ITEM_HEIGHT))
                 .flex()
@@ -541,148 +1572,217 @@ impl BrowserApp {
                 .flex()
                 .items_center()
                 .justify_between()
-                .px(px(7.))
-                .children((0..THEME_COUNT).map(|index| {
-                    let swatch = Theme::new(index, theme.dark);
-                    press_only(
-                        div()
-                            .id(("swatch", usize::from(index)))
-                            .size(px(18.))
-                            .rounded_full()
-                            .bg(swatch.swatch())
-                            .border_2()
-                            .border_color(if index == current {
-                                theme.title()
-                            } else {
-                                theme.ink(0.08)
-                            })
-                            .cursor_pointer(),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.run_menu_action(Action::Theme(space, index), window, cx)
-                    }))
+                .px(px(4.))
+                .children((0..THEME_COUNT).map(|swatch| {
+                    let part = usize::from(swatch);
+                    let colours = Theme::new(swatch, theme.dark);
+                    // The highlight is a soft square behind the swatch, as
+                    // behind the icons below.
+                    let cell = div()
+                        .id(("swatch", part))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(24.))
+                        .rounded(px(6.))
+                        .when(lit == Some(part), |cell| cell.bg(theme.control_hover()))
+                        .cursor_pointer()
+                        .child(
+                            div()
+                                .size(px(18.))
+                                .rounded_full()
+                                .bg(colours.swatch())
+                                .border_2()
+                                .border_color(if swatch == current {
+                                    theme.title()
+                                } else {
+                                    theme.ink(0.08)
+                                }),
+                        );
+                    highlights(press_only(cell), target(part), cx).on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            this.run_menu_action(Action::Theme(space, swatch), window, cx)
+                        },
+                    ))
                 }))
                 .into_any_element(),
-            Entry::Icons(space, current) => {
-                let hover = theme.hover();
-                let choices = std::iter::once(None).chain(space_icons().iter().copied().map(Some));
+            Entry::Icons(space, current, space_theme) => {
+                // No icon shows the space's own dot, whichever space's
+                // colours the menu has.
+                let dot = Theme::new(space_theme, theme.dark).dot();
+                let choices: Vec<_> = std::iter::once(None)
+                    .chain(space_icons().iter().copied().map(Some))
+                    .collect();
+                let mut cell = |part: usize, choice: Option<&'static str>| {
+                    let selected = current.as_deref() == choice;
+                    let cell = div()
+                        .id(("space-icon", part))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(relative(1. / ICONS_PER_ROW as f32))
+                        .h(px(ICON_ROW_HEIGHT))
+                        .rounded(px(6.))
+                        .when(selected, |cell| cell.bg(theme.control_hover()))
+                        .when(lit == Some(part), |cell| {
+                            cell.bg(theme.ink(if theme.dark { 0.16 } else { 0.13 }))
+                        })
+                        .text_size(px(15.))
+                        .map(|cell| match choice {
+                            Some(emoji) => cell.child(emoji),
+                            None => cell.child(div().size(px(7.)).rounded_full().bg(dot)),
+                        });
+                    highlights(press_only(cell), target(part), cx).on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            this.run_menu_action(Action::SpaceIcon(space, choice), window, cx)
+                        },
+                    ))
+                };
+                // Always this many to a row, as `height` counts them, also
+                // in a menu narrowed by a narrow sidebar.
                 div()
-                    .flex()
-                    .flex_wrap()
                     .px(px(2.))
-                    .children(choices.enumerate().map(|(index, choice)| {
-                        let selected = current.as_deref() == choice;
-                        press_only(
-                            div()
-                                .id(("space-icon", index))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .w(px(26.))
-                                .h(px(ICON_ROW_HEIGHT))
-                                .rounded(px(6.))
-                                .when(selected, |cell| cell.bg(theme.control_hover()))
-                                .hover(move |style| style.bg(hover))
-                                .text_size(px(15.))
-                                .map(|cell| match choice {
-                                    Some(emoji) => cell.child(emoji),
-                                    None => cell
-                                        .child(div().size(px(7.)).rounded_full().bg(theme.focus())),
-                                }),
-                        )
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.run_menu_action(Action::SpaceIcon(space, choice), window, cx)
-                            },
-                        ))
-                    }))
+                    .children(
+                        choices
+                            .chunks(ICONS_PER_ROW)
+                            .enumerate()
+                            .map(|(row, chunk)| {
+                                div().flex().children(chunk.iter().enumerate().map(
+                                    |(column, &choice)| cell(row * ICONS_PER_ROW + column, choice),
+                                ))
+                            }),
+                    )
                     .into_any_element()
             }
-            Entry::Prompt { title, detail } => div()
-                .h(px(PROMPT_HEIGHT))
+            Entry::Prompt {
+                title,
+                detail,
+                lines: (title_lines, _),
+            } => div()
+                .h(px(height))
                 .flex()
                 .flex_col()
                 .gap(px(2.))
-                .px(px(9.))
+                .px(px(PROMPT_PADDING))
                 .pt(px(4.))
                 .child(
-                    truncated(title)
-                        .text_size(px(13.))
+                    // The whole name, question mark and all, on the lines
+                    // measured for it.
+                    div()
+                        .line_clamp(title_lines)
+                        .text_ellipsis()
+                        .line_height(px(PROMPT_TITLE_LINE))
+                        .text_size(px(PROMPT_TITLE_SIZE))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.title()),
+                        .text_color(theme.title())
+                        .child(title),
                 )
                 .child(
                     div()
-                        .text_size(px(12.))
-                        .line_height(px(16.))
+                        .text_size(px(PROMPT_DETAIL_SIZE))
+                        .line_height(px(PROMPT_DETAIL_LINE))
                         .text_color(theme.muted())
                         .child(detail),
                 )
                 .into_any_element(),
             Entry::Confirm { label, action } => {
-                let button = |id: &'static str, text: &'static str| {
+                // The highlighted button wears a focus ring, as AppKit draws
+                // around the button Return or Space would press.
+                let button = |id: &'static str, text: &'static str, part: usize| {
                     div()
                         .id(id)
                         .flex()
                         .items_center()
-                        .h(px(24.))
-                        .px(px(11.))
-                        .rounded(px(6.))
+                        .h(px(26.))
+                        .px(px(10.))
+                        .rounded(px(7.))
+                        .border_2()
+                        .border_color(if lit == Some(part) {
+                            focus
+                        } else {
+                            gpui::transparent_black()
+                        })
                         .text_size(px(12.5))
                         .font_weight(FontWeight::MEDIUM)
                         .child(text)
                 };
                 let control_hover = theme.control_hover();
+                let cancel = button("menu-cancel", "Cancel", 0)
+                    .bg(theme.control())
+                    .hover(move |style| style.bg(control_hover))
+                    .text_color(theme.title());
+                let confirm = button("menu-confirm", label, 1)
+                    .bg(theme.danger())
+                    .hover(|style| style.opacity(0.85))
+                    .text_color(gpui::white());
                 div()
                     .h(px(CONFIRM_HEIGHT))
                     .flex()
                     .items_center()
                     .justify_end()
                     .gap(px(6.))
-                    .px(px(4.))
+                    .px(px(3.))
                     .child(
-                        button("menu-cancel", "Cancel")
-                            .bg(theme.control())
-                            .hover(move |style| style.bg(control_hover))
-                            .text_color(theme.title())
-                            .on_click(cx.listener(|this, _, _, cx| this.close_menu(cx))),
+                        highlights(cancel, target(0), cx).on_click(
+                            cx.listener(|this, _, window, cx| this.close_menu(window, cx)),
+                        ),
                     )
-                    .child(
-                        button("menu-confirm", label)
-                            .bg(theme.danger())
-                            .hover(|style| style.opacity(0.85))
-                            .text_color(gpui::white())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.run_menu_action(action, window, cx)
-                            })),
-                    )
+                    .child(highlights(confirm, target(1), cx).on_click(cx.listener(
+                        move |this, _, window, cx| this.run_menu_action(action, window, cx),
+                    )))
                     .into_any_element()
             }
             Entry::Space {
                 name,
-                icon,
+                icon: space_icon,
                 theme: space_theme,
+                shortcut,
+                current,
                 action,
             } => {
-                let dot = Theme::new(space_theme, theme.dark).swatch();
-                item(3000 + index, true)
+                let row = item(3000 + index, true)
                     .gap(px(8.))
+                    .child(space_mark(
+                        space_icon,
+                        space_theme,
+                        theme.dark,
+                        lit.is_some(),
+                    ))
                     .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .size(px(16.))
-                            .map(|slot| match icon {
-                                Some(emoji) => slot.text_size(px(13.)).child(emoji),
-                                None => slot.child(div().size(px(7.)).rounded_full().bg(dot)),
-                            }),
+                        truncated(name)
+                            .flex_1()
+                            .min_w_0()
+                            .when(current, |name| name.font_weight(FontWeight::SEMIBOLD)),
                     )
-                    .child(truncated(name).flex_1().min_w_0())
+                    .when(current, |row| {
+                        let check = if lit.is_some() {
+                            gpui::white()
+                        } else {
+                            theme.title()
+                        };
+                        row.child(icon(Icon::Check, 13., check).flex_none())
+                    })
+                    .when(!shortcut.is_empty(), |row| {
+                        row.child(div().flex_none().text_color(secondary).child(shortcut))
+                    });
+                // "…" lists the spaces for a dragged tab too: dropped on
+                // another one, it moves there.
+                let drop_to = match action {
+                    Action::SwitchSpace(space_id) if !current => Some(space_id),
+                    _ => None,
+                };
+                highlights(row, target(0), cx)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.run_menu_action(action, window, cx)
                     }))
+                    .when_some(drop_to, |row, space_id| {
+                        // Tinted in its colour, as the space's button is.
+                        let tint = Theme::new(space_theme, theme.dark).dot().opacity(0.35);
+                        row.drag_over::<DraggedTab>(move |style, _, _, _| style.bg(tint))
+                            .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
+                                this.drop_tab_on_space(dragged.0, space_id, window, cx)
+                            }))
+                    })
                     .into_any_element()
             }
             Entry::Note(text) => div()
@@ -702,36 +1802,495 @@ impl BrowserApp {
         let next = match action {
             Action::AskDeleteSpace(id) => Some(MenuKind::DeleteSpace(id)),
             Action::AskMoveTab(id) => Some(MenuKind::MoveTab(id)),
+            Action::AskClearSiteData(id) => Some(MenuKind::ClearSiteData(id)),
             _ => None,
         };
         if let (Some(kind), Some(menu)) = (next, &mut self.menu) {
-            menu.kind = kind;
+            menu.become_menu(kind);
             return cx.notify();
         }
-        self.close_menu(cx);
+        // Colours and icons apply at once and the menu stays, so several
+        // can be tried; Esc or a press elsewhere closes it.
+        match action {
+            Action::Theme(id, theme) => return self.set_space_theme(id, theme, cx),
+            Action::SpaceIcon(id, icon) => return self.set_space_icon(id, icon, cx),
+            _ => {}
+        }
+        // The menu shows these changes as they happen, so it stays.
+        match action {
+            Action::CancelDownload(id) => return self.cancel_download(id),
+            Action::RetryDownload(id) => return self.retry_download(id, cx),
+            Action::RemoveDownload(id) => return self.remove_download(id, cx),
+            Action::ClearDownloads => return self.clear_downloads(cx),
+            Action::ResetPermission(tab_id, permission) => {
+                return self.reset_site_permission(tab_id, permission, cx);
+            }
+            Action::Zoom(step) => return self.zoom_page(step, cx),
+            _ => {}
+        }
+        self.close_menu(window, cx);
         match action {
             Action::TogglePin(id) => self.toggle_pin(id, cx),
             Action::ToggleFavorite(id) => self.toggle_favorite(id, cx),
-            Action::CopyLink(id) => self.copy_url(id, cx),
+            Action::RenameTab(id) => self.start_tab_rename(id, window, cx),
+            Action::ResetTabName(id) => self.reset_tab_name(id, cx),
+            Action::GoToPinnedPage(id) => self.go_to_pinned_page(id, window, cx),
+            Action::CopyUrl(id) => self.copy_url(id, cx),
             Action::Duplicate(id) => self.duplicate_tab(id, window, cx),
             Action::Reload(id) => self.reload(id, cx),
+            Action::ToggleMute(id) => self.toggle_mute(id, cx),
             Action::Close(id) => self.close_tab(id, cx),
-            Action::Delete(id) => self.remove_tab(id, cx),
+            // A page with unsaved changes asks first.
+            Action::Delete(id) => self.leave_tab(id, Leaving::Close, cx),
+            Action::CloseOtherTabs(id) => self.close_today_tabs_around(id, false, cx),
+            Action::CloseTabsBelow(id) => self.close_today_tabs_around(id, true, cx),
             Action::Rename(id) => self.start_rename(id, window, cx),
-            Action::Theme(id, theme) => self.set_space_theme(id, theme, cx),
-            Action::SpaceIcon(id, icon) => self.set_space_icon(id, icon, cx),
+            Action::Theme(..) | Action::SpaceIcon(..) => {}
+            Action::SwitchSpace(id) => self.switch_space(id, window, cx),
             Action::NewSpace => self.new_space(window, cx),
             Action::UnloadSpace(id) => self.unload_space(id, cx),
             Action::NewTab => {
                 self.toggle_command_bar(super::command_bar::CommandMode::NewTab, window, cx)
             }
             Action::Reopen(index) => self.reopen_closed(Some(index), window, cx),
-            Action::AskDeleteSpace(_) | Action::AskMoveTab(_) => {}
+            Action::AskDeleteSpace(_)
+            | Action::AskMoveTab(_)
+            | Action::AskClearSiteData(_)
+            | Action::Cancel => {}
             Action::DeleteSpace(id) => self.delete_space(id, window, cx),
+            Action::OpenDownload(id) => self.open_download(id),
             Action::RevealDownload(id) => self.reveal_download(id),
-            Action::MoveTab(id, space_id) => self.move_tab_to_space(id, space_id, cx),
+            Action::CancelDownload(_)
+            | Action::RetryDownload(_)
+            | Action::RemoveDownload(_)
+            | Action::ClearDownloads
+            | Action::ResetPermission(..)
+            | Action::Zoom(_) => {}
+            Action::MoveTab(id, space_id) => self.leave_tab(id, Leaving::Move(space_id), cx),
+            Action::ToggleBlocking(id) => {
+                if let Some(host) = self.state.tab(id).and_then(|tab| host_of(&tab.url)) {
+                    self.toggle_blocking(&host, cx);
+                }
+            }
+            Action::ClearSiteData(id) => self.clear_site_data(id, cx),
         }
     }
+
+    /// The browser window's key context: "Browser", and "Menu" while a menu
+    /// is open, for the menu's keys.
+    pub(super) fn key_context(&self) -> KeyContext {
+        let mut context = KeyContext::default();
+        context.add("Browser");
+        if self.menu.is_some() {
+            context.add("Menu");
+        }
+        context
+    }
+
+    /// The pointer entered or left a choice: it takes the highlight, and
+    /// gives it back to the menu's default when it leaves.
+    fn hover_menu(&mut self, target: Highlight, hovered: bool, cx: &mut Context<Self>) {
+        let Some(menu) = &mut self.menu else {
+            return;
+        };
+        let highlight = if hovered {
+            Some(target)
+        } else if menu.highlight == Some(target) {
+            None
+        } else {
+            return;
+        };
+        if menu.highlight != highlight {
+            menu.highlight = highlight;
+            cx.notify();
+        }
+    }
+
+    /// Moves the open menu's highlight with the arrow keys, Home, End, Tab
+    /// and ⇧Tab. → on "Move to Space ›" lists the spaces, and ← goes back.
+    fn step_menu(&mut self, step: Step, cx: &mut Context<Self>) {
+        let Some(menu) = &self.menu else {
+            return;
+        };
+        let kind = menu.kind;
+        let entries = self.menu_entries(kind);
+        // The entries can change under the highlight (a tab closed by a
+        // shortcut empties its menu).
+        let current = menu
+            .highlight
+            .filter(|at| {
+                entries
+                    .get(at.entry)
+                    .is_some_and(|entry| at.part < entry.parts())
+            })
+            .or_else(|| default_highlight(&entries));
+        let row_choice = current.filter(|at| entries[at.entry].parts() > 1);
+        let next = match (step, current) {
+            // Within a row of choices, ← and → pick the neighbour.
+            (Step::Left | Step::Right, Some(at)) if row_choice.is_some() => {
+                let parts = entries[at.entry].parts();
+                let part = if step == Step::Right {
+                    (at.part + 1) % parts
+                } else {
+                    (at.part + parts - 1) % parts
+                };
+                Some(Highlight { part, ..at })
+            }
+            (Step::Right, Some(at)) => {
+                if let Some(Action::AskMoveTab(id)) = entries[at.entry].action(at.part) {
+                    return self.enter_submenu(MenuKind::MoveTab(id), cx);
+                }
+                return;
+            }
+            (Step::Left, _) => {
+                if let MenuKind::MoveTab(id) = kind {
+                    self.leave_submenu(MenuKind::Tab(id), cx);
+                }
+                return;
+            }
+            (Step::Right, None) => return,
+            (Step::NextControl | Step::PreviousControl, _) => {
+                let targets: Vec<Highlight> = entries
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(entry, item)| {
+                        (0..item.parts()).map(move |part| Highlight { entry, part })
+                    })
+                    .collect();
+                let count = targets.len();
+                let index = current.and_then(|at| targets.iter().position(|t| *t == at));
+                let index = match (index, step == Step::NextControl) {
+                    (Some(index), true) => (index + 1) % count.max(1),
+                    (Some(index), false) => (index + count - 1) % count.max(1),
+                    (None, true) => 0,
+                    (None, false) => count.saturating_sub(1),
+                };
+                targets.get(index).copied()
+            }
+            (Step::Previous | Step::Next | Step::First | Step::Last, _) => {
+                let choices: Vec<usize> = (0..entries.len())
+                    .filter(|&entry| entries[entry].parts() > 0)
+                    .collect();
+                let count = choices.len();
+                let index = current.and_then(|at| choices.iter().position(|&e| e == at.entry));
+                let index = match (step, index) {
+                    (Step::First, _) | (Step::Next, None) => 0,
+                    (Step::Last, _) | (_, None) => count.saturating_sub(1),
+                    (Step::Next, Some(index)) => (index + 1) % count.max(1),
+                    (_, Some(index)) => (index + count - 1) % count.max(1),
+                };
+                choices.get(index).map(|&entry| Highlight {
+                    entry,
+                    part: entries[entry].current_part(),
+                })
+            }
+        };
+        self.highlight_menu(next, cx);
+    }
+
+    /// Highlights `target` and scrolls it into view.
+    fn highlight_menu(&mut self, target: Option<Highlight>, cx: &mut Context<Self>) {
+        let Some(menu) = &mut self.menu else {
+            return;
+        };
+        if let Some(target) = target {
+            menu.scroll.scroll_to_item(target.entry);
+        }
+        if menu.highlight != target {
+            menu.highlight = target;
+            cx.notify();
+        }
+    }
+
+    /// From the keyboard, "Move to Space ›" lists the spaces with the first
+    /// one highlighted.
+    fn enter_submenu(&mut self, kind: MenuKind, cx: &mut Context<Self>) {
+        if let Some(menu) = &mut self.menu {
+            menu.become_menu(kind);
+        }
+        self.step_menu(Step::First, cx);
+        cx.notify();
+    }
+
+    /// ← in the list of spaces: back to the tab's menu, on "Move to Space".
+    fn leave_submenu(&mut self, kind: MenuKind, cx: &mut Context<Self>) {
+        let entries = self.menu_entries(kind);
+        let parent = entries
+            .iter()
+            .position(|entry| matches!(entry.action(0), Some(Action::AskMoveTab(_))));
+        if let Some(menu) = &mut self.menu {
+            menu.become_menu(kind);
+        }
+        self.highlight_menu(parent.map(|entry| Highlight { entry, part: 0 }), cx);
+        cx.notify();
+    }
+
+    /// Return: chooses the highlighted item, or enters the list it opens.
+    fn choose_in_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = &self.menu else {
+            return;
+        };
+        let entries = self.menu_entries(menu.kind);
+        let Some(at) = menu.highlight.or_else(|| default_highlight(&entries)) else {
+            return;
+        };
+        match entries
+            .get(at.entry)
+            .and_then(|entry| entry.action(at.part))
+        {
+            Some(Action::AskMoveTab(id)) => self.enter_submenu(MenuKind::MoveTab(id), cx),
+            Some(Action::Cancel) => self.close_menu(window, cx),
+            Some(action) => self.run_menu_action(action, window, cx),
+            None => {}
+        }
+    }
+
+    /// ⌫ in the library: the highlighted download leaves the list, if it
+    /// ended; the next one takes its place under the highlight.
+    fn remove_in_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = &self.menu else {
+            return;
+        };
+        let entries = self.menu_entries(menu.kind);
+        let removed = menu
+            .highlight
+            .and_then(|at| entries.get(at.entry))
+            .and_then(|entry| match entry {
+                Entry::Download { id, state, .. } if *state != DownloadState::Running => {
+                    Some(Action::RemoveDownload(*id))
+                }
+                _ => None,
+            });
+        if let Some(action) = removed {
+            self.run_menu_action(action, window, cx);
+        }
+    }
+
+    /// ⌥⌘L, History > Show Downloads and the command bar: the library, opened
+    /// from the keyboard with its first choice highlighted, so Return opens
+    /// the newest download. A hidden sidebar peeks while it is open; again
+    /// closes it. An open command bar closes, as for ⌘Y, so the library
+    /// gets the keys.
+    pub(crate) fn show_downloads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let bar_open = self.command_bar.is_some();
+        if bar_open {
+            self.close_command_bar(cx);
+            window.activate_window();
+        }
+        if !bar_open
+            && self
+                .menu
+                .as_ref()
+                .is_some_and(|menu| menu.kind == MenuKind::Library)
+        {
+            return self.close_menu(window, cx);
+        }
+        // A page in fullscreen would cover it.
+        if self.fullscreen {
+            return;
+        }
+        if self.sidebar_width().is_none() {
+            self.sidebar_peek = true;
+            self.sync_traffic_lights();
+        }
+        let height = window.viewport_size().height;
+        let anchor = point(px(LIBRARY_ANCHOR.x), height - px(LIBRARY_ANCHOR.y));
+        self.open_menu(MenuKind::Library, anchor, window, cx);
+        self.step_menu(Step::First, cx);
+    }
+
+    /// ⌘⌫ in a question: its red button, as in AppKit's alerts.
+    fn choose_destructive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = &self.menu else {
+            return;
+        };
+        let action = self
+            .menu_entries(menu.kind)
+            .iter()
+            .find_map(|entry| match entry {
+                Entry::Confirm { action, .. } => Some(*action),
+                _ => None,
+            });
+        if let Some(action) = action {
+            self.run_menu_action(action, window, cx);
+        }
+    }
+
+    /// Typing picks an item by name, as in AppKit's menus: keys typed less
+    /// than `TYPE_SELECT_PAUSE` apart build up the start of a name ("hou"
+    /// for House Hunt), looked for from the highlighted item on. A letter
+    /// typed again and again steps through the items starting with it.
+    /// Nothing matching leaves the highlight where it is, and a space only
+    /// continues a name: Return chooses. Outside a name, Space presses the
+    /// question's button that wears the focus ring, as in AppKit's alerts.
+    fn type_in_menu(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = &mut self.menu else {
+            return;
+        };
+        let modifiers = &event.keystroke.modifiers;
+        if modifiers.platform || modifiers.control || modifiers.alt || modifiers.function {
+            return;
+        }
+        let Some(text) = event
+            .keystroke
+            .key_char
+            .as_deref()
+            .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
+        else {
+            return;
+        };
+        let now = Instant::now();
+        if menu
+            .typed_at
+            .is_none_or(|at| now.duration_since(at) >= TYPE_SELECT_PAUSE)
+        {
+            menu.typed.clear();
+        }
+        // No name starts with a space.
+        if menu.typed.is_empty() && text.trim().is_empty() {
+            let (kind, highlight) = (menu.kind, menu.highlight);
+            let entries = self.menu_entries(kind);
+            let on_button = highlight
+                .or_else(|| default_highlight(&entries))
+                .is_some_and(|at| matches!(entries.get(at.entry), Some(Entry::Confirm { .. })));
+            if on_button {
+                self.choose_in_menu(window, cx);
+            }
+            return;
+        }
+        menu.typed.push_str(&text.to_lowercase());
+        menu.typed_at = Some(now);
+        let (typed, kind) = (menu.typed.clone(), menu.kind);
+        let current = menu.highlight.map(|at| at.entry);
+        let entries = self.menu_entries(kind);
+        let count = entries.len();
+        let find = |from: usize, prefix: &str| {
+            (0..count)
+                .map(|offset| (from + offset) % count.max(1))
+                .find(|&entry| {
+                    entries[entry]
+                        .label()
+                        .is_some_and(|label| label.trim_start().to_lowercase().starts_with(prefix))
+                })
+        };
+        let mut letters = typed.chars();
+        let first = letters.next().map(String::from).unwrap_or_default();
+        let repeated = letters.all(|letter| first.starts_with(letter));
+        // A longer start stays on the highlighted item while it still fits;
+        // one letter, or the same one again, moves on to the next.
+        let found = (typed.chars().count() > 1)
+            .then(|| find(current.unwrap_or(0), &typed))
+            .flatten()
+            .or_else(|| {
+                repeated
+                    .then(|| find(current.map_or(0, |entry| entry + 1), &first))
+                    .flatten()
+            });
+        if let Some(entry) = found {
+            self.highlight_menu(Some(Highlight { entry, part: 0 }), cx);
+        }
+    }
+
+    /// ⇧F10 or the context-menu key, as a right-click from the keyboard:
+    /// the selected tab's menu, below its row, or the space's menu when no
+    /// tab is selected. Its first item is highlighted, as in a menu opened
+    /// from the keyboard on macOS. Menus show only in the sidebar: a hidden
+    /// one peeks, as for the library, and the menu opens once its rows are
+    /// laid out, a frame later. The menu keeps the peek while it is open.
+    pub(crate) fn show_menu_from_keyboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.menu.is_some() || self.fullscreen {
+            return;
+        }
+        if self.sidebar_width().is_some() {
+            return self.open_menu_from_keyboard(window, cx);
+        }
+        self.sidebar_peek = true;
+        self.sync_traffic_lights();
+        cx.notify();
+        // Callbacks for the next frame run before it is drawn; the one
+        // after it finds the peeking sidebar's rows in place.
+        cx.on_next_frame(window, |_, window, cx| {
+            cx.on_next_frame(window, |this, window, cx| {
+                if this.menu.is_none() && this.sidebar_width().is_some() {
+                    this.open_menu_from_keyboard(window, cx);
+                }
+            });
+        });
+    }
+
+    fn open_menu_from_keyboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let inset = point(px(4. * EDGE), px(0.));
+        match self.active_tab_id() {
+            Some(tab_id) => {
+                let anchor = self
+                    .tab_bounds(tab_id)
+                    .map_or(inset, |row| row.bottom_left() + inset);
+                self.open_tab_menu(tab_id, anchor, window, cx);
+            }
+            None => {
+                let space_id = self.state.selected_space_id;
+                let title = self.drop_zones.borrow().title;
+                self.open_space_title_menu(space_id, title.bottom_left() + inset, window, cx);
+            }
+        }
+        self.step_menu(Step::First, cx);
+    }
+}
+
+/// Keeps the menu's highlight on `element`, a choice, while the pointer is
+/// over it.
+fn highlights(
+    element: Stateful<Div>,
+    target: Highlight,
+    cx: &mut Context<BrowserApp>,
+) -> Stateful<Div> {
+    element.on_hover(
+        cx.listener(move |this, hovered: &bool, _, cx| this.hover_menu(target, *hovered, cx)),
+    )
+}
+
+/// A small button inside a row (×, ↻, Reset, the zoom's), shaded while
+/// it has the menu's highlight, like the icon choices.
+fn icon_button(id: &'static str, lit: bool, theme: &Theme) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.))
+        .when(lit, |button| {
+            button.bg(theme.ink(if theme.dark { 0.16 } else { 0.13 }))
+        })
+}
+
+/// The open menu's keys, on the browser window's root.
+pub(super) fn handle_menu_keys<E: InteractiveElement>(root: E, cx: &mut Context<BrowserApp>) -> E {
+    root.on_action(
+        cx.listener(|this, _: &SelectPrevious, _, cx| this.step_menu(Step::Previous, cx)),
+    )
+    .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.step_menu(Step::Next, cx)))
+    .on_action(cx.listener(|this, _: &SelectFirst, _, cx| this.step_menu(Step::First, cx)))
+    .on_action(cx.listener(|this, _: &SelectLast, _, cx| this.step_menu(Step::Last, cx)))
+    .on_action(cx.listener(|this, _: &SelectLeft, _, cx| this.step_menu(Step::Left, cx)))
+    .on_action(cx.listener(|this, _: &SelectRight, _, cx| this.step_menu(Step::Right, cx)))
+    .on_action(cx.listener(|this, _: &NextControl, _, cx| this.step_menu(Step::NextControl, cx)))
+    .on_action(
+        cx.listener(|this, _: &PreviousControl, _, cx| this.step_menu(Step::PreviousControl, cx)),
+    )
+    .on_action(cx.listener(|this, _: &Choose, window, cx| this.choose_in_menu(window, cx)))
+    .on_action(
+        cx.listener(|this, _: &ChooseDestructive, window, cx| this.choose_destructive(window, cx)),
+    )
+    .on_action(
+        cx.listener(|this, _: &ShowTabMenu, window, cx| {
+            this.shortcut(Shortcut::TabMenu, window, cx)
+        }),
+    )
+    .on_action(cx.listener(|this, _: &RemoveFromList, window, cx| this.remove_in_menu(window, cx)))
+    .on_key_down(
+        cx.listener(|this, event: &KeyDownEvent, window, cx| this.type_in_menu(event, window, cx)),
+    )
 }
 
 #[cfg(test)]

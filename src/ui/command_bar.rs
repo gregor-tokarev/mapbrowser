@@ -1,39 +1,76 @@
 //! Arc's command bar (⌘T, ⌘L). It opens in its own pop-up window over the
 //! page card, because the native web views would cover anything GPUI draws
 //! in the browser window. A new tab exists only once a result is picked.
+//! The same bar lists the pages visited (History, ⌘Y) and the few settings
+//! there are (⌘,).
 
 use super::{
     UI_FONT,
+    elide::{self, Cut},
     icons::{Icon, icon},
-    placeholder_favicon, shadow,
+    placeholder_favicon, shadow, text_width,
     theme::Theme,
     truncated,
 };
 use crate::{
-    favicons::host_of,
-    input::{InputEvent, InputStyle, TextInput},
-    model::{self, Pin, SpaceId, TabId},
+    engine::{Navigation, Shortcut, navigation_for},
+    favicons::{host_of, normalize_host},
+    history::VisitedPage,
+    input::{self, InputEvent, InputStyle, TextInput},
+    model::{self, Pin, SearchEngine, SpaceId, TabId},
 };
 use gpui::{
-    App, AppContext, Bounds, Context, DisplayId, Entity, EventEmitter, FontWeight, Image,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, Pixels, Point, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, actions, div, img, point,
-    prelude::FluentBuilder, px, size,
+    App, AppContext, Bounds, Context, DisplayId, Div, Entity, EventEmitter, Font, FontWeight,
+    Image, InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, Pixels, Point,
+    Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, actions, div, font,
+    http_client::Url, img, point, prelude::FluentBuilder, px, size,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    cmp::Reverse,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
-actions!(command_bar, [SelectPrevious, SelectNext]);
+actions!(command_bar, [SelectPrevious, SelectNext, SubmitInNewTab]);
 
-pub const MAX_ITEMS: usize = 8;
-const MAX_TABS: usize = 5;
-const MAX_ACTIONS: usize = 3;
+/// The least share of a row's room a title keeps beside what follows it,
+/// if it needs that much, and the least it keeps where the domain that
+/// owns the row's host needs the room.
+const TITLE_SHARE: f32 = 0.35;
+const TITLE_FLOOR: f32 = 0.25;
+/// The most of a row the highlighted row's hint takes ("Switch to <space>").
+const HINT_SHARE: f32 = 0.3;
+/// The least of a space's name a row's detail keeps while the host before
+/// it gives way: a few letters.
+const DETAIL_LEAST: f32 = 30.;
+/// The least room for a highlighted row's hint ("Switch to…"); with less,
+/// it shows only ↩.
+const HINT_LEAST: f32 = 64.;
+/// Between a row's title and what follows it.
+const DASH: &str = " — ";
+/// Rows the list shows at most before it scrolls; fewer on a short card
+/// (`visible_rows`).
+const MAX_VISIBLE_ROWS: usize = 8;
+/// Open tabs listed at most. Every matching tab can be reached: the list
+/// scrolls.
+const MAX_TABS: usize = 50;
+/// After the tabs: recently closed tabs, visited pages and actions.
+const MAX_CLOSED: usize = 3;
+const MAX_PAGES: usize = 6;
+const MAX_ACTIONS: usize = 4;
+/// Pages the History view lists at most.
+const MAX_HISTORY: usize = 200;
+/// Fewer characters than this never name a tab (`named`).
+const MIN_TAB_NAME: usize = 4;
 const MAX_WIDTH: f32 = 760.;
 const MIN_WIDTH: f32 = 320.;
 const INPUT_HEIGHT: f32 = 68.;
 const ROW_HEIGHT: f32 = 48.;
 const LIST_PADDING_TOP: f32 = 7.;
 const LIST_PADDING_BOTTOM: f32 = 8.;
+/// The panel's least distance from the card's bottom edge.
+const CARD_GAP: f32 = 10.;
 /// Transparent room around the panel for its shadow. X11 previews have no
 /// compositor, so there the window is exactly the panel.
 pub(super) const TRANSPARENT: bool = cfg!(target_os = "macos");
@@ -46,6 +83,14 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("down", SelectNext, Some("CommandBar")),
         KeyBinding::new("ctrl-p", SelectPrevious, Some("CommandBar")),
         KeyBinding::new("ctrl-n", SelectNext, Some("CommandBar")),
+        // As in Chrome's address bar.
+        KeyBinding::new("tab", SelectNext, Some("CommandBar")),
+        KeyBinding::new("shift-tab", SelectPrevious, Some("CommandBar")),
+        // ⇧ still held after typing a capital doesn't swallow Return.
+        KeyBinding::new("shift-enter", input::Submit, Some("CommandBar")),
+        // As in Safari and Chrome: the address in a new tab, from ⌘L too.
+        KeyBinding::new("cmd-enter", SubmitInNewTab, Some("CommandBar")),
+        KeyBinding::new("alt-enter", SubmitInNewTab, Some("CommandBar")),
     ]);
 }
 
@@ -55,6 +100,10 @@ pub enum CommandMode {
     NewTab,
     /// ⌘L: the active tab's address, selected; Enter loads it in that tab.
     EditAddress,
+    /// ⌘Y: the pages visited, the most recent first.
+    History,
+    /// ⌘,: the search engine and the other settings.
+    Settings,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,18 +112,51 @@ pub enum Command {
     Open(String),
     /// An address or search in the active tab.
     Navigate(String),
+    /// A mail, phone or messages address, for its app.
+    OpenInApp(String),
     Reload,
     SwitchToTab(TabId),
     SwitchToSpace(SpaceId),
+    /// The most recently closed tab, back in its space.
+    ReopenClosedTab,
+    /// A recently closed tab, by its id, back in its space.
+    ReopenTab(TabId),
     TogglePin,
     ToggleFavorite,
     ToggleSidebar,
     CopyUrl,
     ClearToday,
     NewSpace,
-    ReopenClosedTab,
+    DuplicateTab,
+    RenameTab,
+    /// A pinned tab or favorite back at the page it was pinned at.
+    GoToPinnedPage,
+    /// A pinned tab or favorite, closed rather than unloaded as ⌘W does.
+    CloseTab,
+    ToggleMute,
+    /// The active space's other Today tabs, closed together.
+    CloseOtherTabs,
+    /// The Today tabs below the active tab, closed together.
+    CloseTabsBelow,
+    MoveTab(SpaceId),
+    RenameSpace,
+    UnloadSpace,
     /// Content blocking on the host, off or back on.
     ToggleBlocking(String),
+    /// The active tab's site menu, as the shield opens it.
+    SiteSettings,
+    /// The site menu's question before it clears the site's data.
+    ClearSiteData,
+    /// What a browser shortcut does: close the tab, find, zoom, print.
+    Shortcut(Shortcut),
+    ShowHistory,
+    /// The library, with its downloads, as ⌥⌘L opens it.
+    ShowDownloads,
+    ClearHistory,
+    ShowSettings,
+    SearchWith(SearchEngine),
+    SetDefaultBrowser,
+    ShowShortcuts,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,10 +170,17 @@ pub enum ItemIcon {
 pub struct CommandItem {
     pub command: Command,
     pub title: String,
-    /// Shown after the title: a tab's host or space.
+    /// Shown after the title: a page's host, which loses its start rather
+    /// than the domain that owns it, or, where titles repeat, its address,
+    /// which loses its middle.
+    pub address: Option<(String, Cut)>,
+    /// Shown after the title and address: a tab's space, or a note. It
+    /// loses its end before the host loses anything.
     pub detail: Option<String>,
-    /// Shown at the right of the highlighted row.
-    pub hint: &'static str,
+    /// Shown last and never cut: how long ago a page was visited.
+    pub when: Option<String>,
+    /// Shown at the right of the highlighted row: what Return does.
+    pub hint: SharedString,
     pub icon: ItemIcon,
 }
 
@@ -109,6 +198,65 @@ pub struct ActiveTab {
     pub pin: Pin,
     pub host: Option<String>,
     pub blocking_disabled: bool,
+    /// For a Today tab: whether other Today tabs, or ones below it, would
+    /// close.
+    pub today_others: bool,
+    pub today_below: bool,
+    /// Whether its page is open: only then can it be unloaded or muted.
+    pub loaded: bool,
+    pub muted: bool,
+    /// A pinned tab or favorite showing another page than it was pinned at.
+    pub pinned_away: bool,
+}
+
+/// A recently closed tab.
+pub struct ClosedEntry {
+    pub id: TabId,
+    pub space_id: SpaceId,
+    pub title: String,
+    pub url: String,
+}
+
+/// A visited page, its text lowercased once for matching as you type.
+pub struct HistoryEntry {
+    pub url: String,
+    /// Empty if the page had none.
+    pub title: String,
+    pub count: u32,
+    /// The latest visit, in seconds since the Unix epoch.
+    pub last: u64,
+    /// The spaces it was visited in, the latest visit's first.
+    pub spaces: Vec<SpaceId>,
+    title_lower: String,
+    /// `url_text`, lowercased.
+    address_lower: String,
+}
+
+impl From<VisitedPage> for HistoryEntry {
+    fn from(page: VisitedPage) -> Self {
+        Self {
+            title_lower: page.title.to_lowercase(),
+            address_lower: url_text(&page.url).to_lowercase(),
+            url: page.url,
+            title: page.title,
+            count: page.count,
+            last: page.last,
+            spaces: page.spaces,
+        }
+    }
+}
+
+impl HistoryEntry {
+    fn score(&self, words: &[String]) -> Option<u32> {
+        score_lowercase(&self.title_lower, words).max(score_lowercase(&self.address_lower, words))
+    }
+
+    /// How often and how recently the page was visited: visits count less
+    /// the older the last one is (half after a week).
+    fn frecency(&self, now: u64) -> f64 {
+        let days = now.saturating_sub(self.last) as f64 / 86_400.;
+        f64::from(self.count) / (1. + days / 7.)
+    }
 }
 
 /// What the results draw from, captured when the bar opens.
@@ -116,17 +264,39 @@ pub struct CommandContext {
     pub space_id: SpaceId,
     /// Every tab: the active space's first, each space in sidebar order.
     pub tabs: Vec<TabEntry>,
+    /// The active space's tabs, the most recently shown first.
+    pub recent: Vec<TabId>,
     pub active: Option<ActiveTab>,
     pub spaces: Vec<(SpaceId, String)>,
-    pub can_reopen: bool,
+    /// Recently closed tabs, the most recent first.
+    pub closed: Vec<ClosedEntry>,
+    /// How many tabs ⇧⌘T reopens: all those a Clear closed together.
+    pub reopen_count: usize,
+    /// Visited pages, the most recent first.
+    pub history: Vec<HistoryEntry>,
+    /// Seconds since the Unix epoch, for how long ago pages were visited.
+    pub now: u64,
     pub sidebar_hidden: bool,
     pub has_today: bool,
+    pub search_engine: SearchEngine,
+}
+
+impl CommandContext {
+    fn space_name(&self, id: SpaceId) -> Option<&str> {
+        self.spaces
+            .iter()
+            .find(|(space, _)| *space == id)
+            .map(|(_, name)| name.as_str())
+    }
 }
 
 /// How well `text` matches every query word: 3 for a word at the start,
 /// 2 at the start of one of its words, 1 anywhere; `None` if one is missing.
 fn score(text: &str, words: &[String]) -> Option<u32> {
-    let text = text.to_lowercase();
+    score_lowercase(&text.to_lowercase(), words)
+}
+
+fn score_lowercase(text: &str, words: &[String]) -> Option<u32> {
     words
         .iter()
         .map(|word| {
@@ -149,10 +319,70 @@ fn score(text: &str, words: &[String]) -> Option<u32> {
         .sum()
 }
 
+/// The lowercase words of a query.
+fn query_words(query: &str) -> Vec<String> {
+    query
+        .to_lowercase()
+        .split_whitespace()
+        .map(String::from)
+        .collect()
+}
+
+/// Lowercase, with single spaces.
+fn normalized(text: &str) -> String {
+    query_words(text).join(" ")
+}
+
 /// URLs match without their scheme and "www.".
 fn url_text(url: &str) -> &str {
     let url = url.split_once("://").map_or(url, |(_, rest)| rest);
     url.strip_prefix("www.").unwrap_or(url)
+}
+
+/// One page, however its address is written: open tabs aren't offered
+/// again as visited pages or closed tabs.
+fn page_key(url: &str) -> String {
+    url_text(url).trim_end_matches('/').to_lowercase()
+}
+
+/// The host, with any port, that `url_text` starts with.
+fn text_host(text: &str) -> &str {
+    &text[..text.find(['/', '?', '#']).unwrap_or(text.len())]
+}
+
+/// A URL's host, with its port if it names one: "localhost:8000" is
+/// another server than "localhost".
+fn site(url: &str) -> Option<String> {
+    let url = Url::parse(url).ok()?;
+    let host = normalize_host(url.host_str()?)?;
+    Some(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
+
+/// How long ago a page was visited, in words.
+fn ago(now: u64, then: u64) -> String {
+    let minutes = now.saturating_sub(then) / 60;
+    let (hours, days) = (minutes / 60, minutes / (60 * 24));
+    let plural = |count: u64, unit: &str| {
+        if count == 1 {
+            format!("1 {unit} ago")
+        } else {
+            format!("{count} {unit}s ago")
+        }
+    };
+    if minutes < 1 {
+        "Just now".into()
+    } else if hours < 1 {
+        plural(minutes, "minute")
+    } else if days < 1 {
+        plural(hours, "hour")
+    } else if days < 14 {
+        plural(days, "day")
+    } else {
+        plural(days / 7, "week")
+    }
 }
 
 /// How clearly typed text names a tab or space.
@@ -169,11 +399,7 @@ enum Naming {
 /// a name only a whole word counts, and only typed alone: phrases are
 /// mostly searches ("rust lang" for "The Rust Programming Language").
 fn naming(name: &str, query: &str) -> Option<Naming> {
-    let name = name
-        .to_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let name = normalized(name);
     if name == query {
         Some(Naming::Exact)
     } else if name.starts_with(query) {
@@ -191,74 +417,358 @@ fn naming(name: &str, query: &str) -> Option<Naming> {
 
 /// What Return should switch to rather than search for or open, as with
 /// Arc's "⌘T, then the tab's or space's name": the other tab or space that
-/// typed text names best (`naming`; spaces win ties, then the bar's order).
-/// A tab is named by its title or the start of its host ("mail" for
-/// mail.google.com, not "google"); an address names the tab at it or, if a
-/// bare host, any tab on that host.
+/// typed text names best (`naming`). A tab is named by its title or the
+/// start of its host ("mail" for mail.google.com, not "google"), and only
+/// by four characters or more: two or three start too many names ("do",
+/// "git", "new"), so they name a space only exactly. Spaces win ties; two
+/// spaces, or two pages, named equally well are no clear choice, and the
+/// text is searched. An address names the tab at it in this space
+/// (`named_address`).
 fn named(query: &str, context: &CommandContext) -> Option<CommandItem> {
-    let query = query
-        .to_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    // A single letter is too little to go on.
-    if query.chars().count() < 2 {
+    let query = normalized(query);
+    let length = query.chars().count();
+    // A single letter is too little to go on; "?" asks for a search.
+    if length < 2 || model::forced_search(&query).is_some() {
         return None;
     }
+    let tabs_named = length >= MIN_TAB_NAME;
     let active = context.active.as_ref().map(|active| active.id);
-    let mut tabs = context.tabs.iter().filter(|tab| Some(tab.id) != active);
+    let tabs: Vec<&TabEntry> = context
+        .tabs
+        .iter()
+        .filter(|tab| tabs_named && Some(tab.id) != active)
+        .collect();
     if !model::is_search_query(&query) {
-        let typed = url_text(&query).trim_end_matches('/');
-        let bare_host = !typed.contains(['/', '?', '#']);
-        return tabs
-            .find(|tab| {
-                url_text(&tab.url)
-                    .trim_end_matches('/')
-                    .eq_ignore_ascii_case(typed)
-                    || (bare_host && host_of(&tab.url).as_deref() == Some(typed))
-            })
-            .map(|tab| switch_item(tab, context));
+        return named_address(&query, &tabs, context.space_id).map(|tab| switch_item(tab, context));
     }
-    let spaces = context
+    let spaces: Vec<(Naming, SpaceId, &str)> = context
         .spaces
         .iter()
         .filter(|(id, _)| *id != context.space_id)
         .filter_map(|(id, name)| {
-            let item = CommandItem {
-                command: Command::SwitchToSpace(*id),
-                title: name.clone(),
-                detail: Some("Space".into()),
-                hint: "Switch to Space",
-                icon: ItemIcon::Glyph(Icon::ArrowRight),
-            };
-            Some((naming(name, &query)?, item))
-        });
-    let tabs = tabs.filter_map(|tab| {
-        let host = host_of(&tab.url)
-            .and_then(|host| naming(&host, &query))
-            .filter(|naming| *naming > Naming::Word);
-        let naming = naming(&tab.title, &query).max(host)?;
-        Some((naming, switch_item(tab, context)))
+            let naming = naming(name, &query).filter(|naming| {
+                // Short text names a space only exactly ("dev" for "Dev").
+                tabs_named || *naming == Naming::Exact
+            })?;
+            Some((naming, *id, name.as_str()))
+        })
+        .collect();
+    let tabs: Vec<(Naming, &TabEntry)> = tabs
+        .into_iter()
+        .filter_map(|tab| {
+            let host = host_of(&tab.url)
+                .and_then(|host| naming(&host, &query))
+                .filter(|naming| *naming > Naming::Word);
+            Some((naming(&tab.title, &query).max(host)?, tab))
+        })
+        .collect();
+    let best = spaces
+        .iter()
+        .map(|(naming, ..)| *naming)
+        .chain(tabs.iter().map(|(naming, _)| *naming))
+        .max()?;
+    let spaces: Vec<_> = spaces
+        .into_iter()
+        .filter(|(naming, ..)| *naming == best)
+        .collect();
+    match spaces.as_slice() {
+        [(_, id, name)] => return Some(space_item(*id, name)),
+        [] => {}
+        _ => return None,
+    }
+    let tabs: Vec<&TabEntry> = tabs
+        .into_iter()
+        .filter(|(naming, _)| *naming == best)
+        .map(|(_, tab)| tab)
+        .collect();
+    one_page(&tabs).map(|tab| switch_item(tab, context))
+}
+
+/// The tab an address names in the space `space_id`: the one at that
+/// address, else, for a host typed bare (with its port, if typed), the
+/// only page open on it. A search on Google among other Google pages isn't
+/// "google.com", and "https://github.com/" is GitHub's home page, not the
+/// one GitHub page open. Spaces are separate logins, so an address open
+/// only in another space opens here; that tab is offered next.
+fn named_address<'a>(
+    query: &str,
+    tabs: &[&'a TabEntry],
+    space_id: SpaceId,
+) -> Option<&'a TabEntry> {
+    let tabs: Vec<&TabEntry> = tabs
+        .iter()
+        .copied()
+        .filter(|tab| tab.space_id == space_id)
+        .collect();
+    let typed = url_text(query).trim_end_matches('/');
+    let at_address = tabs.iter().find(|tab| {
+        url_text(&tab.url)
+            .trim_end_matches('/')
+            .eq_ignore_ascii_case(typed)
     });
-    // The first of the best.
-    spaces
-        .chain(tabs)
-        .min_by_key(|(naming, _)| std::cmp::Reverse(*naming))
-        .map(|(_, item)| item)
+    if let Some(tab) = at_address {
+        return Some(tab);
+    }
+    if query.contains("://") || query.ends_with('/') || typed.contains(['/', '?', '#']) {
+        return None;
+    }
+    let typed_site = site(&format!("http://{typed}"))?;
+    let on_site: Vec<&TabEntry> = tabs
+        .iter()
+        .copied()
+        .filter(|tab| site(&tab.url).as_deref() == Some(typed_site.as_str()))
+        .collect();
+    one_page(&on_site)
+}
+
+/// The first of `tabs` if they all show one page (a page open twice is
+/// still one choice): the active space's first, as the bar orders them.
+fn one_page<'a>(tabs: &[&'a TabEntry]) -> Option<&'a TabEntry> {
+    let first = *tabs.first()?;
+    let page = page_key(&first.url);
+    tabs.iter()
+        .all(|tab| page_key(&tab.url) == page)
+        .then_some(first)
+}
+
+/// The action whose title the text is (any case), or the start of, in two
+/// words or more ("new sp", "clear today"), if only one starts so.
+fn named_action(query: &str, actions: &[(CommandItem, &'static str)]) -> Option<usize> {
+    let query = normalized(query);
+    let title = |item: &CommandItem| normalized(item.title.trim_end_matches('…'));
+    if let Some(index) = actions.iter().position(|(item, _)| title(item) == query) {
+        return Some(index);
+    }
+    if !query.contains(' ') {
+        return None;
+    }
+    let mut starting = actions
+        .iter()
+        .enumerate()
+        .filter(|(_, (item, _))| title(item).starts_with(&query));
+    let (index, _) = starting.next()?;
+    starting.next().is_none().then_some(index)
+}
+
+/// Where typed text that begins a visited address goes (`completion`).
+struct Completion {
+    url: String,
+    /// The page's title, if it was visited and had one.
+    title: Option<String>,
+    /// Visited only in other spaces.
+    elsewhere: bool,
+}
+
+/// A visited site or page whose address typed text begins, for Return to
+/// go to, as Chrome's address bar completes it. Text that stops inside a
+/// host goes to that site ("doc.ru" to doc.rust-lang.org), the one visited
+/// most, and most recently, of those it begins; text that goes on into a
+/// path goes to that page ("doc.rust-lang.org/b" to the Book). The text
+/// must look like an address's start (four characters, or three with a
+/// dot), and only text that is an address ("docs.rs", "localhost:8000/da")
+/// completes to a site visited once; a word needs two visits. An address
+/// visited as typed is where Return goes, not a longer one it begins.
+fn completion(query: &str, context: &CommandContext) -> Option<Completion> {
+    if query.contains(char::is_whitespace) || model::forced_search(query).is_some() {
+        return None;
+    }
+    let lower = query.to_lowercase();
+    let typed = url_text(&lower);
+    let dotted = typed.contains('.');
+    let address =
+        dotted || !model::is_search_query(query) || visited_short_link(query, context).is_some();
+    let length = typed.chars().count();
+    if length < 3 || (length < 4 && !dotted) {
+        return None;
+    }
+    let exact = typed.trim_end_matches('/');
+    let known = context.history.iter().any(|page| {
+        let visited = page.address_lower.as_str();
+        visited.trim_end_matches('/') == exact || text_host(visited) == exact
+    });
+    if known {
+        return None;
+    }
+    let best = |a: &(f64, &HistoryEntry), b: &(f64, &HistoryEntry)| {
+        a.0.total_cmp(&b.0)
+            .then_with(|| b.1.url.len().cmp(&a.1.url.len()))
+    };
+    if typed.contains('/') {
+        let (_, page) = context
+            .history
+            .iter()
+            .filter(|page| address || page.count > 1)
+            .filter(|page| page.address_lower.starts_with(typed))
+            .map(|page| (page.frecency(context.now), page))
+            .max_by(best)?;
+        return Some(Completion {
+            url: page.url.clone(),
+            title: (!page.title.is_empty()).then(|| page.title.clone()),
+            elsewhere: !page.spaces.contains(&context.space_id),
+        });
+    }
+    // Sites by their visits all together, each with its best page and
+    // whether any was in this space.
+    let mut sites: HashMap<&str, (f64, u32, &HistoryEntry, bool)> = HashMap::new();
+    for page in &context.history {
+        let host = text_host(&page.address_lower);
+        if typed.len() >= host.len() || !host.starts_with(typed) {
+            continue;
+        }
+        let frecency = page.frecency(context.now);
+        let site = sites.entry(host).or_insert((0., 0, page, false));
+        if best(&(frecency, page), &(site.2.frecency(context.now), site.2)).is_gt() {
+            site.2 = page;
+        }
+        site.0 += frecency;
+        site.1 = site.1.saturating_add(page.count);
+        site.3 |= page.spaces.contains(&context.space_id);
+    }
+    let (_, _, page, here) = sites
+        .into_values()
+        .filter(|(_, count, ..)| address || *count > 1)
+        .max_by(|a, b| best(&(a.0, a.2), &(b.0, b.2)))?;
+    let origin = Url::parse(&page.url).ok()?.origin().ascii_serialization();
+    let url = format!("{origin}/");
+    let root = page_key(&url);
+    let title = context
+        .history
+        .iter()
+        .find(|page| page_key(&page.url) == root && !page.title.is_empty())
+        .map(|page| page.title.clone());
+    Some(Completion {
+        url,
+        title,
+        elsewhere: !here,
+    })
+}
+
+/// A typed mail, phone or messages address, which opens in its app as a
+/// click on such a link does: the address, and where it goes.
+fn app_link(query: &str) -> Option<(String, &'static str)> {
+    if navigation_for(query) != Navigation::OpenInApp {
+        return None;
+    }
+    let (scheme, rest) = query.split_once(':')?;
+    let scheme = scheme.trim().to_ascii_lowercase();
+    let hint = match scheme.as_str() {
+        "mailto" => "Open in Mail",
+        "sms" => "Open in Messages",
+        _ => "Call with FaceTime",
+    };
+    // Phone numbers are often written with spaces; addresses have none.
+    let rest: String = if scheme == "mailto" {
+        rest.trim().to_owned()
+    } else {
+        rest.split_whitespace().collect()
+    };
+    (!rest.is_empty() && !rest.contains(char::is_whitespace))
+        .then(|| (format!("{scheme}:{rest}"), hint))
 }
 
 fn switch_item(tab: &TabEntry, context: &CommandContext) -> CommandItem {
-    let host = host_of(&tab.url);
+    // Titles that are the host already say it.
+    let address = site(&tab.url)
+        .filter(|site| *site != tab.title)
+        .map(|site| (site, Cut::Start));
+    let (detail, hint) = if tab.space_id != context.space_id {
+        // Return changes space, maybe to the same site under another login.
+        (
+            Some(tab.space_name.clone()),
+            format!("Switch to {}", tab.space_name).into(),
+        )
+    } else {
+        (None, "Switch to Tab".into())
+    };
     CommandItem {
         command: Command::SwitchToTab(tab.id),
         title: tab.title.clone(),
-        detail: if tab.space_id != context.space_id {
-            Some(tab.space_name.clone())
-        } else {
-            host.clone().filter(|host| *host != tab.title)
-        },
-        hint: "Switch to Tab",
-        icon: ItemIcon::Page(host),
+        address,
+        detail,
+        when: None,
+        hint,
+        icon: ItemIcon::Page(host_of(&tab.url)),
+    }
+}
+
+/// What Return on a row that opens a page in a new tab says. A page of
+/// another space, `elsewhere`, opens in this one, with this space's logins,
+/// and the row says so.
+fn open_hint(elsewhere: bool, context: &CommandContext) -> SharedString {
+    match context.space_name(context.space_id) {
+        Some(space) if elsewhere => format!("Open in {space}").into(),
+        _ => "Open".into(),
+    }
+}
+
+fn space_item(id: SpaceId, name: &str) -> CommandItem {
+    CommandItem {
+        command: Command::SwitchToSpace(id),
+        title: name.to_owned(),
+        address: None,
+        detail: Some("Space".into()),
+        when: None,
+        hint: "Switch to Space".into(),
+        icon: ItemIcon::Glyph(Icon::ArrowRight),
+    }
+}
+
+/// A recently closed tab found by typing; it reopens in its own space.
+fn closed_item(closed: &ClosedEntry, context: &CommandContext) -> CommandItem {
+    let detail = match context.space_name(closed.space_id) {
+        Some(space) if closed.space_id != context.space_id => format!("Closed in {space}"),
+        _ => "Recently Closed".into(),
+    };
+    CommandItem {
+        command: Command::ReopenTab(closed.id),
+        title: closed.title.clone(),
+        address: None,
+        detail: Some(detail),
+        when: None,
+        hint: "Reopen Tab".into(),
+        icon: ItemIcon::Page(host_of(&closed.url)),
+    }
+}
+
+/// A visited page, which `command` opens or switches to; `when` adds how
+/// long ago (the History view). A page visited only in other spaces says
+/// in which, as it opens in this one.
+fn page_item(
+    page: &HistoryEntry,
+    command: Command,
+    when: Option<String>,
+    context: &CommandContext,
+) -> CommandItem {
+    let title = if page.title.is_empty() {
+        url_text(&page.url).to_owned()
+    } else {
+        page.title.clone()
+    };
+    // Titles that are the host already say it.
+    let address = site(&page.url)
+        .filter(|address| *address != title)
+        .map(|address| (address, Cut::Start));
+    let elsewhere = !page.spaces.contains(&context.space_id);
+    let space = page
+        .spaces
+        .first()
+        .filter(|_| elsewhere)
+        .and_then(|&id| context.space_name(id));
+    let active = context.active.as_ref().map(|active| active.id);
+    let hint = match command {
+        Command::SwitchToTab(id) if Some(id) == active => "Current Tab".into(),
+        Command::SwitchToTab(_) => "Switch to Tab".into(),
+        Command::Open(_) => open_hint(elsewhere, context),
+        _ => "Open".into(),
+    };
+    CommandItem {
+        command,
+        title,
+        address,
+        detail: space.map(str::to_owned),
+        when,
+        hint,
+        icon: ItemIcon::Page(host_of(&page.url)),
     }
 }
 
@@ -271,76 +781,197 @@ fn action(
     CommandItem {
         command,
         title: title.into(),
+        address: None,
         detail: None,
-        hint,
+        when: None,
+        hint: hint.into(),
         icon: ItemIcon::Glyph(icon),
     }
 }
 
-/// Actions available now, each with extra words it is found by.
+/// Actions available now, each with extra words it is found by. Of equal
+/// matches, the earlier one is listed first.
 fn actions(context: &CommandContext) -> Vec<(CommandItem, &'static str)> {
     let mut actions = Vec::new();
+    let other_spaces = || {
+        context
+            .spaces
+            .iter()
+            .filter(|(id, _)| *id != context.space_id)
+    };
     if let Some(active) = &context.active {
-        // ⌘D returns pinned tabs and favorites to Today.
-        actions.push(if active.pin == Pin::Today {
-            (action(Command::TogglePin, "Pin Tab", Icon::Pin, "⌘D"), "")
-        } else {
-            (
-                action(Command::TogglePin, "Unpin Tab", Icon::PinOff, "⌘D"),
+        // ⌘D returns pinned tabs and favorites to Today; a favorite can
+        // also step down to Pinned. The words are the tab menu's.
+        match active.pin {
+            Pin::Today => actions.extend([
+                (action(Command::TogglePin, "Pin Tab", Icon::Pin, "⌘D"), ""),
+                (
+                    action(Command::ToggleFavorite, "Add to Favorites", Icon::Star, ""),
+                    "favorite",
+                ),
+            ]),
+            Pin::Pinned => actions.extend([
+                (
+                    action(Command::TogglePin, "Unpin Tab", Icon::PinOff, "⌘D"),
+                    "",
+                ),
+                (
+                    action(Command::ToggleFavorite, "Add to Favorites", Icon::Star, ""),
+                    "favorite",
+                ),
+            ]),
+            Pin::Favorite => actions.extend([
+                (
+                    action(
+                        Command::TogglePin,
+                        "Remove from Favorites",
+                        Icon::PinOff,
+                        "⌘D",
+                    ),
+                    "unpin unfavorite today",
+                ),
+                (
+                    action(Command::ToggleFavorite, "Move to Pinned", Icon::Pin, ""),
+                    "unfavorite",
+                ),
+            ]),
+        }
+        // Favorite tiles show no name to edit.
+        if active.pin != Pin::Favorite {
+            actions.push((
+                action(Command::RenameTab, "Rename Tab", Icon::Pencil, ""),
+                "name title",
+            ));
+        }
+        if active.pinned_away {
+            actions.push((
+                action(Command::GoToPinnedPage, "Go to Pinned Page", Icon::Pin, ""),
+                "back home original",
+            ));
+        }
+        actions.push((
+            action(Command::DuplicateTab, "Duplicate Tab", Icon::Duplicate, ""),
+            "copy clone",
+        ));
+        if active.pin == Pin::Today {
+            actions.push((
+                action(
+                    Command::Shortcut(Shortcut::CloseTab),
+                    "Close Tab",
+                    Icon::Close,
+                    "⌘W",
+                ),
                 "",
-            )
-        });
-        actions.push(if active.pin == Pin::Favorite {
+            ));
+        } else {
+            // As in the tab's menu: ⌘W only puts a pinned tab or favorite
+            // to sleep, and Close Tab removes it.
+            if active.loaded {
+                actions.push((
+                    action(
+                        Command::Shortcut(Shortcut::CloseTab),
+                        "Unload Tab",
+                        Icon::Minus,
+                        "⌘W",
+                    ),
+                    "sleep",
+                ));
+            }
+            actions.push((
+                action(Command::CloseTab, "Close Tab", Icon::Close, ""),
+                "remove",
+            ));
+        }
+        if active.today_others {
+            actions.push((
+                action(Command::CloseOtherTabs, "Close Other Tabs", Icon::Close, ""),
+                "today",
+            ));
+        }
+        if active.today_below {
+            actions.push((
+                action(Command::CloseTabsBelow, "Close Tabs Below", Icon::Close, ""),
+                "today",
+            ));
+        }
+        for (id, name) in other_spaces() {
             let item = action(
-                Command::ToggleFavorite,
-                "Remove from Favorites",
-                Icon::Star,
+                Command::MoveTab(*id),
+                format!("Move Tab to {name}"),
+                Icon::ArrowRight,
                 "",
             );
-            (item, "unfavorite")
-        } else {
-            let item = action(Command::ToggleFavorite, "Add to Favorites", Icon::Star, "");
-            (item, "favorite")
-        });
+            actions.push((item, "send space"));
+        }
         actions.push((
             action(Command::CopyUrl, "Copy URL", Icon::Copy, "⇧⌘C"),
             "link address",
         ));
-        if let Some(host) = &active.host {
-            let (title, icon) = if active.blocking_disabled {
-                (format!("Turn On Content Blocking for {host}"), Icon::Shield)
+        // Only a page that is open can play sound.
+        if active.loaded {
+            let (title, glyph) = if active.muted {
+                ("Unmute Tab", Icon::Speaker)
             } else {
-                (
-                    format!("Turn Off Content Blocking for {host}"),
-                    Icon::ShieldOff,
-                )
+                ("Mute Tab", Icon::SpeakerOff)
             };
             actions.push((
-                action(Command::ToggleBlocking(host.clone()), title, icon, ""),
-                "ads trackers blocker",
+                action(Command::ToggleMute, title, glyph, ""),
+                "sound audio silence",
+            ));
+        }
+        for (shortcut, title, glyph, hint, keywords) in [
+            (Shortcut::Reload, "Reload", Icon::Reload, "⌘R", "refresh"),
+            (
+                Shortcut::Find,
+                "Find on Page",
+                Icon::Search,
+                "⌘F",
+                "search text",
+            ),
+            (Shortcut::ZoomIn, "Zoom In", Icon::ZoomIn, "⌘+", "larger"),
+            (
+                Shortcut::ZoomOut,
+                "Zoom Out",
+                Icon::ZoomOut,
+                "⌘−",
+                "smaller",
+            ),
+            (
+                Shortcut::ZoomReset,
+                "Actual Size",
+                Icon::Monitor,
+                "⌘0",
+                "zoom reset",
+            ),
+            (Shortcut::Print, "Print…", Icon::Printer, "⌘P", ""),
+            (
+                Shortcut::DevTools,
+                "Developer Tools",
+                Icon::Code,
+                "⌥⌘I",
+                "inspect console devtools",
+            ),
+        ] {
+            actions.push((
+                action(Command::Shortcut(shortcut), title, glyph, hint),
+                keywords,
+            ));
+        }
+        if let Some(host) = &active.host {
+            actions.push((
+                blocking_action(host, active.blocking_disabled),
+                BLOCKING_WORDS,
             ));
         }
     }
-    let sidebar = if context.sidebar_hidden {
-        "Show Sidebar"
-    } else {
-        "Hide Sidebar"
-    };
-    actions.push((
-        action(Command::ToggleSidebar, sidebar, Icon::Sidebar, "⌘S"),
-        "toggle",
-    ));
+    actions.push((sidebar_action(context), "toggle"));
     if context.has_today {
         actions.push((
-            action(Command::ClearToday, "Clear Today Tabs", Icon::Broom, "⇧⌘K"),
-            "close archive",
+            action(Command::ClearToday, "Clear Today", Icon::Broom, "⇧⌘K"),
+            "tabs archive",
         ));
     }
-    actions.push((
-        action(Command::NewSpace, "New Space", Icon::Plus, ""),
-        "create",
-    ));
-    if context.can_reopen {
+    if !context.closed.is_empty() {
         actions.push((
             action(
                 Command::ReopenClosedTab,
@@ -351,53 +982,183 @@ fn actions(context: &CommandContext) -> Vec<(CommandItem, &'static str)> {
             "undo restore",
         ));
     }
-    for (id, name) in &context.spaces {
-        if *id != context.space_id {
-            let item = action(
-                Command::SwitchToSpace(*id),
-                format!("Switch to Space {name}"),
-                Icon::ArrowRight,
-                "",
-            );
-            actions.push((item, "go"));
+    if let Some(host) = context
+        .active
+        .as_ref()
+        .and_then(|active| active.host.as_ref())
+    {
+        actions.extend(site_actions(host));
+    }
+    actions.push((
+        action(Command::NewSpace, "New Space", Icon::Plus, ""),
+        "create",
+    ));
+    actions.push((
+        action(Command::RenameSpace, "Rename Space", Icon::Pencil, ""),
+        "name",
+    ));
+    actions.push((
+        action(Command::UnloadSpace, "Unload Space", Icon::Archive, ""),
+        "sleep",
+    ));
+    for (id, name) in other_spaces() {
+        let item = action(
+            Command::SwitchToSpace(*id),
+            format!("Switch to {name}"),
+            Icon::ArrowRight,
+            "",
+        );
+        actions.push((item, "go space"));
+    }
+    actions.push((
+        action(
+            Command::ShowHistory,
+            "Show All History",
+            Icon::History,
+            "⌘Y",
+        ),
+        "visited pages",
+    ));
+    actions.push((
+        action(
+            Command::ShowDownloads,
+            "Show Downloads",
+            Icon::ArrowDown,
+            "⌥⌘L",
+        ),
+        "library files",
+    ));
+    actions.push((clear_history_action(), "delete forget"));
+    for engine in SearchEngine::ALL {
+        if engine != context.search_engine {
+            actions.push((search_engine_action(engine, context), "engine default"));
         }
     }
+    actions.push((
+        action(Command::ShowSettings, "Settings…", Icon::Settings, "⌘,"),
+        "preferences",
+    ));
+    actions.push((default_browser_action(), "links"));
+    actions.push((
+        action(
+            Command::ShowShortcuts,
+            "Keyboard Shortcuts",
+            Icon::Keyboard,
+            "",
+        ),
+        "help keys",
+    ));
     actions
 }
 
-/// The bar's rows for `query`. Without a query: the active space's tabs,
-/// the selected one first. With one: opening it (an address or a search),
-/// matching tabs from every space, then matching actions; before all of
-/// them, for a new tab, a tab or space the text clearly names (`named`).
+const BLOCKING_WORDS: &str = "content ads trackers blocker";
+
+/// The site menu and its Clear Site Data question, for the active tab's
+/// host, with the words they are found by.
+fn site_actions(host: &str) -> [(CommandItem, &'static str); 2] {
+    [
+        (
+            action(
+                Command::SiteSettings,
+                format!("Site Settings for {host}"),
+                Icon::Shield,
+                "",
+            ),
+            "permissions camera microphone location notifications zoom",
+        ),
+        (
+            action(
+                Command::ClearSiteData,
+                format!("Clear Site Data for {host}…"),
+                Icon::Broom,
+                "",
+            ),
+            "cookies storage sign out",
+        ),
+    ]
+}
+
+fn default_browser_action() -> CommandItem {
+    action(
+        Command::SetDefaultBrowser,
+        "Set as Default Browser…",
+        Icon::Globe,
+        "",
+    )
+}
+
+fn blocking_action(host: &str, disabled: bool) -> CommandItem {
+    if disabled {
+        let title = format!("Turn On Ad Blocking for {host}");
+        action(
+            Command::ToggleBlocking(host.into()),
+            title,
+            Icon::Shield,
+            "",
+        )
+    } else {
+        let title = format!("Turn Off Ad Blocking for {host}");
+        action(
+            Command::ToggleBlocking(host.into()),
+            title,
+            Icon::ShieldOff,
+            "",
+        )
+    }
+}
+
+fn sidebar_action(context: &CommandContext) -> CommandItem {
+    let title = if context.sidebar_hidden {
+        "Show Sidebar"
+    } else {
+        "Hide Sidebar"
+    };
+    action(Command::ToggleSidebar, title, Icon::Sidebar, "⌘S")
+}
+
+fn clear_history_action() -> CommandItem {
+    action(Command::ClearHistory, "Clear History…", Icon::Broom, "")
+}
+
+/// A setting, not a search: the row says that it changes where every
+/// search goes.
+fn search_engine_action(engine: SearchEngine, context: &CommandContext) -> CommandItem {
+    let current = engine == context.search_engine;
+    CommandItem {
+        command: Command::SearchWith(engine),
+        title: format!("Use {} for Searches", engine.short_name()),
+        address: None,
+        detail: current.then(|| "Current".into()),
+        when: None,
+        hint: if current { "" } else { "Make Default" }.into(),
+        icon: ItemIcon::Glyph(if current { Icon::Check } else { Icon::Search }),
+    }
+}
+
+/// The bar's rows for `query`. Without a query: the active space's other
+/// tabs, the most recently used first, and the tab to reopen. With one:
+/// opening it (an address or a search), matching tabs from every space
+/// (not the one on screen), recently closed tabs, visited pages, then
+/// matching actions. Before all of them goes what the text names, for Return: a
+/// tab, space or action (`named`, `named_action`; not in ⌘L, which loads
+/// what is typed), or a visited page whose address it starts
+/// (`completion`). A mail, phone or FaceTime address goes to its app, and
+/// ⌘L's unchanged address reloads.
 pub fn results(mode: CommandMode, query: &str, context: &CommandContext) -> Vec<CommandItem> {
     let query = query.trim();
-    let active_id = context.active.as_ref().map(|active| active.id);
+    match mode {
+        CommandMode::History => return history_results(query, context),
+        CommandMode::Settings => return settings_results(query, context),
+        CommandMode::NewTab | CommandMode::EditAddress => {}
+    }
     if query.is_empty() {
-        let mut tabs: Vec<&TabEntry> = context
-            .tabs
-            .iter()
-            .filter(|tab| tab.space_id == context.space_id)
-            .collect();
-        tabs.sort_by_key(|tab| Some(tab.id) != active_id);
-        let room = MAX_ITEMS - usize::from(context.can_reopen);
-        let mut items: Vec<CommandItem> = tabs
-            .into_iter()
-            .take(room)
-            .map(|tab| switch_item(tab, context))
-            .collect();
-        if context.can_reopen {
-            items.push(action(
-                Command::ReopenClosedTab,
-                "Reopen Closed Tab",
-                Icon::Reopen,
-                "⇧⌘T",
-            ));
-        }
-        return items;
+        return empty_results(context);
     }
 
     let current_url = context.active.as_ref().map(|active| active.url.as_str());
+    let active_id = context.active.as_ref().map(|active| active.id);
     let in_place = mode == CommandMode::EditAddress && current_url.is_some();
+    let unchanged = in_place && current_url == Some(query);
     let open = |input: &str| {
         if in_place {
             Command::Navigate(input.to_owned())
@@ -405,78 +1166,404 @@ pub fn results(mode: CommandMode, query: &str, context: &CommandContext) -> Vec<
             Command::Open(input.to_owned())
         }
     };
-    let mut items = vec![if in_place && current_url == Some(query) {
+    // ⌘L loads in the tab on screen, in its space; ⌘T says where a page
+    // of another space opens.
+    let open_where = |elsewhere: bool| {
+        if in_place {
+            "Open".into()
+        } else {
+            open_hint(elsewhere, context)
+        }
+    };
+    let link = app_link(query);
+    // Short-link text ("go/payroll") opens the machine it names once that
+    // has been visited, and is searched for, with the address offered
+    // below, until then.
+    let short_link = (!unchanged && link.is_none())
+        .then(|| model::short_link(query))
+        .flatten()
+        .map(|(_, url)| url);
+    let visited_link = short_link
+        .as_ref()
+        .and_then(|_| visited_short_link(query, context));
+    let open_link = |url: &str| CommandItem {
+        command: open(url),
+        hint: open_where(open_only_elsewhere(url, context)),
+        title: url.to_owned(),
+        address: None,
+        detail: None,
+        when: None,
+        icon: ItemIcon::Glyph(Icon::Globe),
+    };
+    let search_item = || CommandItem {
+        command: open(query),
+        title: model::search_text(query).to_owned(),
+        address: None,
+        detail: Some(context.search_engine.search_label()),
+        when: None,
+        hint: "Search".into(),
+        icon: ItemIcon::Glyph(Icon::Search),
+    };
+    let mut items = vec![if unchanged {
         CommandItem {
             command: Command::Reload,
             title: query.to_owned(),
+            address: None,
             detail: None,
-            hint: "Reload",
+            when: None,
+            hint: "Reload".into(),
             icon: ItemIcon::Glyph(Icon::Globe),
         }
-    } else if model::is_search_query(query) {
+    } else if let Some((address, hint)) = link.clone() {
         CommandItem {
-            command: open(query),
-            title: query.to_owned(),
-            detail: Some("Google Search".into()),
-            hint: "Search",
-            icon: ItemIcon::Glyph(Icon::Search),
-        }
-    } else {
-        CommandItem {
-            command: open(query),
-            title: model::normalize_address(query),
+            command: Command::OpenInApp(address.clone()),
+            title: address,
+            address: None,
             detail: None,
-            hint: "Open",
+            when: None,
+            hint: hint.into(),
+            icon: ItemIcon::Glyph(Icon::Link),
+        }
+    } else if let Some(url) = &visited_link {
+        open_link(url)
+    } else if model::is_search_query(query) {
+        search_item()
+    } else {
+        let url = model::normalize_address(query);
+        CommandItem {
+            command: open(query),
+            hint: open_where(open_only_elsewhere(&url, context)),
+            title: url,
+            address: None,
+            detail: None,
+            when: None,
             icon: ItemIcon::Glyph(Icon::Globe),
         }
     }];
 
-    // ⌘L edits the tab's own address: Return always loads it.
-    let promoted = (!in_place).then(|| named(query, context)).flatten();
+    match (&visited_link, &short_link) {
+        (Some(_), _) => items.push(search_item()),
+        (None, Some(url)) => items.push(open_link(url)),
+        (None, None) => {}
+    }
+
+    let actions = actions(context);
+    let typed_page = || {
+        let page = completion(query, context)?;
+        // A page open in a tab of this space is switched to rather than
+        // opened again, as is the only page open on a site; one just
+        // closed in this space comes back where it was. One open only in
+        // another space opens here, with this space's logins.
+        let key = page_key(&page.url);
+        let host = host_of(&page.url);
+        let others: Vec<&TabEntry> = context
+            .tabs
+            .iter()
+            .filter(|tab| !in_place && Some(tab.id) != active_id)
+            .filter(|tab| tab.space_id == context.space_id)
+            .collect();
+        let whole_site = !key.contains('/');
+        let tab = others
+            .iter()
+            .copied()
+            .find(|tab| page_key(&tab.url) == key)
+            .or_else(|| {
+                let on_site: Vec<&TabEntry> = others
+                    .iter()
+                    .copied()
+                    .filter(|tab| whole_site && site(&tab.url) == site(&page.url))
+                    .collect();
+                one_page(&on_site)
+            });
+        let closed = context
+            .closed
+            .iter()
+            .filter(|closed| !in_place && closed.space_id == context.space_id)
+            .find(|closed| page_key(&closed.url) == key);
+        Some(match (tab, closed) {
+            (Some(tab), _) => switch_item(tab, context),
+            (None, Some(closed)) => closed_item(closed, context),
+            (None, None) => CommandItem {
+                command: open(&page.url),
+                hint: open_where(page.elsewhere),
+                title: page.url,
+                address: None,
+                detail: page.title,
+                when: None,
+                icon: ItemIcon::Page(host),
+            },
+        })
+    };
+    // ⌘L edits the tab's own address: Return loads it, completed at most,
+    // and reloads it unchanged, never going to a longer visited address.
+    let promoted = if unchanged || link.is_some() {
+        None
+    } else if in_place {
+        typed_page()
+    } else {
+        named(query, context)
+            .or_else(|| {
+                (model::forced_search(query).is_none())
+                    .then(|| named_action(query, &actions))
+                    .flatten()
+                    .map(|index| actions[index].0.clone())
+            })
+            .or_else(typed_page)
+    };
     let promoted_command = promoted.as_ref().map(|item| item.command.clone());
-    let promoted_tab = matches!(promoted_command, Some(Command::SwitchToTab(_)));
+    let is_promoted = |command: &Command| promoted_command.as_ref() == Some(command);
     items.splice(0..0, promoted);
 
-    let words: Vec<String> = query
-        .to_lowercase()
-        .split_whitespace()
-        .map(String::from)
-        .collect();
+    // The tab on screen is no place to go, as in the empty bar. Addresses
+    // match without their scheme, as pages are matched.
+    let words = query_words(if model::is_search_query(query) {
+        model::search_text(query)
+    } else {
+        url_text(query)
+    });
     let mut tabs: Vec<(u32, &TabEntry)> = context
         .tabs
         .iter()
-        .filter(|tab| !(in_place && Some(tab.id) == active_id))
-        .filter(|tab| promoted_command != Some(Command::SwitchToTab(tab.id)))
+        .filter(|tab| Some(tab.id) != active_id)
+        .filter(|tab| !is_promoted(&Command::SwitchToTab(tab.id)))
         .filter_map(|tab| {
             let best = score(&tab.title, &words).max(score(url_text(&tab.url), &words))?;
             Some((best, tab))
         })
         .collect();
-    tabs.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    tabs.sort_by_key(|(score, _)| Reverse(*score));
     items.extend(
         tabs.into_iter()
-            .take(MAX_TABS - usize::from(promoted_tab))
+            .take(MAX_TABS)
             .map(|(_, tab)| switch_item(tab, context)),
     );
 
-    let mut actions: Vec<(u32, CommandItem)> = actions(context)
+    // Pages open in a tab are switched to, and closed ones reopened, rather
+    // than offered again as visited pages.
+    let mut shown: Vec<String> = context.tabs.iter().map(|tab| page_key(&tab.url)).collect();
+    if let Some(Command::ReopenTab(id)) = &promoted_command {
+        let reopened = context.closed.iter().find(|closed| closed.id == *id);
+        shown.extend(reopened.map(|closed| page_key(&closed.url)));
+    }
+    let mut closed: Vec<(u32, &ClosedEntry)> = context
+        .closed
+        .iter()
+        .filter(|closed| !shown.contains(&page_key(&closed.url)))
+        .filter(|closed| !is_promoted(&Command::ReopenTab(closed.id)))
+        .filter_map(|closed| {
+            let best = score(&closed.title, &words).max(score(url_text(&closed.url), &words))?;
+            Some((best, closed))
+        })
+        .collect();
+    closed.sort_by_key(|(score, _)| Reverse(*score));
+    closed.truncate(MAX_CLOSED);
+    shown.extend(closed.iter().map(|(_, closed)| page_key(&closed.url)));
+    items.extend(
+        closed
+            .into_iter()
+            .map(|(_, closed)| closed_item(closed, context)),
+    );
+
+    // The short link's own page is its row already.
+    shown.extend(short_link.as_deref().map(page_key));
+    let mut pages: Vec<(u32, f64, &HistoryEntry)> = context
+        .history
+        .iter()
+        .filter(|page| !is_promoted(&open(&page.url)))
+        .filter_map(|page| Some((page.score(&words)?, page.frecency(context.now), page)))
+        .filter(|(_, _, page)| !shown.contains(&page_key(&page.url)))
+        .collect();
+    pages.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.total_cmp(&a.1)));
+    items.extend(
+        pages
+            .into_iter()
+            .take(MAX_PAGES)
+            .map(|(_, _, page)| page_item(page, open(&page.url), None, context)),
+    );
+
+    let mut actions: Vec<(u32, CommandItem)> = actions
         .into_iter()
-        .filter(|(item, _)| promoted_command.as_ref() != Some(&item.command))
+        .filter(|(item, _)| !is_promoted(&item.command))
         .filter_map(|(item, keywords)| {
             Some((score(&format!("{} {keywords}", item.title), &words)?, item))
         })
         .collect();
-    actions.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    actions.sort_by_key(|(score, _)| Reverse(*score));
     items.extend(actions.into_iter().take(MAX_ACTIONS).map(|(_, item)| item));
-    items.truncate(MAX_ITEMS);
     items
 }
 
-fn panel_height(items: usize) -> f32 {
-    if items == 0 {
+/// The address of short-link text ("go/payroll", `model::short_link`)
+/// whose name the user has been to: a visited page or an open tab is on
+/// that machine, so the text means it, as in Chrome.
+fn visited_short_link(query: &str, context: &CommandContext) -> Option<String> {
+    let (name, url) = model::short_link(query)?;
+    let visited = context
+        .history
+        .iter()
+        .any(|page| text_host(&page.address_lower) == name)
+        || context
+            .tabs
+            .iter()
+            .any(|tab| host_of(&tab.url).as_deref() == Some(name.as_str()));
+    visited.then_some(url)
+}
+
+/// Whether the site at `url` is open in another space but not in this
+/// one: typed here, it opens with this space's logins, not that tab's.
+fn open_only_elsewhere(url: &str, context: &CommandContext) -> bool {
+    let Some(typed) = site(url) else {
+        return false;
+    };
+    let spaces: HashSet<SpaceId> = context
+        .tabs
+        .iter()
+        .filter(|tab| site(&tab.url).as_deref() == Some(typed.as_str()))
+        .map(|tab| tab.space_id)
+        .collect();
+    !spaces.is_empty() && !spaces.contains(&context.space_id)
+}
+
+/// The empty bar: the space's other tabs, the most recently used first,
+/// then in sidebar order (the tab on screen is no place to go), and the
+/// tab ⇧⌘T would reopen, by name.
+fn empty_results(context: &CommandContext) -> Vec<CommandItem> {
+    let active = context.active.as_ref().map(|active| active.id);
+    let mut tabs: Vec<&TabEntry> = context
+        .tabs
+        .iter()
+        .filter(|tab| tab.space_id == context.space_id && Some(tab.id) != active)
+        .collect();
+    tabs.sort_by_key(|tab| {
+        context
+            .recent
+            .iter()
+            .position(|id| *id == tab.id)
+            .unwrap_or(usize::MAX)
+    });
+    let mut items: Vec<CommandItem> = tabs
+        .into_iter()
+        .take(MAX_TABS)
+        .map(|tab| switch_item(tab, context))
+        .collect();
+    if let Some(closed) = context.closed.first() {
+        // ⇧⌘T brings back all the tabs a Clear closed, not just this one.
+        let together = context.reopen_count > 1;
+        let (address, detail) = match context.space_name(closed.space_id) {
+            Some(space) if closed.space_id != context.space_id => (None, Some(space.to_owned())),
+            _ if together => (None, None),
+            _ => (site(&closed.url).map(|site| (site, Cut::Start)), None),
+        };
+        items.push(CommandItem {
+            command: Command::ReopenClosedTab,
+            title: if together {
+                format!("Reopen {} Closed Tabs", context.reopen_count)
+            } else {
+                format!("Reopen {}", closed.title)
+            },
+            address,
+            detail,
+            when: None,
+            hint: "⇧⌘T".into(),
+            icon: ItemIcon::Glyph(Icon::Reopen),
+        });
+    }
+    items
+}
+
+/// The History view: visited pages, the most recent first, or the best
+/// matches for the query. A page open in a tab of this space is switched
+/// to rather than opened again. Pages of one site with the same title
+/// show their addresses, which tell them apart. Clearing the history ends
+/// the full list.
+fn history_results(query: &str, context: &CommandContext) -> Vec<CommandItem> {
+    let words = query_words(query);
+    let mut pages: Vec<(u32, &HistoryEntry)> = context
+        .history
+        .iter()
+        .filter_map(|page| Some((page.score(&words)?, page)))
+        .collect();
+    // Stable: the most recent first among equal matches.
+    pages.sort_by_key(|(score, _)| Reverse(*score));
+    pages.truncate(MAX_HISTORY);
+    let mut open: HashMap<String, TabId> = HashMap::new();
+    for tab in context
+        .tabs
+        .iter()
+        .filter(|tab| tab.space_id == context.space_id)
+    {
+        open.entry(page_key(&tab.url)).or_insert(tab.id);
+    }
+    let label = |page: &HistoryEntry| (page.title.clone(), site(&page.url));
+    let mut titles: HashMap<(String, Option<String>), usize> = HashMap::new();
+    for (_, page) in pages.iter().filter(|(_, page)| !page.title.is_empty()) {
+        *titles.entry(label(page)).or_default() += 1;
+    }
+    let mut items: Vec<CommandItem> = pages
+        .into_iter()
+        .map(|(_, page)| {
+            let when = ago(context.now, page.last);
+            let command = match open.get(&page_key(&page.url)) {
+                Some(&id) => Command::SwitchToTab(id),
+                None => Command::Open(page.url.clone()),
+            };
+            let mut item = page_item(page, command, Some(when), context);
+            let address = url_text(&page.url).trim_end_matches('/');
+            if titles.get(&label(page)).is_some_and(|&count| count > 1) && address != item.title {
+                item.address = Some((address.to_owned(), Cut::Middle));
+            }
+            item
+        })
+        .collect();
+    if words.is_empty() && !items.is_empty() {
+        items.push(clear_history_action());
+    }
+    items
+}
+
+/// The settings (⌘,): the search engine, then switches kept with the
+/// session, filtered by the query.
+fn settings_results(query: &str, context: &CommandContext) -> Vec<CommandItem> {
+    let mut settings: Vec<(CommandItem, &'static str)> = SearchEngine::ALL
+        .into_iter()
+        .map(|engine| (search_engine_action(engine, context), "engine default"))
+        .collect();
+    if let Some(active) = &context.active
+        && let Some(host) = &active.host
+    {
+        let item = blocking_action(host, active.blocking_disabled);
+        settings.push((item, BLOCKING_WORDS));
+        settings.extend(site_actions(host));
+    }
+    settings.push((sidebar_action(context), "toggle"));
+    settings.push((clear_history_action(), "delete forget"));
+    settings.push((default_browser_action(), "links"));
+    let words = query_words(query);
+    let mut settings: Vec<(u32, CommandItem)> = settings
+        .into_iter()
+        .filter_map(|(item, keywords)| {
+            Some((score(&format!("{} {keywords}", item.title), &words)?, item))
+        })
+        .collect();
+    settings.sort_by_key(|(score, _)| Reverse(*score));
+    settings.into_iter().map(|(_, item)| item).collect()
+}
+
+/// Rows the list shows before it scrolls, so that the panel, 20% down the
+/// card, ends above the card's bottom edge.
+pub fn visible_rows(card: Bounds<Pixels>) -> usize {
+    let room = f32::from(card.size.height) * 0.8
+        - CARD_GAP
+        - (INPUT_HEIGHT + 1. + LIST_PADDING_TOP + LIST_PADDING_BOTTOM);
+    ((room / ROW_HEIGHT).floor().max(1.) as usize).min(MAX_VISIBLE_ROWS)
+}
+
+/// The panel's height with a list `rows` rows tall (none: just the field).
+fn panel_height(rows: f32) -> f32 {
+    if rows <= 0. {
         INPUT_HEIGHT
     } else {
-        INPUT_HEIGHT + 1. + LIST_PADDING_TOP + items as f32 * ROW_HEIGHT + LIST_PADDING_BOTTOM
+        INPUT_HEIGHT + 1. + LIST_PADDING_TOP + rows * ROW_HEIGHT + LIST_PADDING_BOTTOM
     }
 }
 
@@ -488,7 +1575,11 @@ pub fn window_bounds(card: Bounds<Pixels>, origin: Point<Pixels>) -> Bounds<Pixe
     let left = f32::from(card.origin.x) + (card_width - width) / 2.;
     let top = f32::from(card.origin.y) + f32::from(card.size.height) * 0.2;
     // Transparent windows keep their size; others fit the panel as it grows.
-    let height = panel_height(if TRANSPARENT { MAX_ITEMS } else { 0 });
+    let height = panel_height(if TRANSPARENT {
+        visible_rows(card) as f32
+    } else {
+        0.
+    });
     Bounds::new(
         origin + point(px(left - MARGIN), px(top - MARGIN)),
         size(px(width + 2. * MARGIN), px(height + MARGIN + MARGIN_BOTTOM)),
@@ -524,14 +1615,31 @@ pub enum CommandBarEvent {
     },
 }
 
+/// What the bar's field starts with.
+pub enum BarInput {
+    /// Text, selected, so that typing replaces it.
+    Text(String),
+    /// The field of the bar this one replaces, with what was typed, the
+    /// selection and what ⌘Z can undo, and the row it highlighted.
+    Field {
+        field: Entity<TextInput>,
+        selected: Option<usize>,
+    },
+}
+
 pub struct CommandBar {
     mode: CommandMode,
     input: Entity<TextInput>,
     context: CommandContext,
     items: Vec<CommandItem>,
-    selected: usize,
+    /// The highlighted row. Without text nothing is, so a Return out of
+    /// habit does nothing; ↓ or Tab picks the first row.
+    selected: Option<usize>,
     theme: Theme,
     icons: HashMap<String, Arc<Image>>,
+    /// Rows shown before the list scrolls (`visible_rows`).
+    rows: usize,
+    scroll: ScrollHandle,
     was_active: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -539,39 +1647,59 @@ pub struct CommandBar {
 impl EventEmitter<CommandBarEvent> for CommandBar {}
 
 impl CommandBar {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mode: CommandMode,
-        prefill: &str,
+        input: BarInput,
         context: CommandContext,
         theme: Theme,
         icons: HashMap<String, Arc<Image>>,
+        rows: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input = cx.new(|cx| {
-            let mut input = TextInput::new(window, cx);
-            input.set_placeholder("Search or Enter URL…", cx);
-            input.set_style(
-                InputStyle {
-                    text: theme.title(),
-                    placeholder: theme.tertiary(),
-                    cursor: theme.title(),
-                    selection: theme.focus().opacity(0.3),
-                    font_size: px(18.),
-                    line_height: px(24.),
-                },
-                cx,
-            );
-            input.set_text_and_select_all(prefill, window, cx);
-            input
-        });
+        let (input, kept) = match input {
+            BarInput::Field { field, selected } => {
+                field.read(cx).focus(window);
+                (field, selected)
+            }
+            BarInput::Text(text) => (
+                cx.new(|cx| {
+                    let mut input = TextInput::new(window, cx);
+                    input.set_placeholder(
+                        match mode {
+                            CommandMode::NewTab | CommandMode::EditAddress => {
+                                "Search or Enter URL…"
+                            }
+                            CommandMode::History => "Search History…",
+                            CommandMode::Settings => "Search Settings…",
+                        },
+                        cx,
+                    );
+                    input.set_style(
+                        InputStyle {
+                            text: theme.title(),
+                            placeholder: theme.tertiary(),
+                            cursor: theme.title(),
+                            selection: theme.focus().opacity(0.3),
+                            font_size: px(18.),
+                            line_height: px(24.),
+                        },
+                        cx,
+                    );
+                    input.set_text_and_select_all(&text, window, cx);
+                    input
+                }),
+                None,
+            ),
+        };
         let subscriptions = vec![
             cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
                 InputEvent::Changed(query) => {
                     this.update_results(query, window);
                     cx.notify();
                 }
-                InputEvent::Submit(_) => this.run(this.selected, cx),
+                InputEvent::Submit(_) => this.run_selected(cx),
                 InputEvent::Cancel => cx.emit(CommandBarEvent::Dismiss { refocus: true }),
             }),
             cx.observe_window_activation(window, |this, window, cx| {
@@ -582,30 +1710,106 @@ impl CommandBar {
                 }
             }),
         ];
+        let query = input.read(cx).text().to_owned();
         let mut this = Self {
             mode,
             input,
             context,
             items: Vec::new(),
-            selected: 0,
+            selected: None,
             theme,
             icons,
+            rows,
+            scroll: ScrollHandle::new(),
             was_active: window.is_window_active(),
             _subscriptions: subscriptions,
         };
-        this.update_results(prefill, window);
+        this.update_results(&query, window);
+        // The bar placed again over a moved card keeps the row Return runs.
+        if let Some(index) = kept.filter(|&index| index < this.items.len()) {
+            this.selected = Some(index);
+            this.scroll.scroll_to_item(index);
+        }
         this
+    }
+
+    /// What a bar that replaces this one starts with.
+    pub fn replacement(&self) -> BarInput {
+        BarInput::Field {
+            field: self.input.clone(),
+            selected: self.selected,
+        }
+    }
+
+    /// The results again, for what changed since the bar opened (a
+    /// shortcut pinned the tab, cleared Today), keeping the highlight.
+    pub fn set_context(
+        &mut self,
+        context: CommandContext,
+        icons: HashMap<String, Arc<Image>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.context = context;
+        self.icons.extend(icons);
+        let selected = self.selected;
+        let query = self.input.read(cx).text().to_owned();
+        self.update_results(&query, window);
+        if selected.is_some() {
+            self.selected = selected.filter(|&index| index < self.items.len());
+        }
+        cx.notify();
+    }
+
+    /// Favicons read from the disk cache after the bar opened.
+    pub fn add_icons(&mut self, icons: HashMap<String, Arc<Image>>, cx: &mut Context<Self>) {
+        if !icons.is_empty() {
+            self.icons.extend(icons);
+            cx.notify();
+        }
+    }
+
+    /// ⌘L again: the whole address selected once more, as in Chrome.
+    pub fn select_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input
+            .update(cx, |input, cx| input.select_all_focus(window, cx));
     }
 
     fn update_results(&mut self, query: &str, window: &mut Window) {
         self.items = results(self.mode, query, &self.context);
-        self.selected = 0;
+        self.selected = (!query.trim().is_empty() && !self.items.is_empty()).then_some(0);
+        self.scroll.set_offset(point(px(0.), px(0.)));
         if !TRANSPARENT {
-            let height = px(panel_height(self.items.len()));
+            let height = px(panel_height(self.list_rows()));
             let viewport = window.viewport_size();
             if viewport.height != height {
                 window.resize(size(viewport.width, height));
             }
+        }
+    }
+
+    /// What the History view says when it lists nothing.
+    fn note(&self) -> Option<&'static str> {
+        (self.mode == CommandMode::History && self.items.is_empty()).then_some(
+            if self.context.history.is_empty() {
+                "Pages you visit appear here"
+            } else {
+                "No matching pages"
+            },
+        )
+    }
+
+    /// The list's height in rows: every result, or, when they don't fit,
+    /// half a row less than there is room for, so that the row cut in half
+    /// shows there are more.
+    fn list_rows(&self) -> f32 {
+        let count = self.items.len();
+        if count > self.rows {
+            self.rows as f32 - 0.5
+        } else if count == 0 && self.note().is_some() {
+            1.
+        } else {
+            count as f32
         }
     }
 
@@ -615,12 +1819,42 @@ impl CommandBar {
         }
     }
 
+    fn run_selected(&mut self, cx: &mut Context<Self>) {
+        if let Some(index) = self.selected {
+            self.run(index, cx);
+        }
+    }
+
+    /// ⌘Return: an address or search goes to a new tab, also from ⌘L,
+    /// whose Return loads it in the tab on screen.
+    fn run_in_new_tab(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = self.selected.and_then(|index| self.items.get(index)) else {
+            return;
+        };
+        let command = match &item.command {
+            Command::Navigate(input) => Command::Open(input.clone()),
+            Command::Reload => match &self.context.active {
+                Some(active) => Command::Open(active.url.clone()),
+                None => return,
+            },
+            command => command.clone(),
+        };
+        cx.emit(CommandBarEvent::Run(command));
+    }
+
     fn move_selection(&mut self, step: isize, cx: &mut Context<Self>) {
         let count = self.items.len();
-        if count > 0 {
-            self.selected = (self.selected as isize + step).rem_euclid(count as isize) as usize;
-            cx.notify();
+        if count == 0 {
+            return;
         }
+        let next = match self.selected {
+            Some(index) => (index as isize + step).rem_euclid(count as isize) as usize,
+            None if step > 0 => 0,
+            None => count - 1,
+        };
+        self.selected = Some(next);
+        self.scroll.scroll_to_item(next);
+        cx.notify();
     }
 
     fn render_icon(&self, item_icon: &ItemIcon, selected: bool) -> impl IntoElement {
@@ -633,16 +1867,17 @@ impl CommandBar {
             .size(px(24.))
             .rounded(px(5.));
         match item_icon {
-            ItemIcon::Page(host) => {
-                let favicon = host.as_ref().and_then(|host| self.icons.get(host)).cloned();
-                tile.bg(gpui::white())
+            ItemIcon::Page(host) => match host.as_ref().and_then(|host| self.icons.get(host)) {
+                // Favicons are made for light pages: a white tile keeps
+                // dark ones visible on dark themes.
+                Some(image) => tile
+                    .bg(gpui::white())
                     .border_1()
                     .border_color(gpui::black().opacity(0.08))
-                    .child(match favicon {
-                        Some(image) => img(image).size(px(16.)).into_any_element(),
-                        None => placeholder_favicon(host.as_deref(), theme).into_any_element(),
-                    })
-            }
+                    .child(img(image.clone()).size(px(16.))),
+                // The sidebar's letter tile, in the bar's own colours.
+                None => tile.child(placeholder_favicon(host.as_deref(), theme)),
+            },
             ItemIcon::Glyph(glyph) => tile.child(icon(
                 *glyph,
                 16.,
@@ -655,17 +1890,167 @@ impl CommandBar {
         }
     }
 
+    /// What follows a row's title, measured: " — ", the address, the
+    /// detail and when, as `render_detail` draws them.
+    fn detail_parts(&self, item: &CommandItem, window: &Window) -> Option<DetailParts> {
+        if item.address.is_none() && item.detail.is_none() && item.when.is_none() {
+            return None;
+        }
+        let measure = |text: &str| text_width(text, font(UI_FONT), 13., window).ceil();
+        let detail = item.detail.as_ref().map(|detail| match item.address {
+            Some(_) => format!(" · {detail}"),
+            None => detail.clone(),
+        });
+        let when = item.when.as_ref().map(|when| {
+            if item.address.is_some() || item.detail.is_some() {
+                format!(" · {when}")
+            } else {
+                when.clone()
+            }
+        });
+        let address = item
+            .address
+            .as_ref()
+            .map_or(0., |(address, _)| measure(address));
+        // A host keeps at least the domain that owns it.
+        let address_least = item.address.as_ref().map_or(0., |(text, cut)| {
+            (*cut == Cut::Start)
+                .then(|| psl::domain_str(text))
+                .flatten()
+                .map_or(DETAIL_LEAST, |owner| measure(&format!("…{owner}")))
+                .min(address)
+        });
+        let detail_width = detail.as_deref().map_or(0., measure);
+        Some(DetailParts {
+            fixed: measure(DASH) + when.as_deref().map_or(0., measure),
+            address,
+            address_least,
+            detail_least: detail_width.min(measure(" · ") + DETAIL_LEAST),
+            detail_width,
+            detail,
+            when,
+        })
+    }
+
+    /// What follows a row's title, at most `room` wide, so a long one (a
+    /// page's title) leaves room for the title: the address, the detail and
+    /// when. Short of room, the detail (a space's name) loses its end first,
+    /// down to a few letters, then the host its start, down to the domain
+    /// that owns it, before which the detail goes; when a page was visited
+    /// is never cut.
+    fn render_detail(
+        &self,
+        item: &CommandItem,
+        parts: DetailParts,
+        room: f32,
+        selected: bool,
+        window: &Window,
+    ) -> Div {
+        let left = (room - parts.fixed).max(0.);
+        let (address, detail) = (parts.address, parts.detail_width);
+        let (address_room, detail_room) = if address + detail <= left {
+            (address, detail)
+        } else if address + parts.detail_least <= left {
+            (address, left - address)
+        } else if parts.address_least + parts.detail_least <= left {
+            (left - parts.detail_least, parts.detail_least)
+        } else if item.address.is_some() {
+            (left.min(address), 0.)
+        } else {
+            (0., left.min(detail))
+        };
+        let detail = parts.detail.filter(|_| detail_room > 0.);
+        // Cut here rather than as it paints, so what follows it comes
+        // right after it: a host loses whole labels, and the room they
+        // leave goes to the detail.
+        let measure = |text: &str| text_width(text, font(UI_FONT), 13., window).ceil();
+        let address = item
+            .address
+            .as_ref()
+            .map(|(address, cut)| elide::fit(address, address_room, *cut, measure));
+        let address_width = address.as_deref().map_or(0., measure);
+        let detail_room = (detail_room + address_room - address_width).min(parts.detail_width);
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .w(px((parts.fixed + address_width + detail_room).min(room)))
+            .overflow_hidden()
+            .text_color(if selected {
+                gpui::white()
+            } else {
+                self.theme.tertiary()
+            })
+            .child(div().flex_none().child(DASH))
+            .children(address.map(|address| div().flex_none().child(address)))
+            .children(detail.map(|detail| truncated(detail).flex_none().w(px(detail_room))))
+            .children(parts.when.map(|when| div().flex_none().child(when)))
+    }
+
+    /// A row of a bar `bar_width` wide. The title keeps at least
+    /// `TITLE_SHARE` of the row, or all it needs, and what follows it at
+    /// least the domain that owns its host and when (`render_detail`), and
+    /// otherwise at most 40 % of the bar. The highlighted row's hint takes
+    /// at most `HINT_SHARE` of the row, and less where the title and the
+    /// domain need the room: a space's name in it loses its end, and the
+    /// words go before the title or the domain would.
     fn render_item(
         &self,
         index: usize,
         item: &CommandItem,
+        bar_width: f32,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = &self.theme;
-        let selected = index == self.selected;
+        let selected = self.selected == Some(index);
+        let measure = |text: &str, size: f32, weight: FontWeight| {
+            let font = Font {
+                weight,
+                ..font(UI_FONT)
+            };
+            text_width(text, font, size, window).ceil()
+        };
+        let title_weight = if selected {
+            FontWeight::SEMIBOLD
+        } else {
+            FontWeight::NORMAL
+        };
+        // Inside the bar's border, the row's margins and padding, beside
+        // the icon and its gap.
+        let row = bar_width - 2. - 2. * 8. - 2. * 13. - (24. + 8.);
+        let title = measure(&item.title, 13., title_weight);
+        let title_least = title.min(row * TITLE_SHARE);
+        let parts = self.detail_parts(item, window);
+        let detail_least = parts
+            .as_ref()
+            .map_or(0., |parts| parts.fixed + parts.address_least);
+        // ↩ in its box and the gap before it; words go before it with a gap,
+        // unless the title and the domain leave too little room for them.
+        let enter = 8. + 2. * 5. + measure("↩", 12., FontWeight::MEDIUM);
+        let hint_room = (row * HINT_SHARE).min(row - enter - 8. - title_least - detail_least);
+        let hint_words = selected && !item.hint.is_empty() && hint_room >= HINT_LEAST;
+        let hint_width = match (selected, hint_words) {
+            (false, _) => 0.,
+            (true, false) => enter,
+            (true, true) => {
+                enter + 8. + measure(&item.hint, 12., FontWeight::MEDIUM).min(hint_room)
+            }
+        };
+        let content = row - hint_width;
+        // The domain that owns the host and when may take a little of the
+        // title's share, and more than 40 % of the bar.
+        let title_floor = title.min(row * TITLE_FLOOR);
+        let detail_room = (content - title_least)
+            .max((content - title_floor).min(detail_least))
+            .min((bar_width * 0.4).max(detail_least))
+            // All a short title leaves.
+            .max(content - title)
+            .max(0.);
         div()
             .id(("item", index))
             .flex()
+            .flex_none()
             .items_center()
             .gap(px(8.))
             .h(px(ROW_HEIGHT))
@@ -675,8 +2060,8 @@ impl CommandBar {
             .cursor_pointer()
             .when(selected, |row| row.bg(theme.focus()))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                if *hovered && this.selected != index {
-                    this.selected = index;
+                if *hovered && this.selected != Some(index) {
+                    this.selected = Some(index);
                     cx.notify();
                 }
             }))
@@ -699,23 +2084,15 @@ impl CommandBar {
                             } else {
                                 theme.title()
                             })
-                            .when(selected, |title| title.font_weight(FontWeight::SEMIBOLD)),
+                            .font_weight(title_weight),
                     )
-                    .when_some(item.detail.clone(), |row, detail| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .whitespace_nowrap()
-                                .text_color(if selected {
-                                    gpui::white().opacity(0.72)
-                                } else {
-                                    theme.ink(0.45)
-                                })
-                                .child(SharedString::from(format!(" — {detail}"))),
-                        )
-                    }),
+                    .children(parts.map(|parts| {
+                        self.render_detail(item, parts, detail_room, selected, window)
+                    })),
             )
-            .when(selected && !item.hint.is_empty(), |row| {
+            // What Return does: every highlighted row can be the default,
+            // so each shows ↩, with words where it has them.
+            .when(selected, |row| {
                 row.child(
                     div()
                         .flex()
@@ -724,8 +2101,10 @@ impl CommandBar {
                         .gap(px(8.))
                         .text_size(px(12.))
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(gpui::white().opacity(0.9))
-                        .child(item.hint)
+                        .text_color(gpui::white())
+                        .when(hint_words, |hint| {
+                            hint.child(truncated(item.hint.clone()).max_w(px(hint_room)))
+                        })
                         .child(
                             div()
                                 .flex()
@@ -742,6 +2121,19 @@ impl CommandBar {
     }
 }
 
+/// What follows a row's title, measured (`detail_parts`): what never
+/// gives way (" — " and when), the address's width and the least it is cut
+/// to, and the detail's.
+struct DetailParts {
+    fixed: f32,
+    address: f32,
+    address_least: f32,
+    detail: Option<String>,
+    detail_width: f32,
+    detail_least: f32,
+    when: Option<String>,
+}
+
 impl Render for CommandBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
@@ -750,8 +2142,18 @@ impl Render for CommandBar {
             .items
             .iter()
             .enumerate()
-            .map(|(index, item)| self.render_item(index, item, cx).into_any_element())
+            .map(|(index, item)| {
+                self.render_item(index, item, f32::from(width), window, cx)
+                    .into_any_element()
+            })
             .collect::<Vec<_>>();
+        let list_height = LIST_PADDING_TOP + self.list_rows() * ROW_HEIGHT + LIST_PADDING_BOTTOM;
+        let note = self.note();
+        let glyph = match self.mode {
+            CommandMode::NewTab | CommandMode::EditAddress => Icon::Search,
+            CommandMode::History => Icon::History,
+            CommandMode::Settings => Icon::Settings,
+        };
         let panel = div()
             .id("command-bar")
             .absolute()
@@ -777,17 +2179,38 @@ impl Render for CommandBar {
                     .h(px(INPUT_HEIGHT))
                     .pl(px(22.))
                     .pr(px(22.))
-                    .child(icon(Icon::Search, 16., theme.ink(0.55)))
+                    .child(icon(glyph, 16., theme.ink(0.55)))
                     .child(self.input.clone()),
             )
             .when(!items.is_empty(), |panel| {
+                // The padding stays put, so a row scrolled into view keeps
+                // its distance from the panel's edge.
+                panel.child(div().h(px(1.)).bg(theme.ink(0.08))).child(
+                    div()
+                        .pt(px(LIST_PADDING_TOP))
+                        .pb(px(LIST_PADDING_BOTTOM))
+                        .child(
+                            div()
+                                .id("results")
+                                .track_scroll(&self.scroll)
+                                .overflow_y_scroll()
+                                .h(px(self.list_rows() * ROW_HEIGHT))
+                                .flex()
+                                .flex_col()
+                                .children(items),
+                        ),
+                )
+            })
+            .when_some(note, |panel, note| {
                 panel.child(div().h(px(1.)).bg(theme.ink(0.08))).child(
                     div()
                         .flex()
-                        .flex_col()
-                        .pt(px(LIST_PADDING_TOP))
-                        .pb(px(LIST_PADDING_BOTTOM))
-                        .children(items),
+                        .items_center()
+                        .h(px(list_height))
+                        .px(px(29.))
+                        .text_size(px(13.))
+                        .text_color(theme.tertiary())
+                        .child(note),
                 )
             });
         div()
@@ -797,6 +2220,7 @@ impl Render for CommandBar {
             .key_context("CommandBar")
             .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| this.move_selection(-1, cx)))
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_selection(1, cx)))
+            .on_action(cx.listener(|this, _: &SubmitInNewTab, _, cx| this.run_in_new_tab(cx)))
             .when(!TRANSPARENT, |root| root.bg(theme.card()))
             // A press beside the panel, in the transparent margin, dismisses.
             .on_mouse_down(
@@ -841,17 +2265,32 @@ mod tests {
                 tab(20, 2, "GitHub", "https://github.com/"),
                 tab(21, 2, "gpui - Rust", "https://docs.rs/gpui/latest/gpui/"),
             ],
+            recent: Vec::new(),
             active: Some(ActiveTab {
                 id: 11,
                 url: "https://en.wikipedia.org/wiki/Arc".into(),
                 pin: Pin::Today,
                 host: Some("en.wikipedia.org".into()),
                 blocking_disabled: false,
+                today_others: true,
+                today_below: true,
+                loaded: true,
+                muted: false,
+                pinned_away: false,
             }),
             spaces: vec![(1, "Personal".into()), (2, "Work".into())],
-            can_reopen: true,
+            closed: vec![ClosedEntry {
+                id: 5,
+                space_id: 1,
+                title: "Lobsters".into(),
+                url: "https://lobste.rs/".into(),
+            }],
+            reopen_count: 1,
+            history: Vec::new(),
+            now: 0,
             sidebar_hidden: false,
             has_today: true,
+            search_engine: SearchEngine::Google,
         }
     }
 
@@ -873,18 +2312,20 @@ mod tests {
     }
 
     #[test]
-    fn empty_query_lists_the_space_with_the_selected_tab_first() {
+    fn empty_query_lists_the_spaces_other_tabs_and_the_tab_to_reopen() {
         let items = results(CommandMode::NewTab, "  ", &context());
         assert_eq!(
             commands(&items),
             [
-                Command::SwitchToTab(11),
                 Command::SwitchToTab(10),
                 Command::SwitchToTab(12),
                 Command::ReopenClosedTab,
             ]
         );
-        assert_eq!(items[0].detail.as_deref(), Some("en.wikipedia.org"));
+        assert_eq!(
+            items[0].address,
+            Some(("news.ycombinator.com".into(), Cut::Start))
+        );
         assert_eq!(items[0].hint, "Switch to Tab");
     }
 
@@ -951,15 +2392,29 @@ mod tests {
         ] {
             assert_eq!(top(query)[0], search(query), "{query}");
         }
-        // Addresses open, unless an open tab is at that address or, for a
-        // bare host, on that host.
+        // Addresses open, unless a tab of this space is at that address or,
+        // for a bare host, on that host. One open only in another space
+        // opens here, and the tab there comes next.
+        assert_eq!(top("news.ycombinator.com")[0], Command::SwitchToTab(10));
+        assert_eq!(
+            top("https://news.ycombinator.com/")[0],
+            Command::SwitchToTab(10)
+        );
         assert_eq!(
             top("github.com"),
-            [Command::SwitchToTab(20), search("github.com")]
+            [search("github.com"), Command::SwitchToTab(20)]
         );
-        assert_eq!(top("https://www.GitHub.com/")[0], Command::SwitchToTab(20));
-        assert_eq!(top("docs.rs/gpui/latest/gpui")[0], Command::SwitchToTab(21));
-        for query in ["github.com/rust-lang", "example.com", "en.wikipedia.org"] {
+        assert_eq!(
+            results(CommandMode::NewTab, "github.com", &context)[0].hint,
+            "Open in Personal"
+        );
+        for query in [
+            "https://www.GitHub.com/",
+            "docs.rs/gpui/latest/gpui",
+            "github.com/rust-lang",
+            "example.com",
+            "en.wikipedia.org",
+        ] {
             assert_eq!(top(query)[0], search(query), "{query}");
         }
         // ⌘L loads what is typed in the tab.
@@ -992,12 +2447,13 @@ mod tests {
             .iter()
             .find(|item| item.command == Command::SwitchToTab(21))
             .unwrap();
+        assert_eq!(other_space.address, Some(("docs.rs".into(), Cut::Start)));
         assert_eq!(other_space.detail.as_deref(), Some("Work"));
-        // ⌘L never offers the tab being edited.
+        // Neither ⌘L nor ⌘T offers the tab on screen.
         let edit = results(CommandMode::EditAddress, "wikipedia", &context());
         assert!(!commands(&edit).contains(&Command::SwitchToTab(11)));
         assert!(
-            commands(&results(CommandMode::NewTab, "wikipedia", &context()))
+            !commands(&results(CommandMode::NewTab, "wikipedia", &context()))
                 .contains(&Command::SwitchToTab(11))
         );
     }
@@ -1028,7 +2484,7 @@ mod tests {
         for (pin, title) in [
             (Pin::Today, "Pin Tab"),
             (Pin::Pinned, "Unpin Tab"),
-            (Pin::Favorite, "Unpin Tab"),
+            (Pin::Favorite, "Remove from Favorites"),
         ] {
             let mut context = context();
             context.active.as_mut().unwrap().pin = pin;
@@ -1041,14 +2497,19 @@ mod tests {
     }
 
     #[test]
-    fn results_are_capped() {
+    fn every_matching_tab_is_listed_up_to_the_cap() {
         let mut context = context();
-        context.tabs = (0..20)
+        context.tabs = (0..60)
             .map(|id| tab(100 + id, 1, "Page", &format!("https://page{id}.test/")))
             .collect();
-        assert_eq!(results(CommandMode::NewTab, "", &context).len(), MAX_ITEMS);
-        let typed = results(CommandMode::NewTab, "page", &context);
-        assert_eq!(typed.len(), 1 + MAX_TABS);
+        let tabs = |query: &str| {
+            results(CommandMode::NewTab, query, &context)
+                .iter()
+                .filter(|item| matches!(item.command, Command::SwitchToTab(_)))
+                .count()
+        };
+        assert_eq!(tabs(""), MAX_TABS);
+        assert_eq!(tabs("page"), MAX_TABS);
     }
 
     #[test]
