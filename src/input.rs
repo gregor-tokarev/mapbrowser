@@ -247,10 +247,14 @@ impl TextInput {
         window.focus(&self.focus_handle);
     }
 
+    /// Selects the whole text from its end, so that a long one shows its
+    /// start, as Safari's and Chrome's address fields do: an address's
+    /// scheme and host, not the end of its path.
     pub fn select_all_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
         self.selected_range = 0..self.content.len();
-        self.selection_reversed = false;
+        self.selection_reversed = true;
+        self.scroll_x = px(0.);
         cx.notify();
     }
 
@@ -470,29 +474,31 @@ impl TextInput {
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
-        let kind = self.deletion_kind();
-        if self.selected_range.is_empty() {
-            self.select_to(self.previous_boundary(self.cursor_offset()), cx)
-        }
-        self.edit_selection(kind, "", window, cx)
+        let caret = self.cursor_offset();
+        self.delete_next_to_caret(self.previous_boundary(caret)..caret, window, cx);
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
-        let kind = self.deletion_kind();
-        if self.selected_range.is_empty() {
-            self.select_to(self.next_boundary(self.cursor_offset()), cx)
-        }
-        self.edit_selection(kind, "", window, cx)
+        let caret = self.cursor_offset();
+        self.delete_next_to_caret(caret..self.next_boundary(caret), window, cx);
     }
 
-    /// Single characters deleted one after another undo together; a
-    /// deleted selection on its own.
-    fn deletion_kind(&self) -> EditKind {
-        if self.selected_range.is_empty() {
-            EditKind::Deleting
-        } else {
-            EditKind::Other
+    /// Backspace and Delete: a selection goes on its own, else the
+    /// character `beside` the caret, in a run that ⌘Z undoes together.
+    /// The selection isn't extended to it first, so ⌘Z puts the caret
+    /// back where the run began rather than selecting one character.
+    fn delete_next_to_caret(
+        &mut self,
+        beside: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.selected_range.is_empty() || self.marked_range.is_some() {
+            return self.edit_selection(EditKind::Other, "", window, cx);
         }
+        self.next_edit = EditKind::Deleting;
+        let beside = self.range_to_utf16(&beside);
+        self.replace_text_in_range(Some(beside), "", window, cx);
     }
 
     fn on_mouse_down(

@@ -312,7 +312,13 @@ impl BrowserApp {
         let tab_name_input = cx.new(|cx| TextInput::new(window, cx));
         let notices = PageNotices::new(cx);
         let favicons = FaviconStore::new(state.root_dir());
-        let history = History::load(state.root_dir());
+        let mut history = History::load(state.root_dir());
+        // A deleted space's visits go with it, as its profile does, and on
+        // the same trust: only the session saved last says it's gone. The
+        // next save writes the file.
+        if state.from_state_file() {
+            history.retain_spaces(&state.spaces.iter().map(|space| space.id).collect());
+        }
         let restored = state
             .spaces
             .iter()
@@ -1354,10 +1360,27 @@ impl BrowserApp {
         }
         self.show_toast(format!("Deleted {}", space.name), cx);
         self.persist_later(cx);
-        // The space's history goes with it.
+        // The space's history goes with it, and the icons of the sites only
+        // it had.
         if self.history.forget_space(space_id) {
             self.schedule_history_save(SAVE_DELAY, cx);
         }
+        self.forget_unused_favicons(cx);
+    }
+
+    /// Deletes the cached icons of sites that no tab, closed tab or visit
+    /// in any space has any more: the cache names every site it holds.
+    fn forget_unused_favicons(&mut self, cx: &mut Context<Self>) {
+        let tabs = self.state.spaces.iter().flat_map(|space| &space.tabs);
+        let closed = self.state.closed_tabs().iter().map(|closed| &closed.tab);
+        let keep = tabs
+            .chain(closed)
+            .map(|tab| tab.url.as_str())
+            .chain(self.history.urls())
+            .filter_map(host_of)
+            .collect();
+        self.favicons.retain_hosts(&keep);
+        self.favicons.release_replaced(cx);
     }
 
     pub fn set_space_theme(&mut self, space_id: SpaceId, theme: u8, cx: &mut Context<Self>) {
@@ -1855,12 +1878,12 @@ impl BrowserApp {
             return;
         };
         let mode = bar.mode;
-        let Ok(field) = bar.handle.read(cx).map(CommandBar::field) else {
+        let Ok(input) = bar.handle.read(cx).map(CommandBar::replacement) else {
             return;
         };
         self.close_command_bar(cx);
         if !self.fullscreen {
-            self.show_command_bar(mode, BarInput::Field(field), window, cx);
+            self.show_command_bar(mode, input, window, cx);
         }
     }
 
@@ -2095,6 +2118,7 @@ impl BrowserApp {
             self.persist_later(cx);
         }
         self.clear_downloads(cx);
+        self.forget_unused_favicons(cx);
         self.show_toast("Cleared history", cx);
         self.refresh_command_bar(cx);
     }
@@ -2347,7 +2371,7 @@ impl BrowserApp {
             }
             EngineEvent::Title { tab_id, title } => {
                 // Also when the tab's title stays: its new page has one.
-                if self.history.set_title(tab_id, &title) {
+                if self.history.set_title(tab_id, &title, history::now()) {
                     self.schedule_history_save(PAGE_SAVE_DELAY, cx);
                 }
                 let Some(tab) = self.state.tab(tab_id) else {

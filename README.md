@@ -14,11 +14,11 @@ Your tabs live in a sidebar instead of across the top. Group them into spaces, o
 
 ## Using Map Browser
 
-**Opening pages.** Press `⌘T` to open the command bar. Type an address or a search, pick an open tab from any space, a tab you just closed or a page you've visited before, or run an action such as Pin Tab, Mute Tab, Clear Today or Switch to Work. A tab appears once you pick a result. Type the name of an open tab or of a space, or the address of an open tab, and Return goes there instead of searching. `⌘L`, or a click on the address at the top of the sidebar, edits the current page's address; `⌘Return` opens the edited address in a new tab instead.
+**Opening pages.** Press `⌘T` to open the command bar. Type an address or a search, pick an open tab from any space, a tab you just closed or a page you've visited before, or run an action such as Pin Tab, Mute Tab, Clear Today or Switch to Work. A tab appears once you pick a result. Type the name of an open tab or of a space, or the address of a tab open in this space, and Return goes there instead of searching. An address that's open only in another space opens here, with this space's logins, and the bar says so. `⌘L`, or a click on the address at the top of the sidebar, edits the current page's address; `⌘Return` opens the edited address in a new tab instead.
 
-Home-network addresses such as `192.168.1.1`, `nas.local` or `router/` open as they are. Start with `?` to search for something that looks like an address. Typed `mailto:` and `tel:` addresses open Mail and FaceTime. `⌘Z` and `⇧⌘Z` undo and redo typing in the command bar and every other field of the browser, so a stray key over the address can be taken back.
+Home-network addresses such as `192.168.1.1`, `nas.local`, `router/` or `nas:5000` open as they are, while words like `tcp/ip` or `24/7` are searched. A file's path, such as `~/Desktop/page.html`, opens the file. Start with `?` to search for something that looks like an address. Typed `mailto:` and `tel:` addresses open Mail and FaceTime. `⌘Z` and `⇧⌘Z` undo and redo typing in the command bar and every other field of the browser, so a stray key over the address can be taken back.
 
-**History and settings.** Pages you visit are remembered, so typing part of a site you've been to takes you back there. `⌘Y` lists the pages you've visited, newest first, and searches them. History > Clear History… forgets them all, your recently closed tabs and your list of downloads, after asking; deleting a space removes its history too. `⌘,` opens the settings in the command bar: pick the search engine (Google, DuckDuckGo, Bing, Brave Search, Kagi or Ecosia), turn ad blocking off for the current site, or make Map Browser your default browser.
+**History and settings.** Pages you visit are remembered, so typing part of a site you've been to takes you back there. `⌘Y` lists the pages you've visited, newest first, and searches them; a page that's already open takes you to its tab, and pages visited in another space say which. History > Clear History… forgets them all, your recently closed tabs and your list of downloads, after asking, along with the icons it kept of sites you no longer have open; deleting a space removes its history too. `⌘,` opens the settings in the command bar: pick the search engine (Google, DuckDuckGo, Bing, Brave Search, Kagi or Ecosia), turn ad blocking off for the current site, or make Map Browser your default browser.
 
 **Today, pinned and favorites.**
 - New tabs appear in **Today**, at the top of the list.
@@ -55,7 +55,7 @@ Home-network addresses such as `192.168.1.1`, `nas.local` or `router/` open as t
 | `⌥⌘L` | Show your downloads |
 | `⌘,` | Settings |
 
-Help > Keyboard Shortcuts shows every shortcut in one panel. Web apps keep their own shortcuts: in an editor such as Figma, VS Code for the web or Google Docs, keys like `⌘Z`, `⌘A`, `⇧⌘K`, `⌘[` or `⌘F` do what the app says. Opening, closing and switching tabs and spaces always works.
+Help > Keyboard Shortcuts shows every shortcut in one panel. Web apps keep their own shortcuts: in an editor such as Figma, VS Code for the web or Google Docs, keys like `⌘Z`, `⌘A`, `⇧⌘K`, `⌘[` or `⌘F` do what the app says. Opening, closing and switching tabs and spaces, History (`⌘Y`) and Settings (`⌘,`) always work, as in Safari and Chrome.
 
 Menus in the sidebar work from the keyboard too: `⇧F10` opens the selected tab's menu, the arrow keys move, Return chooses, → opens Move to Space, typing the start of a name jumps to it and Esc closes. When Map Browser asks before deleting, Return means Cancel.
 

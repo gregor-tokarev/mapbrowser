@@ -137,7 +137,7 @@ pub fn search_label(selection: &str) -> Option<String> {
         }
         shown.push('…');
     }
-    let engine = crate::model::current_search_engine().name();
+    let engine = crate::model::current_search_engine().short_name();
     Some(format!(
         "Search {engine} for “{}”",
         shown.replace('&', "&&")
