@@ -608,6 +608,9 @@ impl BrowserApp {
                     }
                     this.state.set_downloads(this.downloads.saved());
                     cx.quit();
+                } else {
+                    // Restart to Update asked, and was cancelled too.
+                    this.updates.relaunch = false;
                 }
             });
         })

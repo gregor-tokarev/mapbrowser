@@ -10,6 +10,7 @@ mod model;
 mod native;
 mod recent;
 mod ui;
+mod updater;
 
 #[cfg(not(target_os = "macos"))]
 mod native {
@@ -50,7 +51,7 @@ use engine::{Engine, Shortcut};
 use gpui::{prelude::*, *};
 use model::{BrowserState, Pin};
 use std::{cell::RefCell, rc::Rc};
-use ui::{command_bar::CommandMode, downloads::request_quit};
+use ui::{command_bar::CommandMode, downloads::request_quit, updates::UpdateOffer};
 
 actions!(
     mapbrowser,
@@ -72,7 +73,9 @@ actions!(
         ShowShortcuts,
         ShowHistory,
         ClearHistory,
-        ShowDownloads
+        ShowDownloads,
+        CheckForUpdates,
+        RestartToUpdate
     ]
 );
 
@@ -168,7 +171,8 @@ fn key_bindings() -> Vec<KeyBinding> {
 }
 
 /// What the menu bar's changing items follow: Show or Hide Sidebar, what
-/// ⌘D and ⌘W do to the active tab, and the spaces ⌃1–⌃9 go to.
+/// ⌘D and ⌘W do to the active tab, the spaces ⌃1–⌃9 go to, and Check for
+/// Updates or Restart to Update.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MenuBarState {
     pub sidebar_hidden: bool,
@@ -176,6 +180,7 @@ pub struct MenuBarState {
     pub pin: Pin,
     /// The first nine spaces' names.
     pub spaces: Vec<String>,
+    pub update: UpdateOffer,
 }
 
 pub fn menus(state: &MenuBarState) -> Vec<Menu> {
@@ -206,25 +211,28 @@ pub fn menus(state: &MenuBarState) -> Vec<Menu> {
             .zip(1..=9u8)
             .map(|(name, number)| MenuItem::action(name.clone(), Browse(SelectSpace(number)))),
     );
+    let mut app = vec![MenuItem::action("About Map Browser", About)];
+    match state.update {
+        UpdateOffer::None => {}
+        UpdateOffer::Check => app.push(MenuItem::action("Check for Updates…", CheckForUpdates)),
+        UpdateOffer::Restart(_) => app.push(MenuItem::action("Restart to Update", RestartToUpdate)),
+    }
+    app.extend([
+        MenuItem::separator(),
+        MenuItem::action("Settings…", Settings),
+        MenuItem::action("Set as Default Browser…", SetDefaultBrowser),
+        MenuItem::separator(),
+        MenuItem::os_submenu("Services", SystemMenuType::Services),
+        MenuItem::separator(),
+        MenuItem::action("Hide Map Browser", Hide),
+        MenuItem::action("Hide Others", HideOthers),
+        MenuItem::action("Show All", ShowAll),
+        MenuItem::separator(),
+        MenuItem::action("Quit Map Browser", Quit),
+    ]);
     vec![
         // AppKit titles this menu with the bundle's name, "Map Browser".
-        menu(
-            "Map Browser",
-            vec![
-                MenuItem::action("About Map Browser", About),
-                MenuItem::separator(),
-                MenuItem::action("Settings…", Settings),
-                MenuItem::action("Set as Default Browser…", SetDefaultBrowser),
-                MenuItem::separator(),
-                MenuItem::os_submenu("Services", SystemMenuType::Services),
-                MenuItem::separator(),
-                MenuItem::action("Hide Map Browser", Hide),
-                MenuItem::action("Hide Others", HideOthers),
-                MenuItem::action("Show All", ShowAll),
-                MenuItem::separator(),
-                MenuItem::action("Quit Map Browser", Quit),
-            ],
-        ),
+        menu("Map Browser", app),
         menu(
             "File",
             vec![
@@ -463,6 +471,16 @@ fn main() -> anyhow::Result<()> {
                 let _ = window.update(cx, |app, window, cx| app.show_downloads(window, cx));
             })
         });
+        cx.on_action(move |_: &CheckForUpdates, cx| {
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |app, _, cx| app.check_for_updates(true, cx));
+            })
+        });
+        cx.on_action(move |_: &RestartToUpdate, cx| {
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |app, window, cx| app.restart_to_update(window, cx));
+            })
+        });
         cx.on_action(move |_: &ClearHistory, cx| {
             cx.defer(move |cx| {
                 let _ = window.update(cx, |app, window, cx| app.ask_to_clear_history(window, cx));
@@ -492,6 +510,8 @@ fn main() -> anyhow::Result<()> {
         });
         cx.activate(true);
     });
-    retained_engine.borrow_mut().shutdown()?;
-    Ok(())
+    let shutdown = retained_engine.borrow_mut().shutdown();
+    // Chromium's helpers start from the bundle, so it changes only now.
+    updater::finish();
+    shutdown
 }

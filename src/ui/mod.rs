@@ -19,6 +19,7 @@ pub mod sidebar;
 pub mod swipe;
 pub mod theme;
 pub mod toast_window;
+pub mod updates;
 pub mod window_frame;
 
 use crate::{Dismiss, app::BrowserApp};

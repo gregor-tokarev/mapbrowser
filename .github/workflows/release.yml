@@ -1,0 +1,138 @@
+# Builds the Mac app for Apple silicon and Intel. On a version tag (v1.2.3,
+# matching Cargo.toml) it publishes them to that tag's release with the
+# signed update manifest the app checks. A release drafted by hand before
+# the tag keeps its notes and stays a draft until published; otherwise the
+# release is created with generated notes and published once its files are
+# up. See docs/development.md, "Releases and updates".
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "scripts/bundle.py"
+      - "scripts/package.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: macos-15
+    env:
+      # The CEF runtime the build downloads, about 1 GB unpacked, kept
+      # outside target/: rust-cache prunes what it doesn't know there.
+      CEF_PATH: /Users/runner/cef
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-apple-darwin
+          - arch: x64
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag matches Cargo.toml
+        if: github.ref_type == 'tag'
+        run: |
+          version="$(python3 scripts/package.py version)"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match version $version in Cargo.toml"
+            exit 1
+          fi
+
+      - name: Install tools
+        run: |
+          brew install ninja
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Find the CEF version
+        id: cef
+        run: echo "version=$(grep -A1 '^name = "cef-dll-sys"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        with:
+          path: ${{ env.CEF_PATH }}
+          key: cef-${{ matrix.target }}-${{ steps.cef.outputs.version }}
+
+      - name: Build the app
+        env:
+          # Only these builds update themselves (src/updater.rs).
+          MAPBROWSER_RELEASE: "1"
+        run: python3 scripts/bundle.py --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: python3 scripts/package.py app --arch ${{ matrix.arch }} --app "target/${{ matrix.target }}/bundle/Map Browser.app" --out dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mac-${{ matrix.arch }}
+          path: dist/
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: Publish
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write and sign the update manifest
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
+          version="${GITHUB_REF_NAME#v}"
+          python3 scripts/package.py manifest --version "$version" \
+            --base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME" \
+            dist/*.json > latest.json
+          cat latest.json
+          key="$RUNNER_TEMP/minisign.key"
+          (umask 077 && printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key")
+          minisign -S -s "$key" -m latest.json -t "Map Browser $version"
+          rm -f "$key"
+          # The key the app trusts: a manifest it would refuse must not ship.
+          public_key="$(sed -n 's/^const PUBLIC_KEY: &str = "\(.*\)";$/\1/p' src/updater.rs)"
+          minisign -V -P "$public_key" -m latest.json
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          created=false
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --draft --verify-tag --title "Map Browser ${tag#v}" --generate-notes
+            created=true
+          fi
+          gh release upload "$tag" dist/*.dmg dist/*.zip --clobber
+          # Last: once the manifest is there, apps on older versions update.
+          gh release upload "$tag" latest.json latest.json.minisig --clobber
+          if [ "$created" = true ]; then
+            gh release edit "$tag" --draft=false --latest
+          fi

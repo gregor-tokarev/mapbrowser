@@ -1,6 +1,6 @@
 [package]
 name = "mapbrowser"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 default-run = "mapbrowser"
 
@@ -13,17 +13,23 @@ async-channel = "2"
 dirs = "6"
 env_logger = "0.11"
 gpui = { version = "=0.2.2", default-features = false, features = ["font-kit"] }
+# Updates: the release manifest's signature, the download's hash.
+minisign-verify = "0.2"
 # The public suffix list, to tell "example.dev" from "node.js". adblock
 # already builds it.
 psl = "2"
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 unicode-segmentation = "1"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 cef = { version = "=152.2.0", default-features = false, features = ["sandbox"] }
 dispatch2 = "0.3"
+libc = "0.2"
 objc2 = "0.6"
 objc2-app-kit = "0.3"
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "objc2", "CGPath"] }

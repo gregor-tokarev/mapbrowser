@@ -28,6 +28,7 @@ use crate::{
         swipe::SwipeTracker,
         theme::Theme,
         toast_window::{Toast, ToastKind, ToastWindow},
+        updates::Updates,
         window_frame::WindowFrame,
     },
 };
@@ -164,6 +165,7 @@ pub struct BrowserApp {
     pub link_status: LinkStatus,
     /// Why the last save failed, until one succeeds; a notice says so.
     pub(crate) save_failure: Option<SharedString>,
+    pub(crate) updates: Updates,
     /// What the menu bar shows now.
     menu_bar: crate::MenuBarState,
     /// Help > Keyboard Shortcuts, while open.
@@ -372,6 +374,7 @@ impl BrowserApp {
             toast_window: None,
             link_status: LinkStatus::default(),
             save_failure: None,
+            updates: Updates::default(),
             menu_bar: crate::MenuBarState::default(),
             shortcuts: None,
             history,
@@ -445,6 +448,9 @@ impl BrowserApp {
                 this.save_now();
                 this.history_save_task = None;
                 this.history.save();
+                if this.updates.relaunch {
+                    crate::updater::relaunch_after_quit();
+                }
                 async {}
             }),
             // ⌃ can be let go of in another app.
@@ -509,6 +515,7 @@ impl BrowserApp {
         this.load_favicons(hosts, cx);
         // Lazy restore: only the tab on screen gets a browser now.
         this.show_selected();
+        this.schedule_update_checks(cx);
         if let Some(recovery) = this.state.recovery.take() {
             cx.defer_in(window, move |this, window, cx| {
                 this.tell_recovery(recovery, window, cx)
@@ -2036,6 +2043,7 @@ impl BrowserApp {
             sidebar_hidden: self.sidebar_toggle_shows(),
             has_today: active_space.section(Pin::Today).next().is_some(),
             search_engine: self.state.search_engine(),
+            update: self.updates.offer(),
         }
     }
 
@@ -2071,6 +2079,8 @@ impl BrowserApp {
             Command::SearchWith(engine) => self.set_search_engine(engine, cx),
             Command::SetDefaultBrowser => self.set_default_browser(cx),
             Command::ShowShortcuts => self.show_shortcuts(window, cx),
+            Command::CheckForUpdates => self.check_for_updates(true, cx),
+            Command::RestartToUpdate => self.restart_to_update(window, cx),
             Command::Reload
             | Command::TogglePin
             | Command::ToggleFavorite
@@ -2893,18 +2903,20 @@ impl BrowserApp {
     }
 
     /// Keeps the menu bar's changing items (Show or Hide Sidebar, what ⌘D
-    /// and ⌘W do to the tab, the spaces) in step with the window. Called on
-    /// every frame; the menu bar is rebuilt only when they change, which is
-    /// rare.
+    /// and ⌘W do to the tab, the spaces, updates) in step with the window.
+    /// Called on every frame; the menu bar is rebuilt only when they change,
+    /// which is rare.
     pub(crate) fn sync_menu_bar(&mut self, cx: &mut Context<Self>) {
         // The words the sidebar button and the command bar use.
         let sidebar_hidden = self.sidebar_toggle_shows();
         let pin = self.state.active_tab().map_or(Pin::Today, |tab| tab.pin);
         let spaces = self.state.spaces.iter().take(9).map(|space| &space.name);
+        let update = self.updates.offer();
         let shown = &self.menu_bar;
         if shown.sidebar_hidden == sidebar_hidden
             && shown.pin == pin
             && shown.spaces.iter().eq(spaces.clone())
+            && shown.update == update
         {
             return;
         }
@@ -2912,6 +2924,7 @@ impl BrowserApp {
             sidebar_hidden,
             pin,
             spaces: spaces.cloned().collect(),
+            update,
         };
         self.menu_bar = state.clone();
         cx.defer(move |cx| cx.set_menus(crate::menus(&state)));
@@ -2987,8 +3000,8 @@ impl BrowserApp {
     }
 }
 
-/// Why a save failed, in a few words for the notice.
-fn save_failure_reason(error: &std::io::Error) -> String {
+/// Why a save failed, in a few words for the notice; an update's too.
+pub(crate) fn save_failure_reason(error: &std::io::Error) -> String {
     use std::io::ErrorKind;
     match error.kind() {
         ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => {
