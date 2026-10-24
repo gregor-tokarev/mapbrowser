@@ -18,7 +18,7 @@ Your tabs live in a sidebar instead of across the top. Group them into spaces, o
 
 Home-network addresses such as `192.168.1.1`, `nas.local` or `router/` open as they are. Start with `?` to search for something that looks like an address. Typed `mailto:` and `tel:` addresses open Mail and FaceTime. `⌘Z` and `⇧⌘Z` undo and redo typing in the command bar and every other field of the browser, so a stray key over the address can be taken back.
 
-**History and settings.** Pages you visit are remembered, so typing part of a site you've been to takes you back there. `⌘Y` lists the pages you've visited, newest first, and searches them. History > Clear History… forgets them all, and your recently closed tabs, after asking; deleting a space removes its history too. `⌘,` opens the settings in the command bar: pick the search engine (Google, DuckDuckGo, Bing, Brave Search, Kagi or Ecosia), turn ad blocking off for the current site, or make Map Browser your default browser.
+**History and settings.** Pages you visit are remembered, so typing part of a site you've been to takes you back there. `⌘Y` lists the pages you've visited, newest first, and searches them. History > Clear History… forgets them all, your recently closed tabs and your list of downloads, after asking; deleting a space removes its history too. `⌘,` opens the settings in the command bar: pick the search engine (Google, DuckDuckGo, Bing, Brave Search, Kagi or Ecosia), turn ad blocking off for the current site, or make Map Browser your default browser.
 
 **Today, pinned and favorites.**
 - New tabs appear in **Today**, at the top of the list.
@@ -52,6 +52,7 @@ Home-network addresses such as `192.168.1.1`, `nas.local` or `router/` open as t
 | `⌘+` / `⌘−` / `⌘0` | Zoom in, out, or back to actual size |
 | `⌘P` | Print the page |
 | `⌘Y` | Search your history |
+| `⌥⌘L` | Show your downloads |
 | `⌘,` | Settings |
 
 Help > Keyboard Shortcuts shows every shortcut in one panel. Web apps keep their own shortcuts: in an editor such as Figma, VS Code for the web or Google Docs, keys like `⌘Z`, `⌘A`, `⇧⌘K`, `⌘[` or `⌘F` do what the app says. Opening, closing and switching tabs and spaces always works.
@@ -62,7 +63,7 @@ Point at a link to see where it goes, at the bottom left of the page. Right-clic
 
 Drag the sidebar's edge to resize it; double-click the edge to reset it. With the sidebar hidden, rest the pointer on the window's left edge to peek at it; it hides again when you move away. Short messages such as "Copied URL" or the zoom level then appear briefly at the bottom left of the page, with a ✓ when something is done and a ✕ when it failed.
 
-**The site menu.** The shield beside the address opens a menu for the site. Turn ad and tracker blocking off or on there, see which permissions the site was given or refused in this space and reset them, change the page zoom, or clear the site's cookies and stored data, which signs you out of it in this space only. Plain `http://` pages, and sites you went on to past a certificate warning, show **Not Secure** by the address. A page that isn't at 100 % shows its zoom level there; a click resets it.
+**The site menu.** The shield beside the address opens a menu for the site. Turn ad and tracker blocking off or on there, see which permissions the site was given or refused in this space and reset them, change the page zoom, or clear the site's cookies and stored data, which signs you out of it in this space only. Plain `http://` pages, devices on your network such as `nas.local` included, and sites you went on to past a certificate warning, show **Not Secure** by the address, or an open lock where the sidebar needs the room for the site's name. A page that isn't at 100 % shows its zoom level there; a click resets it.
 
 **When a page needs you.**
 - Sites and company proxies that ask for a username and password show a sign-in card on the page.
@@ -73,7 +74,7 @@ Drag the sidebar's edge to resize it; double-click the edge to reset it. With th
 - Tabs playing sound show a speaker; click it to mute the tab. Tabs using your camera or microphone show a red indicator.
 - Blocked pop-ups say so, and a page going full screen shows its site and that Esc leaves full screen.
 
-**Downloads.** Files go straight to your Downloads folder, numbered if a file with that name is already there. While they download, the library button at the bottom left shows their progress, or with the sidebar hidden, the bottom left of the page does. The library lists your recent downloads, also after you restart: × cancels one, ↻ downloads a failed or cancelled one again with its space's logins, and a click shows a finished one in Finder. A download that fails says why and marks the library button red. If files are still downloading when you quit, Map Browser asks first, as quitting cancels them.
+**Downloads.** Files go straight to your Downloads folder, numbered if a file with that name is already there. While they download, the library button at the bottom left shows their progress, or with the sidebar hidden, the bottom left of the page does. The library lists your recent downloads, also after you restart, and `⌥⌘L` opens it from the keyboard: a click or Return opens a finished file and the magnifier shows it in Finder, × cancels one, and ↻ downloads a failed or cancelled one again with the logins of the space it came from, which the row names when it isn't the one you're in. `⌫` takes a download off the list and Clear Downloads clears them all; the files stay in your Downloads folder. A download that fails says why and marks the library button red. If files are still downloading when you quit, Map Browser asks first, as quitting cancels them.
 
 **Camera, microphone and location.** Sites ask before using your camera, microphone, screen, location, notifications or other devices. The question appears in the sidebar, names exactly what the site wants and how long your answer lasts, and can be answered with Tab and Return. Your answer holds for that site in that space, for camera and microphone until you quit; screen sharing asks every time. The site menu lists your answers and resets them.
 

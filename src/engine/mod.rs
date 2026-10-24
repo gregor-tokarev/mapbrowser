@@ -800,8 +800,9 @@ pub fn site_origin(url: &str) -> Option<String> {
 }
 
 /// Whether `url` is a plain-HTTP page that others on the network could read
-/// or change. This Mac's own servers (localhost, loopback addresses) and
-/// the local network's .local names are trusted, as Chrome trusts them.
+/// or change. Only this Mac's own servers (localhost, loopback addresses)
+/// are trusted, as in Chrome: a .local name is another device, reached
+/// over the network unencrypted.
 pub fn is_insecure(url: &str) -> bool {
     let Some(host) = gpui::http_client::Url::parse(url)
         .ok()
@@ -815,7 +816,7 @@ pub fn is_insecure(url: &str) -> bool {
         return !address.is_loopback();
     }
     let host = host.trim_end_matches('.');
-    !(host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local"))
+    !(host == "localhost" || host.ends_with(".localhost"))
 }
 
 /// How a page asked for a new window (Chromium's window disposition).

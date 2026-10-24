@@ -16,6 +16,7 @@ use crate::{
         },
         downloads::Downloads,
         drag::{self, DropZones, TabDrag},
+        elide::Cut,
         find_bar::Find,
         link_status::LinkStatus,
         menu::{MenuKind, OpenMenu},
@@ -1589,15 +1590,12 @@ impl BrowserApp {
             let id = tab.id;
             self.reload(id, cx);
         }
-        self.show_toast_kind(
-            ToastKind::Info,
-            if disabled {
-                format!("Ad blocking off for {host}")
-            } else {
-                format!("Ad blocking on for {host}")
-            },
-            cx,
-        );
+        let lead = if disabled {
+            "Ad blocking off for "
+        } else {
+            "Ad blocking on for "
+        };
+        self.show_toast_about(ToastKind::Info, lead, host, Cut::Start, cx);
         self.persist_later(cx);
     }
 
@@ -1964,6 +1962,7 @@ impl BrowserApp {
             Command::UnloadSpace => self.unload_space(space_id, cx),
             Command::Shortcut(shortcut) => self.shortcut(shortcut, window, cx),
             Command::ShowHistory => self.toggle_command_bar(CommandMode::History, window, cx),
+            Command::ShowDownloads => self.show_downloads(window, cx),
             Command::ShowSettings => self.toggle_command_bar(CommandMode::Settings, window, cx),
             Command::ClearHistory => self.ask_to_clear_history(window, cx),
             Command::SearchWith(engine) => self.set_search_engine(engine, cx),
@@ -2019,8 +2018,8 @@ impl BrowserApp {
             PromptLevel::Warning,
             "Clear all history?",
             Some(
-                "Map Browser forgets the pages you visited and your recently closed tabs, \
-                 in every space.",
+                "Map Browser forgets the pages you visited, your recently closed tabs and \
+                 your list of downloads, in every space. Downloaded files stay.",
             ),
             &["Clear History", "Cancel"],
             cx,
@@ -2033,7 +2032,8 @@ impl BrowserApp {
         .detach();
     }
 
-    /// Forgets every visited page and closed tab, in every space.
+    /// Forgets every visited page, closed tab and finished download, in
+    /// every space.
     fn clear_history(&mut self, cx: &mut Context<Self>) {
         if self.history.clear() {
             self.schedule_history_save(SAVE_DELAY, cx);
@@ -2041,6 +2041,7 @@ impl BrowserApp {
         if self.state.clear_closed() {
             self.persist_later(cx);
         }
+        self.clear_downloads(cx);
         self.show_toast("Cleared history", cx);
         self.refresh_command_bar(cx);
     }

@@ -8,7 +8,7 @@
 use super::{
     UI_FONT,
     command_bar::{self, TRANSPARENT},
-    elide::{Cut, fit},
+    elide::fit_address,
     shadow, text_width,
     theme::Theme,
 };
@@ -146,7 +146,9 @@ impl BrowserApp {
         let card = self.card_bounds(window.viewport_size());
         let measure = |text: &str| text_width(text, font(UI_FONT), FONT_SIZE, window);
         let room = (f32::from(card.size.width) / 2.).min(MAX_WIDTH) - 2. * PADDING;
-        let text = fit(shown_address(&address), room, Cut::Middle, measure);
+        // The host stays whole, as in Chrome's status bubble: a link's
+        // path is cut, never the site it goes to.
+        let text = fit_address(shown_address(&address), room, measure);
         // A point to spare for rounding, so the text is never clipped.
         let width = (measure(&text) + 2. * PADDING + 1.).ceil();
         let size = size(px(width + 2. * MARGIN), px(HEIGHT + 2. * MARGIN));
@@ -291,6 +293,7 @@ mod tests {
 
     #[test]
     fn long_addresses_keep_their_start_and_end() {
+        use crate::ui::elide::{Cut, fit};
         let width = |text: &str| text.chars().count() as f32;
         let fit_middle = |text, room| fit(text, room, Cut::Middle, width);
         assert_eq!(fit_middle("example.com/a", 20.), "example.com/a");

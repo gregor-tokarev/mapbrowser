@@ -8,7 +8,7 @@ use super::{
     beside_pointer,
     command_bar::CommandMode,
     drag::{DraggedEdge, DraggedTab, EDGE_HANDLE, TabDrag, TabPreview},
-    elide::{Cut, elided},
+    elide::{Cut, advance_width, breakable, elided},
     icons::{Icon, icon},
     menu::MenuKind,
     page_notice::Leaving,
@@ -35,6 +35,10 @@ use std::{cell::Cell, collections::HashMap, rc::Rc, time::Instant};
 /// The navigation row's centre, level with the traffic lights.
 const TOP_ROW_CENTER: f32 = 20.;
 const URL_PILL_TOP: f32 = 42.;
+/// The URL pill's buttons (Copy URL, the shield) and the gap between its
+/// parts.
+const PILL_BUTTON: f32 = 26.;
+const PILL_GAP: f32 = 2.;
 /// The sliding pages start just above the URL pill.
 const PAGES_TOP: f32 = 40.;
 const BOTTOM_BAR: f32 = 48.;
@@ -972,7 +976,21 @@ impl BrowserApp {
         // blocking is off for the site, something was blocked for it this
         // session, or its menu is open.
         let hovered = interactive && self.url_pill_hovered;
-        let copy = tab.filter(|_| hovered).map(|tab| tab.id);
+        let zoom = tab
+            .filter(|_| interactive)
+            .and_then(|tab| self.engine.borrow().zoom_percent(tab.id))
+            .filter(|&percent| percent != 100);
+        let fit = label.as_deref().map_or(PillFit::default(), |label| {
+            fit_url_pill(
+                label,
+                width,
+                insecure && interactive,
+                zoom,
+                host.is_some(),
+                cx,
+            )
+        });
+        let copy = tab.filter(|_| hovered && fit.copy).map(|tab| tab.id);
         let site = tab
             .filter(|tab| {
                 interactive
@@ -983,10 +1001,6 @@ impl BrowserApp {
                         || self.site_blocked_something(tab.id))
             })
             .map(|tab| tab.id);
-        let zoom = tab
-            .filter(|_| interactive)
-            .and_then(|tab| self.engine.borrow().zoom_percent(tab.id))
-            .filter(|&percent| percent != 100);
         // Pressed while ⌘L edits the address, as "+ New Tab" is for ⌘T.
         let editing = interactive
             && self
@@ -1004,7 +1018,7 @@ impl BrowserApp {
                     .flex_none()
                     .items_center()
                     .justify_center()
-                    .size(px(26.))
+                    .size(px(PILL_BUTTON))
                     .rounded(px(6.))
                     .hover(move |style| style.bg(hover))
                     .child(icon(glyph, 17., theme.icon())),
@@ -1027,12 +1041,17 @@ impl BrowserApp {
             .mt(px(URL_PILL_TOP - PAGES_TOP))
             .pl(px(if insecure && interactive { 7. } else { 13. }))
             .pr(px(if buttons { 5. } else { 13. }))
-            .gap(px(2.))
+            .gap(px(PILL_GAP))
             .rounded(px(10.))
             .map(|pill| {
                 if editing {
-                    pill.bg(theme.selected())
-                        .when(!theme.dark, |pill| pill.shadow(selected_shadow()))
+                    // A dark theme's selected veil is barely more than the
+                    // hover's: pressed takes a clearly stronger one.
+                    if theme.dark {
+                        pill.bg(theme.ink(0.2))
+                    } else {
+                        pill.bg(theme.selected()).shadow(selected_shadow())
+                    }
                 } else if site_menu_open {
                     pill.bg(control_hover)
                 } else {
@@ -1062,7 +1081,7 @@ impl BrowserApp {
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(muted)
                                 .child(icon(Icon::LockOpen, 13., muted))
-                                .when(width >= 220., |chip| chip.child("Not Secure")),
+                                .when(fit.not_secure, |chip| chip.child("Not Secure")),
                         )
                         .maybe_tooltip(self.tooltip("Connection Isn't Secure", "", theme, width))
                         .on_click(open_site_menu(tab_id)),
@@ -1071,7 +1090,10 @@ impl BrowserApp {
             )
             .when(interactive, |pill| {
                 pill.cursor_pointer()
-                    .hover(move |style| style.bg(control_hover))
+                    // Hovering doesn't hide that ⌘L or the site menu is open.
+                    .when(!editing && !site_menu_open, |pill| {
+                        pill.hover(move |style| style.bg(control_hover))
+                    })
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                         if this.url_pill_hovered != *hovered {
                             this.url_pill_hovered = *hovered;
@@ -1095,11 +1117,9 @@ impl BrowserApp {
                         .flex_1()
                         .min_w_0()
                         .when_some(origin.filter(|_| interactive), |host, origin| {
-                            host.maybe_tooltip(
-                                self.menu
-                                    .is_none()
-                                    .then(|| Tooltip::build_wrapping(origin, "", theme, width)),
-                            )
+                            host.maybe_tooltip(self.menu.is_none().then(|| {
+                                Tooltip::build_wrapping(breakable(&origin), "", theme, width)
+                            }))
                         })
                         .child(
                             elided(label.clone(), Cut::Start, 20.)
@@ -1118,32 +1138,6 @@ impl BrowserApp {
                             .text_size(px(13.5))
                             .text_color(theme.tertiary()),
                     ),
-            })
-            // The page isn't at 100%: a click resets it.
-            .when_some(zoom, |pill, percent| {
-                pill.child(
-                    press_only(
-                        div()
-                            .id("zoom")
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .h(px(22.))
-                            .px(px(6.))
-                            .rounded(px(6.))
-                            .bg(control_hover)
-                            .hover(move |style| style.bg(hover))
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.muted())
-                            .child(format!("{percent}%")),
-                    )
-                    .maybe_tooltip(self.tooltip("Actual Size", "⌘0", theme, width))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.shortcut(Shortcut::ZoomReset, window, cx);
-                    })),
-                )
             })
             .when_some(copy, |pill, id| {
                 pill.child(
@@ -1169,6 +1163,34 @@ impl BrowserApp {
                     )
                     .when(site_menu_open, |button| button.bg(hover))
                     .on_click(open_site_menu(tab_id)),
+                )
+            })
+            // The page isn't at 100%: a click resets it. Last, at the pill's
+            // right edge, so the buttons that show on hover appear beside
+            // it, never under the pointer on its way there.
+            .when_some(zoom, |pill, percent| {
+                pill.child(
+                    press_only(
+                        div()
+                            .id("zoom")
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .h(px(22.))
+                            .px(px(6.))
+                            .rounded(px(6.))
+                            .bg(control_hover)
+                            .hover(move |style| style.bg(hover))
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.muted())
+                            .child(format!("{percent}%")),
+                    )
+                    .maybe_tooltip(self.tooltip("Actual Size", "⌘0", theme, width))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.shortcut(Shortcut::ZoomReset, window, cx);
+                    })),
                 )
             })
     }
@@ -1992,6 +2014,65 @@ impl BrowserApp {
                         this.open_menu(MenuKind::Plus, anchor, window, cx)
                     })),
             )
+    }
+}
+
+/// What the URL pill shows besides the host: "Not Secure" in words, and
+/// Copy URL on hover.
+#[derive(Clone, Copy, Default)]
+struct PillFit {
+    not_secure: bool,
+    copy: bool,
+}
+
+/// Fits the URL pill of a sidebar `width` wide around `label`, its host,
+/// which keeps room for the domain that owns it ("…example.com"), or all
+/// of itself if shorter: "Not Secure" shrinks to its lock, and Copy URL
+/// stays away (⇧⌘C copies too), before the host would lose that. Both are
+/// decided as if the buttons that show on hover were there, so nothing
+/// jumps when the pointer comes. `site`: the host has a site menu, whose
+/// shield shows on hover.
+fn fit_url_pill(
+    label: &str,
+    width: f32,
+    insecure: bool,
+    zoom: Option<u32>,
+    site: bool,
+    cx: &App,
+) -> PillFit {
+    let regular = font(UI_FONT);
+    let medium = Font {
+        weight: FontWeight::MEDIUM,
+        ..font(UI_FONT)
+    };
+    let measure = |text: &str, font: &Font, size: f32| advance_width(text, font, size, cx);
+    let whole = measure(label, &regular, 13.5);
+    let needed = psl::domain_str(label)
+        .filter(|domain| domain.len() < label.len())
+        .map_or(whole, |domain| {
+            whole.min(measure(&format!("…{domain}"), &regular, 13.5))
+        });
+    // The pill's margins, and its padding with buttons at its end.
+    let padding = 16. + if insecure { 7. } else { 13. } + 5.;
+    let room = |parts: [Option<f32>; 4]| {
+        width
+            - padding
+            - parts
+                .iter()
+                .flatten()
+                .map(|part| part + PILL_GAP)
+                .sum::<f32>()
+    };
+    // The chip's padding, lock and margin, and its words with their gap.
+    let lock = 6. + 13. + 6. + 4.;
+    let words = 4. + measure("Not Secure", &medium, 12.);
+    let zoom = zoom.map(|percent| 2. * 6. + measure(&format!("{percent}%"), &medium, 12.));
+    let site = site.then_some(PILL_BUTTON);
+    let not_secure = insecure && room([Some(lock + words), zoom, site, None]) >= needed;
+    let chip = insecure.then_some(if not_secure { lock + words } else { lock });
+    PillFit {
+        not_secure,
+        copy: room([chip, zoom, site, Some(PILL_BUTTON)]) >= needed,
     }
 }
 

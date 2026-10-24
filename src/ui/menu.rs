@@ -7,7 +7,7 @@
 use super::{
     Tooltip, UI_FONT,
     downloads::DownloadState,
-    elide::{Cut, elided},
+    elide::{Cut, advance_width, breakable, elided},
     icons::{Icon, icon},
     permissions::{permission_icon, permission_name},
     press_only, shadow,
@@ -24,9 +24,9 @@ use crate::{
 };
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, Div, Font, FontWeight, InteractiveElement,
-    IntoElement, KeyBinding, KeyContext, KeyDownEvent, MouseButton, ParentElement, Pixels, Point,
-    ScrollHandle, SharedString, Size, Stateful, StatefulInteractiveElement, Styled, Window,
-    actions, deferred, div, font, point, prelude::FluentBuilder, px, relative,
+    IntoElement, KeyBinding, KeyContext, KeyDownEvent, MouseButton, MouseMoveEvent, ParentElement,
+    Pixels, Point, ScrollHandle, SharedString, Size, Stateful, StatefulInteractiveElement, Styled,
+    Window, actions, deferred, div, font, point, prelude::FluentBuilder, px, relative,
 };
 
 actions!(
@@ -41,7 +41,8 @@ actions!(
         NextControl,
         PreviousControl,
         Choose,
-        ChooseDestructive
+        ChooseDestructive,
+        RemoveFromList
     ]
 );
 
@@ -64,6 +65,9 @@ pub fn init(cx: &mut App) {
         // Return never deletes: in the delete prompt it means Cancel, as
         // destructive buttons are never the default on macOS.
         KeyBinding::new("cmd-backspace", ChooseDestructive, Some("Menu")),
+        // In the library, a download that ended leaves the list.
+        KeyBinding::new("backspace", RemoveFromList, Some("Menu")),
+        KeyBinding::new("delete", RemoveFromList, Some("Menu")),
     ]);
 }
 
@@ -97,6 +101,15 @@ const ZOOM_HEIGHT: f32 = 30.;
 const EDGE: f32 = 6.;
 /// Distance between a tab's row and its menu.
 const ROW_GAP: f32 = 3.;
+/// The library's width, in a sidebar wide enough.
+const LIBRARY_WIDTH: f32 = 212.;
+/// Recently closed tabs the library lists, the newest; ⇧⌘T and the
+/// command bar reach the others.
+const LIBRARY_CLOSED_ROWS: usize = 20;
+/// Where the library opens from the keyboard: as from a click on its
+/// button, at the sidebar's bottom left, this far above the window's
+/// bottom edge.
+const LIBRARY_ANCHOR: Point<f32> = Point { x: 9.5, y: 42. };
 /// Menus asked for this close to the window's bottom edge belong to the
 /// bottom bar, and move with it when the window's height changes.
 const BOTTOM_BAR_REACH: f32 = 64.;
@@ -225,9 +238,13 @@ enum Action {
     /// "Delete Space…": the menu asks first.
     AskDeleteSpace(SpaceId),
     DeleteSpace(SpaceId),
+    OpenDownload(u64),
     RevealDownload(u64),
     CancelDownload(u64),
     RetryDownload(u64),
+    /// Takes a download that ended off the list (⌫ on its row).
+    RemoveDownload(u64),
+    ClearDownloads,
     /// "Move to Space ›": the menu lists the spaces.
     AskMoveTab(TabId),
     MoveTab(TabId, SpaceId),
@@ -279,7 +296,8 @@ enum Entry {
         action: Action,
     },
     /// A download, with × while it runs and ↻ once stopped; finished ones
-    /// show in Finder when chosen.
+    /// open when chosen, and show in Finder with the magnifier. `space`
+    /// names the space it downloads with, when there are several.
     Download {
         id: u64,
         name: SharedString,
@@ -287,6 +305,7 @@ enum Entry {
         state: DownloadState,
         missing: bool,
         can_retry: bool,
+        space: Option<SharedString>,
     },
     /// The site a site menu is about, and whether its connection is plain
     /// HTTP.
@@ -384,6 +403,12 @@ impl Entry {
             | Entry::Space { .. }
             | Entry::Check { .. }
             | Entry::Permission { .. } => 1,
+            // A file that is there: open it, or show it in Finder.
+            Entry::Download {
+                state: DownloadState::Done,
+                missing: false,
+                ..
+            } => 2,
             Entry::Download { .. } => usize::from(self.action(0).is_some()),
             Entry::Swatches(..) => usize::from(THEME_COUNT),
             Entry::Icons(..) => space_icons().len() + 1,
@@ -411,7 +436,7 @@ impl Entry {
             | Entry::Check { action, .. }
             | Entry::Permission { action, .. } => Some(*action),
             Entry::Closed { index, .. } => Some(Action::Reopen(*index)),
-            // One choice: show a file that is there in Finder, stop one
+            // Open a file that is there or show it in Finder, stop one
             // that downloads, or download a stopped one again.
             Entry::Download {
                 id,
@@ -419,10 +444,11 @@ impl Entry {
                 missing,
                 can_retry,
                 ..
-            } => match state {
-                DownloadState::Done if !missing => Some(Action::RevealDownload(*id)),
-                DownloadState::Running => Some(Action::CancelDownload(*id)),
-                DownloadState::Failed | DownloadState::Cancelled if *can_retry => {
+            } => match (state, part) {
+                (DownloadState::Done, 0) if !missing => Some(Action::OpenDownload(*id)),
+                (DownloadState::Done, 1) if !missing => Some(Action::RevealDownload(*id)),
+                (DownloadState::Running, 0) => Some(Action::CancelDownload(*id)),
+                (DownloadState::Failed | DownloadState::Cancelled, 0) if *can_retry => {
                     Some(Action::RetryDownload(*id))
                 }
                 _ => None,
@@ -744,34 +770,60 @@ impl BrowserApp {
             ],
             MenuKind::Library => {
                 let mut entries = vec![Entry::Header("Downloads")];
+                // Downloads of every space, each with its own space's
+                // logins: with several spaces, rows say which.
+                let several = self.state.spaces.len() > 1;
                 let downloads: Vec<Entry> = self
                     .downloads
                     .listed()
-                    .map(|download| Entry::Download {
-                        id: download.id,
-                        name: download.name.clone(),
-                        status: download.status(),
-                        state: download.state,
-                        missing: download.missing,
-                        can_retry: download.can_retry()
-                            && download
-                                .space_id
-                                .is_some_and(|id| self.state.space(id).is_some()),
+                    .map(|download| {
+                        let space = download
+                            .space_id
+                            .and_then(|id| self.state.space(id))
+                            .filter(|_| several);
+                        // Another space's: its name first, where a narrow
+                        // row still shows it.
+                        let mut status = download.status();
+                        if let Some(space) =
+                            space.filter(|space| space.id != self.state.selected_space_id)
+                        {
+                            status = format!("{} · {status}", space.name);
+                        }
+                        Entry::Download {
+                            id: download.id,
+                            name: download.name.clone(),
+                            status,
+                            state: download.state,
+                            missing: download.missing,
+                            can_retry: download.can_retry()
+                                && download
+                                    .space_id
+                                    .is_some_and(|id| self.state.space(id).is_some()),
+                            space: space.map(|space| space.name.clone().into()),
+                        }
                     })
                     .collect();
                 if downloads.is_empty() {
                     entries.push(Entry::Empty("No downloads yet"));
                 }
                 entries.extend(downloads);
+                if self.downloads.any_finished() {
+                    entries.push(Entry::item("Clear Downloads", "", Action::ClearDownloads));
+                }
                 entries.extend([Entry::Separator, Entry::Header("Recently Closed")]);
-                // Every tab ⇧⌘T can still bring back, the most recent first.
+                // The tabs ⇧⌘T brings back next, the most recent first.
                 let closed = self.state.closed_tabs();
-                entries.extend(closed.iter().enumerate().rev().map(|(index, closed)| {
-                    Entry::Closed {
-                        index,
-                        title: closed.tab.shown_title().to_owned().into(),
-                    }
-                }));
+                entries.extend(
+                    closed
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .take(LIBRARY_CLOSED_ROWS)
+                        .map(|(index, closed)| Entry::Closed {
+                            index,
+                            title: closed.tab.shown_title().to_owned().into(),
+                        }),
+                );
                 if closed.is_empty() {
                     entries.push(Entry::Empty("No recently closed tabs"));
                 }
@@ -1009,7 +1061,7 @@ impl BrowserApp {
         } else {
             theme.tertiary()
         };
-        let choice = entry.action(0);
+        let (choice, second) = (entry.action(0), entry.action(1));
         match entry {
             Entry::Item {
                 label,
@@ -1047,22 +1099,49 @@ impl BrowserApp {
                 name,
                 status,
                 state,
+                space,
                 ..
             } => {
                 let sidebar = self.sidebar_width().unwrap_or_default();
-                // A file that is there shows in Finder: the whole row is the
-                // choice. Otherwise × or ↻ is, or nothing.
-                let reveal = matches!(choice, Some(Action::RevealDownload(_)));
-                let button = choice.and_then(|action| match action {
-                    Action::CancelDownload(_) => {
-                        Some(("download-cancel", Icon::Close, "Cancel Download", action))
-                    }
-                    Action::RetryDownload(_) => {
-                        Some(("download-retry", Icon::Reload, "Download Again", action))
-                    }
+                // A file that is there opens: the whole row is the choice,
+                // and the magnifier shows it in Finder. Otherwise × or ↻
+                // is, or nothing.
+                let open = matches!(choice, Some(Action::OpenDownload(_)));
+                let button = match second.or(choice.filter(|_| !open)) {
+                    Some(action @ Action::RevealDownload(_)) => Some((
+                        "download-reveal",
+                        Icon::Search,
+                        SharedString::from("Show in Finder"),
+                        action,
+                        1,
+                    )),
+                    Some(action @ Action::CancelDownload(_)) => Some((
+                        "download-cancel",
+                        Icon::Close,
+                        "Cancel Download".into(),
+                        action,
+                        0,
+                    )),
+                    // Downloads again with the logins of the space it came
+                    // from, which may not be the one on screen.
+                    Some(action @ Action::RetryDownload(_)) => Some((
+                        "download-retry",
+                        Icon::Reload,
+                        space.map_or_else(
+                            || "Download Again".into(),
+                            |space| format!("Download Again in {space}").into(),
+                        ),
+                        action,
+                        0,
+                    )),
                     _ => None,
-                });
-                let row_lit = reveal && lit.is_some();
+                };
+                let row_lit = open && lit == Some(0);
+                // The room for the name: the library's width (`render_menu`)
+                // less its padding and the row's: 9 + 4, the icon and the
+                // button (16 and 24), and the gaps beside the name.
+                let room = LIBRARY_WIDTH.min(sidebar - 2. * EDGE) - 2. * PADDING - 69.;
+                let name_cut = advance_width(&name, &font(UI_FONT), 13., cx) > room;
                 let muted = if row_lit {
                     gpui::white().opacity(0.8)
                 } else {
@@ -1088,14 +1167,25 @@ impl BrowserApp {
                         theme.title()
                     })
                     .when(row_lit, |row| row.bg(focus))
-                    // The whole name: the row cuts long ones in the middle.
-                    .tooltip(Tooltip::build_wrapping(name.clone(), "", theme, sidebar))
-                    .when(reveal, |row| {
-                        highlights(row, target(0), cx).on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.run_menu_action(Action::RevealDownload(id), window, cx)
-                            },
-                        ))
+                    // The whole name, where the row cuts it in the middle.
+                    .when(name_cut, |row| {
+                        row.tooltip(Tooltip::build_wrapping(name.clone(), "", theme, sidebar))
+                    })
+                    // GPUI hides a tooltip only as it redraws: a row that
+                    // doesn't change on hover still redraws as the pointer
+                    // leaves it, so its tooltip goes with it.
+                    .hover(|style| style)
+                    .when(open, |row| {
+                        let row_target = target(0);
+                        highlights(row, row_target, cx)
+                            // Back on the row from its magnifier, which
+                            // keeps its moves to itself.
+                            .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                                this.hover_menu(row_target, true, cx)
+                            }))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.run_menu_action(Action::OpenDownload(id), window, cx)
+                            }))
                     })
                     .child(icon(Icon::File, 16., muted))
                     .child(
@@ -1112,12 +1202,13 @@ impl BrowserApp {
                                     .text_color(status_color),
                             ),
                     )
-                    .children(button.map(|(button_id, glyph, label, action)| {
+                    .children(button.map(|(button_id, glyph, label, action, part)| {
                         let button = press_only(
-                            icon_button(button_id, lit.is_some(), theme)
+                            icon_button(button_id, lit == Some(part), theme)
                                 .size(px(24.))
                                 .child(icon(glyph, 15., theme.icon())),
                         )
+                        .on_mouse_move(|_, _, cx| cx.stop_propagation())
                         .tooltip(Tooltip::build(label, "", theme, sidebar))
                         .on_click(cx.listener(
                             move |this, _: &ClickEvent, window, cx| {
@@ -1125,7 +1216,7 @@ impl BrowserApp {
                                 this.run_menu_action(action, window, cx)
                             },
                         ));
-                        highlights(button, target(0), cx)
+                        highlights(button, target(part), cx)
                     }))
                     .into_any_element()
             }
@@ -1142,7 +1233,14 @@ impl BrowserApp {
                     .flex_col()
                     .px(px(9.))
                     // The whole origin: the line keeps the end of a long host.
-                    .tooltip(Tooltip::build_wrapping(origin, "", theme, sidebar))
+                    .tooltip(Tooltip::build_wrapping(
+                        breakable(&origin),
+                        "",
+                        theme,
+                        sidebar,
+                    ))
+                    // Redraws as the pointer leaves, which hides the tooltip.
+                    .hover(|style| style)
                     .child(
                         div()
                             .flex()
@@ -1562,6 +1660,8 @@ impl BrowserApp {
         match action {
             Action::CancelDownload(id) => return self.cancel_download(id),
             Action::RetryDownload(id) => return self.retry_download(id, cx),
+            Action::RemoveDownload(id) => return self.remove_download(id, cx),
+            Action::ClearDownloads => return self.clear_downloads(cx),
             Action::ResetPermission(tab_id, permission) => {
                 return self.reset_site_permission(tab_id, permission, cx);
             }
@@ -1598,9 +1698,12 @@ impl BrowserApp {
             | Action::AskClearSiteData(_)
             | Action::Cancel => {}
             Action::DeleteSpace(id) => self.delete_space(id, window, cx),
+            Action::OpenDownload(id) => self.open_download(id),
             Action::RevealDownload(id) => self.reveal_download(id),
             Action::CancelDownload(_)
             | Action::RetryDownload(_)
+            | Action::RemoveDownload(_)
+            | Action::ClearDownloads
             | Action::ResetPermission(..)
             | Action::Zoom(_) => {}
             Action::MoveTab(id, space_id) => self.leave_tab(id, Leaving::Move(space_id), cx),
@@ -1783,6 +1886,53 @@ impl BrowserApp {
         }
     }
 
+    /// ⌫ in the library: the highlighted download leaves the list, if it
+    /// ended; the next one takes its place under the highlight.
+    fn remove_in_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = &self.menu else {
+            return;
+        };
+        let entries = self.menu_entries(menu.kind);
+        let removed = menu
+            .highlight
+            .and_then(|at| entries.get(at.entry))
+            .and_then(|entry| match entry {
+                Entry::Download { id, state, .. } if *state != DownloadState::Running => {
+                    Some(Action::RemoveDownload(*id))
+                }
+                _ => None,
+            });
+        if let Some(action) = removed {
+            self.run_menu_action(action, window, cx);
+        }
+    }
+
+    /// ⌥⌘L, History > Show Downloads and the command bar: the library, opened
+    /// from the keyboard with its first choice highlighted, so Return opens
+    /// the newest download. A hidden sidebar peeks while it is open; again
+    /// closes it.
+    pub(crate) fn show_downloads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .menu
+            .as_ref()
+            .is_some_and(|menu| menu.kind == MenuKind::Library)
+        {
+            return self.close_menu(window, cx);
+        }
+        // A page in fullscreen would cover it.
+        if self.fullscreen {
+            return;
+        }
+        if self.sidebar_width().is_none() {
+            self.sidebar_peek = true;
+            self.sync_traffic_lights();
+        }
+        let height = window.viewport_size().height;
+        let anchor = point(px(LIBRARY_ANCHOR.x), height - px(LIBRARY_ANCHOR.y));
+        self.open_menu(MenuKind::Library, anchor, window, cx);
+        self.step_menu(Step::First, cx);
+    }
+
     /// ⌘⌫ in a question: its red button, as in AppKit's alerts.
     fn choose_destructive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(menu) = &self.menu else {
@@ -1884,6 +2034,7 @@ pub(super) fn handle_menu_keys<E: InteractiveElement>(root: E, cx: &mut Context<
     .on_action(
         cx.listener(|this, _: &ChooseDestructive, window, cx| this.choose_destructive(window, cx)),
     )
+    .on_action(cx.listener(|this, _: &RemoveFromList, window, cx| this.remove_in_menu(window, cx)))
     .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| this.type_in_menu(event, cx)))
 }
 

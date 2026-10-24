@@ -13,10 +13,11 @@
 
 use super::{
     Tooltip, UI_FONT,
-    elide::{Cut, elided},
+    elide::{Cut, breakable, elided},
     icons::{Icon, icon},
     press_only, shadow, text_width,
     theme::Theme,
+    toast_window::ToastKind,
 };
 use crate::{
     app::BrowserApp,
@@ -26,7 +27,7 @@ use crate::{
 };
 use gpui::{
     Context, Div, Font, FontWeight, InteractiveElement, KeyDownEvent, ParentElement,
-    StatefulInteractiveElement, Styled, Window, div, font, px,
+    StatefulInteractiveElement, Styled, Window, div, font, prelude::FluentBuilder, px,
 };
 use std::collections::HashMap;
 
@@ -233,6 +234,8 @@ fn request_text(permissions: &[Permission]) -> String {
     format!("wants to {text}")
 }
 
+/// Each kind of request has a glyph of its own; none is the shield, which
+/// is Site Settings and ad blocking.
 pub fn permission_icon(permission: Permission) -> Icon {
     match permission {
         Permission::Camera => Icon::Camera,
@@ -243,18 +246,32 @@ pub fn permission_icon(permission: Permission) -> Icon {
         Permission::Location => Icon::MapPin,
         Permission::Notifications => Icon::Bell,
         Permission::Clipboard => Icon::Clipboard,
+        Permission::Midi => Icon::Music,
         Permission::Downloads => Icon::ArrowDown,
-        Permission::LocalNetwork | Permission::LoopbackNetwork => Icon::Globe,
+        Permission::StorageAccess => Icon::Cookie,
+        Permission::DiskQuota => Icon::HardDrive,
+        Permission::LocalFonts => Icon::Type,
+        Permission::IdleDetection => Icon::Timer,
+        Permission::PointerLock => Icon::Pointer,
+        Permission::KeyboardLock => Icon::Keyboard,
+        Permission::LocalNetwork => Icon::Network,
+        Permission::LoopbackNetwork => Icon::Laptop,
+        Permission::Sensors => Icon::Activity,
+        Permission::ProtectedMedia => Icon::Key,
         Permission::FileSystem => Icon::File,
         Permission::ProtocolHandler => Icon::Link,
-        _ => Icon::Shield,
+        Permission::AppInstallation => Icon::AppWindow,
+        Permission::IdentityProvider => Icon::SignIn,
+        Permission::VirtualReality | Permission::AugmentedReality => Icon::Glasses,
+        Permission::HandTracking => Icon::Hand,
+        Permission::Other => Icon::Question,
     }
 }
 
 fn request_icon(permissions: &[Permission]) -> Icon {
     permissions
         .first()
-        .map_or(Icon::Shield, |&permission| permission_icon(permission))
+        .map_or(Icon::Question, |&permission| permission_icon(permission))
 }
 
 /// How long an answer to `permissions` holds, in the space called `space`.
@@ -375,10 +392,20 @@ impl BrowserApp {
     }
 
     /// Dismisses every request of the tab on screen, for hiding the sidebar
-    /// they hold open: the sites can ask again.
+    /// they hold open (⌘S), and says so over the page: the sites can ask
+    /// again, which many do only as the page loads.
     pub(crate) fn dismiss_shown_permissions(&mut self, cx: &mut Context<Self>) {
+        let mut dismissed = false;
         while let Some(id) = self.permission_shown().map(|request| request.id) {
             self.answer_permission(id, PermissionDecision::Dismiss, cx);
+            dismissed = true;
+        }
+        if dismissed {
+            self.show_toast_kind(
+                ToastKind::Info,
+                "Request dismissed · reload the page to be asked again",
+                cx,
+            );
         }
     }
 
@@ -471,7 +498,7 @@ impl BrowserApp {
             .borrow_mut()
             .clear_site_data(space_id, tab_id, &site);
         let host = host_of(&site).unwrap_or(site);
-        self.show_toast(format!("Cleared data for {host}"), cx);
+        self.show_toast_about(ToastKind::Done, "Cleared data for ", &host, Cut::Start, cx);
     }
 
     /// "meet.google.com wants to use your camera and microphone", with
@@ -497,21 +524,29 @@ impl BrowserApp {
         let host_room = column - CLOSE_BUTTON;
         // A host too long for its line splits in two: as much of its start
         // as fits, cut from the left, above the domain that owns it
-        // ("attacker.example"), which is always shown whole.
+        // ("attacker.example"), which is always shown whole. A domain too
+        // long for the card's first line takes it.
         let bold = Font {
             weight: FontWeight::SEMIBOLD,
             ..font(UI_FONT)
         };
         let (first_line, domain) = match psl::domain_str(&host) {
-            Some(domain)
-                if domain.len() < host.len()
-                    && text_width(&host, bold, 13., window) > host_room =>
-            {
+            Some(domain) if text_width(&host, bold.clone(), 13., window) > host_room => {
                 let domain = domain.to_owned();
                 (host[..host.len() - domain.len()].to_owned(), Some(domain))
             }
             _ => (host, None),
         };
+        let (first_line, domain_room) = if first_line.is_empty() {
+            (None, host_room)
+        } else {
+            (Some(first_line), column)
+        };
+        let beside_close = first_line.is_none();
+        let domain = domain.map(|domain| {
+            domain_lines(domain, domain_room, &bold, window)
+                .when(beside_close, |lines| lines.mr(px(CLOSE_BUTTON)))
+        });
         let button = |label: &'static str, answer: PermissionDecision, index: isize| {
             let primary = answer == PermissionDecision::Allow;
             let (fill, hover) = if primary {
@@ -614,11 +649,15 @@ impl BrowserApp {
                                         .id("permission-host")
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(theme.title())
-                                        .tooltip(Tooltip::build_wrapping(origin, "", theme, width))
-                                        .child(
-                                            elided(first_line, Cut::Start, 17.)
-                                                .mr(px(CLOSE_BUTTON)),
-                                        )
+                                        .tooltip(Tooltip::build_wrapping(
+                                            breakable(&origin),
+                                            "",
+                                            theme,
+                                            width,
+                                        ))
+                                        .children(first_line.map(|first_line| {
+                                            elided(first_line, Cut::Start, 17.).mr(px(CLOSE_BUTTON))
+                                        }))
                                         .children(domain),
                                 )
                                 .child(
@@ -679,6 +718,29 @@ impl BrowserApp {
     }
 }
 
+/// The domain that owns a host, on lines `room` wide: whole on one line, a
+/// size smaller if need be, else broken between its labels (and at the
+/// hyphens of a label longer than a line), never at any other character,
+/// so it can't read as another domain.
+fn domain_lines(domain: String, room: f32, bold: &Font, window: &Window) -> Div {
+    for size in [13., 12., 11.] {
+        if text_width(&domain, bold.clone(), size, window) <= room {
+            return div().whitespace_nowrap().text_size(px(size)).child(domain);
+        }
+    }
+    let labels: Vec<String> = domain
+        .split_inclusive('.')
+        .map(|label| {
+            if text_width(label, bold.clone(), 13., window) > room {
+                label.replace('-', "-\u{200B}")
+            } else {
+                label.to_owned()
+            }
+        })
+        .collect();
+    div().child(labels.join("\u{200B}"))
+}
+
 fn decision(allow: bool) -> PermissionDecision {
     if allow {
         PermissionDecision::Allow
@@ -719,7 +781,7 @@ mod tests {
             "wants to use your camera, know your location and show notifications"
         );
         assert_eq!(request_icon(&[Location]), Icon::MapPin);
-        assert_eq!(request_icon(&[Other]), Icon::Shield);
+        assert_eq!(request_icon(&[Other]), Icon::Question);
     }
 
     #[test]
