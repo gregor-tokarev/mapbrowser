@@ -35,9 +35,16 @@ pub const MAX_SIDEBAR_WIDTH: f32 = 420.;
 /// Closes that ⇧⌘T and the library can undo, per space. Tabs closed
 /// together (Clear, Close Other Tabs) count as one.
 pub const REOPEN_LIMIT: usize = 20;
+/// Once a space's closed tabs number this many, its older closes go, so a
+/// few large Clears don't grow the session without end. The newest close
+/// stays whole, however many tabs it took.
+const CLOSED_TAB_LIMIT: usize = 100;
 /// Finished downloads the library keeps, also after a restart. Running
 /// ones are kept on top of these.
 pub const DOWNLOAD_LIMIT: usize = 20;
+/// The longest download address kept for downloading again. Signed links
+/// to files run long; longer ones carry their data rather than name it.
+const MAX_DOWNLOAD_URL_LEN: usize = 8 * 1024;
 
 /// The sidebar section a tab belongs to. Variants are declared in sidebar
 /// order, so sorting by `Pin` groups favorites, pinned tabs, then Today.
@@ -1135,19 +1142,24 @@ impl BrowserState {
     }
 
     /// Keeps each space's `REOPEN_LIMIT` most recent closes, so one space
-    /// never pushes another's out. Tabs closed together count once, and
-    /// stay or go together.
+    /// never pushes another's out, and of those only as many as keep it
+    /// near `CLOSED_TAB_LIMIT` tabs. Tabs closed together count once, and
+    /// stay or go together; the newest close always stays.
     fn trim_closed(&mut self) {
-        let mut closes: HashMap<SpaceId, usize> = HashMap::new();
+        // Per space: the closes seen, the tabs kept, and whether the close
+        // being looked at is kept.
+        let mut spaces: HashMap<SpaceId, (usize, usize, bool)> = HashMap::new();
         let mut newer_batch = None;
         let mut keep = Vec::with_capacity(self.closed.len());
         for closed in self.closed.iter().rev() {
-            let count = closes.entry(closed.space_id).or_default();
+            let (closes, tabs, kept) = spaces.entry(closed.space_id).or_default();
             if closed.batch.is_none() || closed.batch != newer_batch {
-                *count += 1;
+                *closes += 1;
+                *kept = *closes == 1 || (*closes <= REOPEN_LIMIT && *tabs < CLOSED_TAB_LIMIT);
             }
             newer_batch = closed.batch;
-            keep.push(*count <= REOPEN_LIMIT);
+            *tabs += usize::from(*kept);
+            keep.push(*kept);
         }
         let mut keep = keep.into_iter().rev();
         self.closed.retain(|_| keep.next().unwrap_or(false));
@@ -1328,7 +1340,7 @@ impl BrowserState {
                 download.state = DownloadState::Failed;
                 download.error = Some("Interrupted".into());
             }
-            download.url = display_url(&download.url);
+            download.url = download_source(&download.url);
         }
         trim_downloads(&mut self.downloads);
         Ok(())
@@ -1515,6 +1527,21 @@ fn write_barrier(file: &File) -> io::Result<()> {
 /// written so far from the drive's cache to permanent storage.
 fn flush_drive(directory: &Path) -> io::Result<()> {
     File::open(directory)?.sync_all()
+}
+
+/// Where a download came from, as kept for downloading it again: a web
+/// address without credentials, or nothing. data: addresses can be
+/// megabytes long and blob: ones end with their page, so neither is kept,
+/// and nothing offers to download them again.
+pub fn download_source(url: &str) -> String {
+    let web = url.split_once("://").is_some_and(|(scheme, _)| {
+        matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https")
+    });
+    if web && url.len() <= MAX_DOWNLOAD_URL_LEN {
+        display_url(url)
+    } else {
+        String::new()
+    }
 }
 
 /// Remove authority credentials from the URL kept in tabs, the address bar and disk.

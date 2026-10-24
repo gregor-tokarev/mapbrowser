@@ -4,9 +4,11 @@
 //! progress, navigation buttons, closing) behave as they do on macOS.
 //!
 //! Addresses containing "download-demo" download a file instead (one with
-//! "fail" fails halfway), and pages whose address contains
+//! "fail" fails halfway, one with "blob" comes from a blob: address, as a
+//! file a page makes does), and pages whose address contains
 //! "permission-demo" ask to use the camera and microphone ("location",
-//! "notifications", "fonts", "windows", "network" or "midi" in the address
+//! "notifications", "fonts", "windows", "network", "midi", "sensors",
+//! "idle", "keyboard", "pointer", "storage" or "install" in the address
 //! ask for those). On pages whose address contains "status-demo" the
 //! pointer rests on a long link.
 //!
@@ -901,6 +903,14 @@ impl Engine {
             downloads.insert(id, path.clone());
             path
         };
+        // A file the page made (a canvas export, a generated report)
+        // comes from a blob: address that ends with the page.
+        let source = match Url::parse(url) {
+            Ok(parsed) if url.contains("blob") => {
+                format!("blob:{}/{id}", parsed.origin().ascii_serialization())
+            }
+            _ => url.to_owned(),
+        };
         self.send(EngineEvent::DownloadStarted {
             id,
             tab_id,
@@ -908,7 +918,7 @@ impl Engine {
                 .file_name()
                 .map_or(name, |name| name.to_string_lossy().into_owned()),
             path,
-            url: url.to_owned(),
+            url: source,
             blank_tab,
         });
         let (events, fails, downloads) = (
@@ -969,6 +979,12 @@ impl Engine {
             ("windows", Permission::WindowManagement),
             ("network", Permission::LocalNetwork),
             ("midi", Permission::Midi),
+            ("sensors", Permission::Sensors),
+            ("idle", Permission::IdleDetection),
+            ("keyboard", Permission::KeyboardLock),
+            ("pointer", Permission::PointerLock),
+            ("storage", Permission::StorageAccess),
+            ("install", Permission::AppInstallation),
         ]
         .into_iter()
         .find(|(word, _)| url.contains(word))

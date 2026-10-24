@@ -99,6 +99,7 @@ const COLUMNS: [&[Group]; 2] = [
             title: "Map Browser",
             rows: &[
                 ("Search the history", &["⌘Y"]),
+                ("Show downloads", &["⌥⌘L"]),
                 ("Settings", &["⌘,"]),
                 ("Hide Map Browser", &["⌘H"]),
                 ("Hide the other apps", &["⌥⌘H"]),
@@ -135,6 +136,7 @@ const COLUMNS: [&[Group]; 2] = [
                 ("Jump to an item by its name", &["A–Z"]),
                 ("Choose", &["Return"]),
                 ("Delete, when asked", &["⌘⌫"]),
+                ("Remove a download from the list", &["⌫"]),
                 ("Close a menu or the command bar", &["Esc"]),
             ],
         },

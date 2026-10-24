@@ -27,6 +27,9 @@ mod native {
     /// Previews have no Finder.
     pub fn reveal_in_finder(_path: &std::path::Path) {}
 
+    /// Previews open no other apps.
+    pub fn open_file(_path: &std::path::Path) {}
+
     /// Previews have no default browser to be.
     pub fn is_default_browser() -> bool {
         false
@@ -68,7 +71,8 @@ actions!(
         SetDefaultBrowser,
         ShowShortcuts,
         ShowHistory,
-        ClearHistory
+        ClearHistory,
+        ShowDownloads
     ]
 );
 
@@ -99,6 +103,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         // the menu bar.
         KeyBinding::new("cmd-,", Settings, None),
         KeyBinding::new("cmd-y", ShowHistory, None),
+        KeyBinding::new("alt-cmd-l", ShowDownloads, None),
         KeyBinding::new("escape", Dismiss, Some("Browser")),
         KeyBinding::new("cmd-t", Browse(CommandBar), None),
         KeyBinding::new("cmd-l", Browse(EditAddress), None),
@@ -279,6 +284,7 @@ pub fn menus(state: &MenuBarState) -> Vec<Menu> {
             "History",
             vec![
                 MenuItem::action("Show All History", ShowHistory),
+                MenuItem::action("Show Downloads", ShowDownloads),
                 MenuItem::action("Reopen Closed Tab", Browse(ReopenClosedTab)),
                 MenuItem::separator(),
                 MenuItem::action("Clear History…", ClearHistory),
@@ -448,6 +454,12 @@ fn main() -> anyhow::Result<()> {
                 let _ = window.update(cx, |app, window, cx| {
                     app.toggle_command_bar(CommandMode::Settings, window, cx)
                 });
+            })
+        });
+        // The library, which lists them, opened from the keyboard.
+        cx.on_action(move |_: &ShowDownloads, cx| {
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |app, window, cx| app.show_downloads(window, cx));
             })
         });
         cx.on_action(move |_: &ClearHistory, cx| {

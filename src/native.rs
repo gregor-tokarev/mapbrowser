@@ -474,6 +474,14 @@ pub fn reveal_in_finder(path: &std::path::Path) {
         .activateFileViewerSelectingURLs(&NSArray::from_retained_slice(&[url]));
 }
 
+/// Opens `path` with its default app, as a double click in Finder does.
+/// Downloads carry the quarantine flag (`LSFileQuarantineEnabled`), so
+/// macOS checks an app or installer before it first runs.
+pub fn open_file(path: &std::path::Path) {
+    let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+    NSWorkspace::sharedWorkspace().openURL(&url);
+}
+
 /// Window > Bring All to Front.
 pub fn bring_all_to_front() {
     if let Some(mtm) = MainThreadMarker::new() {

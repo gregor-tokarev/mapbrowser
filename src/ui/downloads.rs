@@ -6,16 +6,17 @@
 //! reports progress.
 
 use super::{
+    elide::Cut,
     icons::{Icon, icon},
     menu::MenuKind,
     shadow,
     theme::Theme,
-    toast_window::ToastKind,
+    toast_window::{Subject, ToastKind},
 };
 use crate::{
     app::BrowserApp,
     engine::{DownloadEnd, page::elide_middle},
-    model::{DOWNLOAD_LIMIT, Pin, SavedDownload, SpaceId, TabId, display_url},
+    model::{DOWNLOAD_LIMIT, Pin, SavedDownload, SpaceId, TabId, download_source},
     native,
 };
 use gpui::{
@@ -38,8 +39,8 @@ const RING_WIDTH: f32 = 1.75;
 /// Without a size, the ring shows a quarter arc that steps on by an
 /// eighth of a turn for every this many bytes.
 const UNKNOWN_SIZE_STEP: u64 = 256 * 1024;
-/// File names in questions and toasts keep this many characters at most,
-/// their end included.
+/// File names in the question before quitting keep this many characters
+/// at most, their end included. Toasts cut them to the room they have.
 const NAME_CHARS: usize = 40;
 
 pub struct Download {
@@ -198,9 +199,10 @@ impl Downloads {
         true
     }
 
-    /// Ends a running download; `None` if it wasn't running (a cancel that
-    /// crossed its last step).
-    pub fn finish(&mut self, id: u64, end: &DownloadEnd) -> Option<&Download> {
+    /// Ends a running download: its name and the tab whose browser it
+    /// kept, read before the list is trimmed, which may drop it. `None` if
+    /// it wasn't running (a cancel that crossed its last step).
+    pub fn finish(&mut self, id: u64, end: &DownloadEnd) -> Option<(SharedString, Option<TabId>)> {
         let download = self
             .get_mut(id)
             .filter(|download| download.state == DownloadState::Running)?;
@@ -216,11 +218,12 @@ impl Downloads {
                 download.error = reason.map(str::to_owned);
             }
         }
+        let ended = (download.name.clone(), download.tab_id);
         if download.state == DownloadState::Failed {
             self.failure_unseen = true;
         }
         self.trim();
-        self.get(id)
+        Some(ended)
     }
 
     /// Keeps every running download and the `DOWNLOAD_LIMIT` newest others.
@@ -239,9 +242,28 @@ impl Downloads {
         self.items.iter().find(|download| download.id == id)
     }
 
-    fn remove(&mut self, id: u64) -> Option<Download> {
-        let index = self.items.iter().position(|download| download.id == id)?;
-        Some(self.items.remove(index))
+    /// Takes a download off the list; one still running stays.
+    fn remove(&mut self, id: u64) -> bool {
+        let before = self.items.len();
+        self.items
+            .retain(|download| download.id != id || download.state == DownloadState::Running);
+        self.items.len() != before
+    }
+
+    /// Takes every download that ended off the list. True if any did.
+    fn clear_finished(&mut self) -> bool {
+        let before = self.items.len();
+        self.items
+            .retain(|download| download.state == DownloadState::Running);
+        self.items.len() != before
+    }
+
+    /// Whether the list has downloads that ended, which Clear Downloads
+    /// takes off it.
+    pub fn any_finished(&self) -> bool {
+        self.items
+            .iter()
+            .any(|download| download.state != DownloadState::Running)
     }
 
     /// Whether a download started in the tab still runs: the tab's
@@ -307,22 +329,27 @@ impl Downloads {
     }
 
     /// The ring as one line, for showing over the page while the sidebar
-    /// is hidden: "Downloading report.pdf — 35%".
-    fn summary(&self) -> Option<String> {
+    /// is hidden: "Downloading report.pdf — 35%", and the name, which is
+    /// cut to the room there is. The percentage is padded to the width of
+    /// "100%", so the line keeps its width as it counts up.
+    fn summary(&self) -> Option<(String, Subject)> {
         let mut running = self.running();
         let first = running.next()?;
         let count = 1 + running.count();
         let what = if count == 1 {
-            elide_middle(&first.name, NAME_CHARS)
+            first.name.to_string()
         } else {
             format!("{count} files")
         };
         let ring = self.ring()?;
-        Some(if ring.start == 0. {
-            format!("Downloading {what} — {}%", (ring.length * 100.).round())
+        let tail = if ring.start == 0. {
+            // U+2007, a space as wide as a figure.
+            let percent = format!("{}%", (ring.length * 100.).round());
+            format!(" — {percent:\u{2007}<4}")
         } else {
-            format!("Downloading {what}…")
-        })
+            "…".to_owned()
+        };
+        Some(Subject::compose("Downloading ", &what, &tail, Cut::Middle))
     }
 }
 
@@ -359,7 +386,7 @@ impl BrowserApp {
     ) {
         let space_id = self.state.space_of_tab(tab_id);
         self.downloads
-            .start(id, tab_id, space_id, name, path, display_url(&url));
+            .start(id, tab_id, space_id, name, path, download_source(&url));
         // A link that opened a new tab for a file leaves it blank: close it
         // (it isn't worth reopening) and go back to the page with the link,
         // in its own space: the window stays in the space on screen. Its
@@ -413,11 +440,11 @@ impl BrowserApp {
     }
 
     pub(crate) fn download_finished(&mut self, id: u64, end: DownloadEnd, cx: &mut Context<Self>) {
-        let Some(download) = self.downloads.finish(id, &end) else {
+        let Some((name, tab_id)) = self.downloads.finish(id, &end) else {
             return;
         };
-        let (name, tab_id) = (elide_middle(&download.name, NAME_CHARS), download.tab_id);
-        // A tab closed or unloaded during the download kept its browser.
+        // A tab closed or unloaded during the download kept its browser,
+        // also when the download itself just left the list.
         if let Some(tab_id) = tab_id
             && !self.downloads.running_in(tab_id)
             && !self.is_loaded(tab_id)
@@ -435,10 +462,16 @@ impl BrowserApp {
         }
         self.save_downloads(cx);
         match end {
-            DownloadEnd::Complete { .. } => self.show_toast(format!("Downloaded {name}"), cx),
-            DownloadEnd::Failed { .. } => {
-                self.show_toast_kind(ToastKind::Failed, format!("Couldn't download {name}"), cx)
+            DownloadEnd::Complete { .. } => {
+                self.show_toast_about(ToastKind::Done, "Downloaded ", &name, Cut::Middle, cx)
             }
+            DownloadEnd::Failed { .. } => self.show_toast_about(
+                ToastKind::Failed,
+                "Couldn't download ",
+                &name,
+                Cut::Middle,
+                cx,
+            ),
             // Cancelled from the library, which shows it.
             DownloadEnd::Cancelled => self.downloads_changed(cx),
         }
@@ -555,15 +588,44 @@ impl BrowserApp {
         }
     }
 
+    /// Opens a finished download with its app, as a double click in Finder
+    /// does; macOS checks a downloaded app before it runs.
+    pub fn open_download(&self, id: u64) {
+        if let Some(download) = self.downloads.get(id) {
+            native::open_file(&download.path);
+        }
+    }
+
+    /// Takes a download that ended off the library's list; the file stays.
+    pub fn remove_download(&mut self, id: u64, cx: &mut Context<Self>) {
+        if self.downloads.remove(id) {
+            self.save_downloads(cx);
+            cx.notify();
+        }
+    }
+
+    /// Clear Downloads, and Clear History: takes every download that ended
+    /// off the list, with the address it came from. Files stay where they
+    /// are, and running downloads go on.
+    pub fn clear_downloads(&mut self, cx: &mut Context<Self>) {
+        if self.downloads.clear_finished() {
+            self.downloads.failure_unseen = false;
+            self.save_downloads(cx);
+            cx.notify();
+        }
+    }
+
     /// The library is opening.
     pub(crate) fn library_opened(&mut self) {
         self.downloads.library_opened();
     }
 
     /// Running downloads as a line over the page, while the hidden sidebar
-    /// can't show their ring.
-    pub(crate) fn downloads_over_card(&self) -> Option<SharedString> {
-        self.downloads.summary().map(SharedString::from)
+    /// can't show their ring, and the file name in it, which may be cut.
+    pub(crate) fn downloads_over_card(&self) -> Option<(SharedString, Subject)> {
+        self.downloads
+            .summary()
+            .map(|(text, subject)| (text.into(), subject))
     }
 
     /// The progress ring over the library button while files download, or

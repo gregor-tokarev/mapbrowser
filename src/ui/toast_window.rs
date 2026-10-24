@@ -1,7 +1,10 @@
 //! Toasts: short messages ("Copied URL", "Zoom 110%", "Downloaded …") above
 //! the sidebar's bottom bar, with a mark for what they report: ✓ done,
-//! ✕ failed, · for news. Long ones lose their middle, so a file's extension
-//! and a host's domain stay, and stay up a little longer.
+//! ✕ failed, · for news. A long one keeps the words that say what
+//! happened: in the sidebar the host or file name it names moves to a
+//! second line, over the page it is cut in place, a host from its start
+//! and a file name in its middle (other text loses its middle). Long ones
+//! stay up a little longer.
 //!
 //! While the sidebar is hidden (⌘S) the toast shows over the page card's
 //! bottom-left corner, as Arc shows toasts over the page then, above the
@@ -28,7 +31,7 @@ use gpui::{
     Styled, Task, Window, WindowHandle, WindowOptions, div, font, point, prelude::FluentBuilder,
     px, size,
 };
-use std::{rc::Rc, time::Duration};
+use std::{ops::Range, rc::Rc, time::Duration};
 
 /// The toast's distance from the card's left and bottom edges.
 const INSET: f32 = 10.;
@@ -61,18 +64,41 @@ pub enum ToastKind {
     Info,
 }
 
+/// The part of a toast's text that may lose characters to fit: a host its
+/// start, a file name its middle (`cut`). The words around it say what
+/// happened ("Ad blocking off for", "Couldn't download") and always show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Subject {
+    range: Range<usize>,
+    cut: Cut,
+}
+
+impl Subject {
+    /// `lead`, `subject` and `tail` as one text, with `subject` the part
+    /// that is cut.
+    pub fn compose(lead: &str, subject: &str, tail: &str, cut: Cut) -> (String, Subject) {
+        let range = lead.len()..lead.len() + subject.len();
+        (format!("{lead}{subject}{tail}"), Subject { range, cut })
+    }
+}
+
 pub struct Toast {
     pub kind: ToastKind,
     pub text: SharedString,
+    subject: Option<Subject>,
     /// Says how to undo what was done ("Closed 3 tabs · ⇧⌘T reopens
     /// them"): the sidebar wraps it to two lines rather than cut the hint.
     undo: bool,
     /// A button after the text, such as Open on "Pop-up blocked".
     action: Option<ToastAction>,
-    /// The text as the sidebar shows it, elided to fit `.0` points.
-    fitted: Option<(f32, SharedString)>,
+    /// The text as the sidebar shows it, fitted to `.0` points.
+    fitted: Option<(f32, Lines)>,
     _timer: Task<()>,
 }
+
+/// A toast's text in the sidebar: one line, or, too long for one, what
+/// happened on the first and its subject, cut to fit, on the second.
+type Lines = (SharedString, Option<SharedString>);
 
 /// A toast's button: its label, and what it does.
 pub struct ToastAction {
@@ -81,11 +107,11 @@ pub struct ToastAction {
 }
 
 impl Toast {
-    /// The sidebar's text: elided once the sidebar has measured it.
-    fn shown(&self) -> SharedString {
+    /// The sidebar's text: fitted once the sidebar has measured it.
+    fn shown(&self) -> Lines {
         self.fitted
             .as_ref()
-            .map_or_else(|| self.text.clone(), |(_, text)| text.clone())
+            .map_or_else(|| (self.text.clone(), None), |(_, lines)| lines.clone())
     }
 }
 
@@ -126,9 +152,40 @@ fn text_width(text: &str, window: &Window) -> f32 {
     super::text_width(text, medium, FONT_SIZE, window)
 }
 
-/// `text`, elided in the middle to fit `room` points.
-fn fit(text: &str, room: f32, window: &Window) -> SharedString {
-    elide::fit(text, room, Cut::Middle, |text| text_width(text, window)).into()
+/// `text`, cut to fit `room` points: only its subject, if it has one and
+/// the words around it fit, else in the middle.
+fn fit(text: &str, subject: Option<&Subject>, room: f32, window: &Window) -> SharedString {
+    let width = |text: &str| text_width(text, window);
+    if let Some(Subject { range, cut }) = subject
+        && let (Some(lead), Some(part), Some(tail)) = (
+            text.get(..range.start),
+            text.get(range.clone()),
+            text.get(range.end..),
+        )
+    {
+        let around = width(lead) + width(tail);
+        if around < room {
+            let part = elide::fit(part, room - around, *cut, width);
+            return format!("{lead}{part}{tail}").into();
+        }
+    }
+    elide::fit(text, room, Cut::Middle, width).into()
+}
+
+/// `text` as the sidebar shows it in `room` points: on one line if it fits,
+/// else, if it has a subject, the words before it on one line and the
+/// subject on the next, cut only if it must be.
+fn fit_lines(text: &str, subject: Option<&Subject>, room: f32, window: &Window) -> Lines {
+    let width = |text: &str| text_width(text, window);
+    if width(text) > room
+        && let Some(Subject { range, cut }) = subject
+        && let (Some(lead), Some(rest)) = (text.get(..range.start), text.get(range.start..))
+        && width(lead.trim_end()) <= room
+    {
+        let rest = elide::fit(rest, room, *cut, width);
+        return (lead.trim_end().to_owned().into(), Some(rest.into()));
+    }
+    (fit(text, subject, room, window), None)
 }
 
 pub struct ToastView {
@@ -172,8 +229,9 @@ impl Render for ToastView {
     }
 }
 
-/// What the toast window shows: a toast, or the failed save's notice.
-type Shown = (ToastKind, SharedString);
+/// What the toast window shows: a toast, or the failed save's notice, and
+/// the part of its text that may be cut.
+type Shown = (ToastKind, SharedString, Option<Subject>);
 
 pub struct ToastWindow {
     handle: WindowHandle<ToastView>,
@@ -215,13 +273,37 @@ impl BrowserApp {
     ) {
         let text = text.into();
         let duration = toast_duration(kind, &text);
-        self.set_toast(kind, text, duration, false, None, cx);
+        self.set_toast(kind, text, None, duration, false, None, cx);
+    }
+
+    /// Shows a toast of `kind` saying `lead` and then `subject`, a host or
+    /// a file name: only the subject is cut to fit, as `cut` says, so the
+    /// words that say what happened always show.
+    pub fn show_toast_about(
+        &mut self,
+        kind: ToastKind,
+        lead: &str,
+        subject: &str,
+        cut: Cut,
+        cx: &mut Context<Self>,
+    ) {
+        let (text, subject) = Subject::compose(lead, subject, "", cut);
+        let duration = toast_duration(kind, &text);
+        self.set_toast(kind, text.into(), Some(subject), duration, false, None, cx);
     }
 
     /// Shows a ✓ toast that says how to undo what was done, for
     /// `UNDO_DURATION`.
     pub fn show_undo_toast(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.set_toast(ToastKind::Done, text.into(), UNDO_DURATION, true, None, cx);
+        self.set_toast(
+            ToastKind::Done,
+            text.into(),
+            None,
+            UNDO_DURATION,
+            true,
+            None,
+            cx,
+        );
     }
 
     /// Shows a toast with a button `label` that runs `run`, for
@@ -240,13 +322,22 @@ impl BrowserApp {
             label: label.into(),
             run: Rc::new(run),
         };
-        self.set_toast(kind, text.into(), UNDO_DURATION, false, Some(action), cx);
+        self.set_toast(
+            kind,
+            text.into(),
+            None,
+            UNDO_DURATION,
+            false,
+            Some(action),
+            cx,
+        );
     }
 
     fn set_toast(
         &mut self,
         kind: ToastKind,
         text: SharedString,
+        subject: Option<Subject>,
         duration: Duration,
         undo: bool,
         action: Option<ToastAction>,
@@ -262,6 +353,7 @@ impl BrowserApp {
         self.toast = Some(Toast {
             kind,
             text,
+            subject,
             undo,
             action,
             fitted: None,
@@ -276,6 +368,7 @@ impl BrowserApp {
         Some((
             ToastKind::Failed,
             format!("Can't save your tabs: {reason}").into(),
+            None,
         ))
     }
 
@@ -295,7 +388,8 @@ impl BrowserApp {
                 .as_ref()
                 .is_none_or(|(fitted, _)| *fitted != room)
         {
-            toast.fitted = Some((room, fit(&toast.text, room, window)));
+            let lines = fit_lines(&toast.text, toast.subject.as_ref(), room, window);
+            toast.fitted = Some((room, lines));
         }
     }
 
@@ -334,7 +428,14 @@ impl BrowserApp {
                         .text_ellipsis()
                         .child(toast.text.clone())
                 } else {
-                    truncated(toast.shown()).min_w_0()
+                    match toast.shown() {
+                        (line, None) => truncated(line).min_w_0(),
+                        (lead, Some(subject)) => div()
+                            .min_w_0()
+                            .line_height(px(16.))
+                            .child(truncated(lead))
+                            .child(truncated(subject)),
+                    }
                 })
                 .when_some(toast.action.as_ref(), |row, action| {
                     let (run, control_hover) = (action.run.clone(), theme.control_hover());
@@ -404,11 +505,11 @@ impl BrowserApp {
         }
         self.toast
             .as_ref()
-            .map(|toast| (toast.kind, toast.text.clone()))
+            .map(|toast| (toast.kind, toast.text.clone(), toast.subject.clone()))
             .or_else(|| self.save_notice())
             .or_else(|| {
                 self.downloads_over_card()
-                    .map(|text| (ToastKind::Info, text))
+                    .map(|(text, subject)| (ToastKind::Info, text, Some(subject)))
             })
     }
 
@@ -436,13 +537,14 @@ impl BrowserApp {
     }
 
     fn update_toast_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((kind, text)) = self.toast_over_card() else {
+        let Some(shown) = self.toast_over_card() else {
             return self.close_toast_window(cx);
         };
         let card = self.card_bounds(window.viewport_size());
         let lifted = self.link_status_shown();
         let fitted = fit(
-            &text,
+            &shown.1,
+            shown.2.as_ref(),
             f32::from(card.size.width) - 2. * INSET - CHROME_WIDTH,
             window,
         );
@@ -455,11 +557,12 @@ impl BrowserApp {
             self.close_toast_window(cx);
         }
         let Some(open) = &mut self.toast_window else {
-            return self.open_toast_window((kind, text), fitted, card, lifted, window, cx);
+            return self.open_toast_window(shown, fitted, card, lifted, window, cx);
         };
-        if open.shown != (kind, text.clone()) {
+        if open.shown != shown {
             let size = window_size(&fitted, card, window);
-            open.shown = (kind, text);
+            let kind = shown.0;
+            open.shown = shown;
             let _ = open.handle.update(cx, |toast, window, cx| {
                 toast.kind = kind;
                 toast.text = fitted;

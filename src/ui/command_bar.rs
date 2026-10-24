@@ -130,6 +130,8 @@ pub enum Command {
     /// What a browser shortcut does: close the tab, find, zoom, print.
     Shortcut(Shortcut),
     ShowHistory,
+    /// The library, with its downloads, as ⌥⌘L opens it.
+    ShowDownloads,
     ClearHistory,
     ShowSettings,
     SearchWith(SearchEngine),
@@ -914,6 +916,15 @@ fn actions(context: &CommandContext) -> Vec<(CommandItem, &'static str)> {
             "⌘Y",
         ),
         "visited pages",
+    ));
+    actions.push((
+        action(
+            Command::ShowDownloads,
+            "Show Downloads",
+            Icon::ArrowDown,
+            "⌥⌘L",
+        ),
+        "library files",
     ));
     actions.push((clear_history_action(), "delete forget"));
     for engine in SearchEngine::ALL {

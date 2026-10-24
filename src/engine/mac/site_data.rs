@@ -1,8 +1,10 @@
 //! "Clear Site Data" from the site menu: a site's cookies and storage in
-//! one space's profile. Cookies go through the profile's cookie manager;
-//! local storage, IndexedDB, caches and service workers through DevTools'
-//! Storage.clearDataForOrigin on the tab's browser, which needs no DevTools
-//! window. The page reloads once the storage is gone.
+//! one space's profile. Cookies go through the profile's cookie manager:
+//! the host's own, and the Domain= cookies its parent domains send it
+//! (".google.com", often the sign-in), which deleting by address leaves.
+//! Local storage, IndexedDB, caches and service workers go through
+//! DevTools' Storage.clearDataForOrigin on the tab's browser, which needs
+//! no DevTools window. The page reloads once the storage is gone.
 
 use super::Engine;
 use cef::*;
@@ -25,7 +27,15 @@ impl Engine {
         };
         let url = CefString::from(origin);
         if let Some(cookies) = context.cookie_manager(None) {
+            // Host cookies on any path. CEF deletes by the address's host
+            // only, so Domain= cookies are visited and deleted one by one.
             cookies.delete_cookies(Some(&url), None, None);
+            if let Some(host) = gpui::http_client::Url::parse(origin)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            {
+                cookies.visit_all_cookies(Some(&mut DomainCookies::new(host)));
+            }
         }
         let Some(browser) = self.live_browser(tab_id).cloned() else {
             return;
@@ -57,6 +67,35 @@ impl Engine {
             message_id: Some(message_id),
             registration,
         };
+    }
+}
+
+/// Whether a cookie of `domain` is a Domain= cookie sent to `host`: one
+/// set for the host or a domain above it, which Chromium keeps with a
+/// leading dot (".example.com"). Host cookies have none.
+fn domain_cookie_of(domain: &str, host: &str) -> bool {
+    let Some(domain) = domain.strip_prefix('.') else {
+        return false;
+    };
+    let domain = domain.to_ascii_lowercase();
+    host == domain
+        || host
+            .strip_suffix(domain.as_str())
+            .is_some_and(|sub| sub.ends_with('.'))
+}
+
+wrap_cookie_visitor! {
+    struct DomainCookies { host: String }
+    impl CookieVisitor {
+        fn visit(&self, cookie: Option<&Cookie>, _count: i32, _total: i32, delete_cookie: Option<&mut i32>) -> i32 {
+            if let (Some(cookie), Some(delete)) = (cookie, delete_cookie)
+                && domain_cookie_of(&cookie.domain.to_string(), &self.host)
+            {
+                *delete = 1;
+            }
+            // On to the next cookie.
+            1
+        }
     }
 }
 

@@ -53,9 +53,10 @@ const _: () = {
     assert!(Prompt::CEF_PERMISSION_TYPE_SENSORS as u32 == 1 << 28);
 };
 
-/// The content settings the site menu lists and resets. Each one asks by
-/// default, so an Allow or Block found for a site is an answer someone
-/// gave; settings that allow by default (sensors) would list every site.
+/// The content settings the site menu lists. Each one asks by default, so
+/// an Allow or Block found for a site is an answer someone gave; settings
+/// that allow by default (sensors) would list every site.
+/// `reset_settings` names every setting Reset clears.
 const SITE_SETTINGS: [(ContentSettingTypes, Permission); 10] = [
     (ContentSettingTypes::MEDIASTREAM_CAMERA, Permission::Camera),
     (ContentSettingTypes::MEDIASTREAM_MIC, Permission::Microphone),
@@ -115,7 +116,7 @@ impl Engine {
             return;
         };
         let url = CefString::from(origin);
-        for &(kind, _) in SITE_SETTINGS.iter().filter(|(_, kept)| *kept == permission) {
+        for &kind in reset_settings(permission) {
             context.set_content_setting(
                 Some(&url),
                 Some(&url),
@@ -123,6 +124,47 @@ impl Engine {
                 ContentSettingValues::DEFAULT,
             );
         }
+    }
+}
+
+/// Every content setting Chromium keeps an answer to `permission` in, for
+/// Reset: the menu lists answers this session gave to any prompt, not only
+/// `SITE_SETTINGS`. Each is the setting Chromium decides a prompt of that
+/// kind by, so it is one this Chromium knows; setting one it doesn't
+/// know would crash it.
+fn reset_settings(permission: Permission) -> &'static [ContentSettingTypes] {
+    use ContentSettingTypes as Kind;
+    match permission {
+        // getUserMedia, and moving the camera.
+        Permission::Camera => &[Kind::MEDIASTREAM_CAMERA, Kind::CAMERA_PAN_TILT_ZOOM],
+        Permission::Microphone => &[Kind::MEDIASTREAM_MIC],
+        Permission::CapturedSurfaceControl => &[Kind::CAPTURED_SURFACE_CONTROL],
+        Permission::Location => &[Kind::GEOLOCATION],
+        Permission::Notifications => &[Kind::NOTIFICATIONS],
+        Permission::Clipboard => &[Kind::CLIPBOARD_READ_WRITE],
+        Permission::Midi => &[Kind::MIDI_SYSEX, Kind::MIDI],
+        Permission::Downloads => &[Kind::AUTOMATIC_DOWNLOADS],
+        Permission::StorageAccess => &[Kind::STORAGE_ACCESS, Kind::TOP_LEVEL_STORAGE_ACCESS],
+        Permission::LocalFonts => &[Kind::LOCAL_FONTS],
+        Permission::WindowManagement => &[Kind::WINDOW_MANAGEMENT],
+        Permission::IdleDetection => &[Kind::IDLE_DETECTION],
+        Permission::PointerLock => &[Kind::POINTER_LOCK],
+        Permission::KeyboardLock => &[Kind::KEYBOARD_LOCK],
+        Permission::LocalNetwork => &[Kind::LOCAL_NETWORK],
+        Permission::LoopbackNetwork => &[Kind::LOOPBACK_NETWORK],
+        Permission::Sensors => &[Kind::SENSORS],
+        Permission::FileSystem => &[Kind::FILE_SYSTEM_WRITE_GUARD],
+        Permission::AppInstallation => &[Kind::WEB_APP_INSTALLATION],
+        Permission::VirtualReality => &[Kind::VR],
+        Permission::AugmentedReality => &[Kind::AR],
+        Permission::HandTracking => &[Kind::HAND_TRACKING],
+        // Asked every time, or not kept as a content setting.
+        Permission::Screen
+        | Permission::DiskQuota
+        | Permission::ProtectedMedia
+        | Permission::ProtocolHandler
+        | Permission::IdentityProvider
+        | Permission::Other => &[],
     }
 }
 
