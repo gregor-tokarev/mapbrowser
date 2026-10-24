@@ -1652,6 +1652,14 @@ const LOCAL_SUFFIXES: &[&str] = &[
     ".localdomain",
 ];
 
+/// Whether `host` (lowercase, without a trailing dot) only means something
+/// on the local network: a single label such as "router", or a name under
+/// one of the local suffixes. No HSTS preload list can hold such names.
+pub fn is_local_network_name(host: &str) -> bool {
+    !host.is_empty()
+        && (!host.contains('.') || LOCAL_SUFFIXES.iter().any(|suffix| host.ends_with(suffix)))
+}
+
 /// The URL that trimmed, non-empty text names, or `None` for a search query.
 fn web_address(input: &str) -> Option<String> {
     // A file's path, as Finder's Copy as Pathname gives it, opens the file,

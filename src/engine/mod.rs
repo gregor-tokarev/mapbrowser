@@ -361,9 +361,11 @@ pub fn certificate_error_overridable(code: i32) -> bool {
 /// error `code`. Chrome refuses whenever the host uses HSTS or is pinned,
 /// which CEF 152 doesn't tell its handler (`OnCertificateError` gets no
 /// `strict_enforcement`, and `CefSSLInfo` only the certificate's status), so
-/// only hosts that can never be either may continue: IP addresses, whose
-/// HSTS headers Chromium ignores and which no preload list holds, and
-/// localhost names, whose HSTS headers it ignores too.
+/// only hosts no preload list can hold may continue: IP addresses, whose
+/// HSTS headers Chromium ignores, localhost names, whose headers it ignores
+/// too, and local network names (nas.local, router), which could only have
+/// sent HSTS themselves. Those devices often have self-signed certificates,
+/// and Chrome lets you past them unless the device asked for HSTS.
 pub fn certificate_continue_allowed(code: i32, url: &str) -> bool {
     let Some(host) = gpui::http_client::Url::parse(url)
         .ok()
@@ -372,11 +374,13 @@ pub fn certificate_continue_allowed(code: i32, url: &str) -> bool {
         return false;
     };
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    let never_strict = host.parse::<std::net::IpAddr>().is_ok() || {
+    let unlisted = host.parse::<std::net::IpAddr>().is_ok() || {
         let host = host.trim_end_matches('.');
-        host == "localhost" || host.ends_with(".localhost")
+        host == "localhost"
+            || host.ends_with(".localhost")
+            || crate::model::is_local_network_name(host)
     };
-    never_strict && certificate_error_overridable(code)
+    unlisted && certificate_error_overridable(code)
 }
 
 /// How a download ended.
