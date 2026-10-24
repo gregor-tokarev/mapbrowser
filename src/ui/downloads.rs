@@ -576,7 +576,7 @@ impl BrowserApp {
             length: 1.,
         }))?;
         let (track, fill) = if failed {
-            (theme.danger().opacity(0.25), theme.danger())
+            (theme.error().opacity(0.25), theme.error())
         } else {
             (
                 theme.ink(if theme.dark { 0.18 } else { 0.12 }),

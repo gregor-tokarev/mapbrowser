@@ -110,9 +110,10 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-shift-escape", Browse(CancelTabSwitch), None),
         KeyBinding::new("cmd-alt-down", Browse(NextTabInList), None),
         KeyBinding::new("cmd-alt-up", Browse(PreviousTabInList), None),
-        // Chrome's and Safari's keys for the same, after the menu's own.
-        KeyBinding::new("cmd-shift-]", Browse(NextTabInList), None),
-        KeyBinding::new("cmd-shift-[", Browse(PreviousTabInList), None),
+        // Chrome's and Safari's ⇧⌘] and ⇧⌘[, after the menu's own. GPUI
+        // reports a shifted symbol as the symbol it types, without ⇧.
+        KeyBinding::new("cmd-}", Browse(NextTabInList), None),
+        KeyBinding::new("cmd-{", Browse(PreviousTabInList), None),
         KeyBinding::new("cmd-alt-left", Browse(PreviousSpace), None),
         KeyBinding::new("cmd-alt-right", Browse(NextSpace), None),
         KeyBinding::new("cmd-r", Browse(Reload), None),

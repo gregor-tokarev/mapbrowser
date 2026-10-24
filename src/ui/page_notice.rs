@@ -502,7 +502,7 @@ impl BrowserApp {
                     ),
                 };
                 column
-                    .child(tile(Icon::Warning, theme.danger()))
+                    .child(tile(Icon::Warning, theme.error()))
                     .child(title(heading.into()))
                     .child(div().child(body))
                     .child(buttons().child(
@@ -537,7 +537,7 @@ impl BrowserApp {
                 let (id, host) = (certificate.id, site(&certificate.url));
                 let continue_hover = theme.title();
                 column
-                    .child(tile(Icon::ShieldAlert, theme.danger()))
+                    .child(tile(Icon::ShieldAlert, theme.error()))
                     .child(title(
                         format!("Your connection to {host} isn't private").into(),
                     ))
@@ -675,8 +675,8 @@ impl BrowserApp {
                         .flex()
                         .items_center()
                         .gap(px(6.))
-                        .text_color(theme.danger())
-                        .child(icon(Icon::Warning, 14., theme.danger()))
+                        .text_color(theme.error())
+                        .child(icon(Icon::Warning, 14., theme.error()))
                         .child("Your connection to this site isn't private"),
                 )
             })
@@ -1268,7 +1268,7 @@ impl BrowserApp {
                 .flex_none()
                 .items_center()
                 .gap(px(2.))
-                .children(capture.map(|glyph| icon(glyph, size, theme.danger())))
+                .children(capture.map(|glyph| icon(glyph, size, theme.error())))
                 .children(speaker),
         )
     }

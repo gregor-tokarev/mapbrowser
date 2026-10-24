@@ -1,8 +1,9 @@
 //! Popover menus for tabs, spaces, the library, the site by the address and
 //! "+". They are drawn in GPUI and kept inside the sidebar, where no native
 //! web view covers them. Like AppKit's menus they work from the keyboard too: ↑ and ↓ move a
-//! highlight, → and ← enter and leave "Move to Space", Return chooses, a
-//! letter jumps to the next item starting with it, and Esc closes.
+//! highlight, → and ← enter and leave "Move to Space", Return chooses, typing
+//! the start of an item's name jumps to it, and Esc closes. ⇧F10 (or the
+//! context-menu key) opens the selected tab's menu.
 
 use super::{
     Tooltip, UI_FONT,
@@ -28,6 +29,7 @@ use gpui::{
     ScrollHandle, SharedString, Size, Stateful, StatefulInteractiveElement, Styled, Window,
     actions, deferred, div, font, point, prelude::FluentBuilder, px, relative,
 };
+use std::time::{Duration, Instant};
 
 actions!(
     menu,
@@ -41,7 +43,8 @@ actions!(
         NextControl,
         PreviousControl,
         Choose,
-        ChooseDestructive
+        ChooseDestructive,
+        ShowTabMenu
     ]
 );
 
@@ -59,11 +62,15 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("right", SelectRight, Some("Menu")),
         KeyBinding::new("tab", NextControl, Some("Menu")),
         KeyBinding::new("shift-tab", PreviousControl, Some("Menu")),
+        // Space doesn't choose, as in AppKit's menus: it may be part of a
+        // name being typed ("side p" for Side Project).
         KeyBinding::new("enter", Choose, Some("Menu")),
-        KeyBinding::new("space", Choose, Some("Menu")),
         // Return never deletes: in the delete prompt it means Cancel, as
         // destructive buttons are never the default on macOS.
         KeyBinding::new("cmd-backspace", ChooseDestructive, Some("Menu")),
+        // The keyboard's way to a right-click, while the shell has focus.
+        KeyBinding::new("shift-f10", ShowTabMenu, Some("Browser")),
+        KeyBinding::new("menu", ShowTabMenu, Some("Browser")),
     ]);
 }
 
@@ -100,6 +107,8 @@ const ROW_GAP: f32 = 3.;
 /// Menus asked for this close to the window's bottom edge belong to the
 /// bottom bar, and move with it when the window's height changes.
 const BOTTOM_BAR_REACH: f32 = 64.;
+/// Keys typed closer together than this build up one name to jump to.
+const TYPE_SELECT_PAUSE: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuKind {
@@ -136,6 +145,10 @@ pub struct OpenMenu {
     highlight: Option<Highlight>,
     /// Menus taller than the window scroll.
     scroll: ScrollHandle,
+    /// The start of a name typed to jump to an item, lowercased, and when
+    /// its last key came (`type_in_menu`).
+    typed: String,
+    typed_at: Option<Instant>,
 }
 
 impl OpenMenu {
@@ -147,6 +160,8 @@ impl OpenMenu {
             bottom_bar: (anchor.y > window_height - px(BOTTOM_BAR_REACH)).then_some(window_height),
             highlight: None,
             scroll: ScrollHandle::new(),
+            typed: String::new(),
+            typed_at: None,
         }
     }
 
@@ -156,6 +171,7 @@ impl OpenMenu {
         self.kind = kind;
         self.highlight = None;
         self.scroll = ScrollHandle::new();
+        self.typed.clear();
     }
 
     /// Where the menu was asked for, in a window now `window_height` tall:
@@ -1069,7 +1085,7 @@ impl BrowserApp {
                     theme.tertiary()
                 };
                 let status_color = if state == DownloadState::Failed {
-                    theme.danger()
+                    theme.error()
                 } else {
                     muted
                 };
@@ -1135,7 +1151,7 @@ impl BrowserApp {
                 insecure,
             } => {
                 let sidebar = self.sidebar_width().unwrap_or_default();
-                let danger = theme.danger();
+                let warning = theme.error();
                 div()
                     .id("site")
                     .flex()
@@ -1167,8 +1183,8 @@ impl BrowserApp {
                                 .h(px(SITE_WARNING_HEIGHT))
                                 .mt(px(-4.))
                                 .text_size(px(11.5))
-                                .text_color(danger)
-                                .child(icon(Icon::LockOpen, 12., danger))
+                                .text_color(warning)
+                                .child(icon(Icon::LockOpen, 12., warning))
                                 .child("Connection isn't secure"),
                         )
                     })
@@ -1232,7 +1248,7 @@ impl BrowserApp {
                             .text_color(if allowed {
                                 theme.tertiary()
                             } else {
-                                theme.danger()
+                                theme.error()
                             })
                             .child(if allowed { "Allowed" } else { "Blocked" }),
                     )
@@ -1762,8 +1778,7 @@ impl BrowserApp {
         cx.notify();
     }
 
-    /// Return or Space: chooses the highlighted item, or enters the list it
-    /// opens.
+    /// Return: chooses the highlighted item, or enters the list it opens.
     fn choose_in_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(menu) = &self.menu else {
             return;
@@ -1800,42 +1815,95 @@ impl BrowserApp {
         }
     }
 
-    /// A typed letter or digit jumps to the next item starting with it.
+    /// Typing picks an item by name, as in AppKit's menus: keys typed less
+    /// than `TYPE_SELECT_PAUSE` apart build up the start of a name ("hou"
+    /// for House Hunt), looked for from the highlighted item on. A letter
+    /// typed again and again steps through the items starting with it.
+    /// Nothing matching leaves the highlight where it is, and a space only
+    /// continues a name: Return chooses.
     fn type_in_menu(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        let Some(menu) = &self.menu else {
+        let Some(menu) = &mut self.menu else {
             return;
         };
         let modifiers = &event.keystroke.modifiers;
         if modifiers.platform || modifiers.control || modifiers.alt || modifiers.function {
             return;
         }
-        let Some(typed) = event
+        let Some(text) = event
             .keystroke
             .key_char
             .as_deref()
-            .and_then(|text| text.chars().next())
-            .filter(|ch| ch.is_alphanumeric())
+            .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
         else {
             return;
         };
-        let entries = self.menu_entries(menu.kind);
-        let after = menu.highlight.map_or(0, |at| at.entry + 1);
-        let starts_with = |entry: &Entry| {
-            entry.label().is_some_and(|label| {
-                label
-                    .trim_start()
-                    .chars()
-                    .next()
-                    .is_some_and(|first| first.to_lowercase().eq(typed.to_lowercase()))
-            })
-        };
+        let now = Instant::now();
+        if menu
+            .typed_at
+            .is_none_or(|at| now.duration_since(at) >= TYPE_SELECT_PAUSE)
+        {
+            menu.typed.clear();
+        }
+        // No name starts with a space.
+        if menu.typed.is_empty() && text.trim().is_empty() {
+            return;
+        }
+        menu.typed.push_str(&text.to_lowercase());
+        menu.typed_at = Some(now);
+        let (typed, kind) = (menu.typed.clone(), menu.kind);
+        let current = menu.highlight.map(|at| at.entry);
+        let entries = self.menu_entries(kind);
         let count = entries.len();
-        let found = (0..count)
-            .map(|offset| (after + offset) % count.max(1))
-            .find(|&entry| starts_with(&entries[entry]));
+        let find = |from: usize, prefix: &str| {
+            (0..count)
+                .map(|offset| (from + offset) % count.max(1))
+                .find(|&entry| {
+                    entries[entry]
+                        .label()
+                        .is_some_and(|label| label.trim_start().to_lowercase().starts_with(prefix))
+                })
+        };
+        let mut letters = typed.chars();
+        let first = letters.next().map(String::from).unwrap_or_default();
+        let repeated = letters.all(|letter| first.starts_with(letter));
+        // A longer start stays on the highlighted item while it still fits;
+        // one letter, or the same one again, moves on to the next.
+        let found = (typed.chars().count() > 1)
+            .then(|| find(current.unwrap_or(0), &typed))
+            .flatten()
+            .or_else(|| {
+                repeated
+                    .then(|| find(current.map_or(0, |entry| entry + 1), &first))
+                    .flatten()
+            });
         if let Some(entry) = found {
             self.highlight_menu(Some(Highlight { entry, part: 0 }), cx);
         }
+    }
+
+    /// ⇧F10 or the context-menu key, as a right-click from the keyboard:
+    /// the selected tab's menu, below its row, or the space's menu when no
+    /// tab is selected. Its first item is highlighted, as in a menu opened
+    /// from the keyboard on macOS. Menus show only in the sidebar.
+    fn show_menu_from_keyboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.menu.is_some() || self.sidebar_width().is_none() {
+            return;
+        }
+        let inset = point(px(4. * EDGE), px(0.));
+        match self.active_tab_id() {
+            Some(tab_id) => {
+                let anchor = self
+                    .tab_bounds(tab_id)
+                    .map_or(inset, |row| row.bottom_left() + inset);
+                self.open_tab_menu(tab_id, anchor, window, cx);
+            }
+            None => {
+                let space_id = self.state.selected_space_id;
+                let title = self.drop_zones.borrow().title;
+                self.open_space_title_menu(space_id, title.bottom_left() + inset, window, cx);
+            }
+        }
+        self.step_menu(Step::First, cx);
     }
 }
 
@@ -1883,6 +1951,9 @@ pub(super) fn handle_menu_keys<E: InteractiveElement>(root: E, cx: &mut Context<
     .on_action(cx.listener(|this, _: &Choose, window, cx| this.choose_in_menu(window, cx)))
     .on_action(
         cx.listener(|this, _: &ChooseDestructive, window, cx| this.choose_destructive(window, cx)),
+    )
+    .on_action(
+        cx.listener(|this, _: &ShowTabMenu, window, cx| this.show_menu_from_keyboard(window, cx)),
     )
     .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| this.type_in_menu(event, cx)))
 }

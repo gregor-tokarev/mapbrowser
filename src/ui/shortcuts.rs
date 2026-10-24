@@ -1,7 +1,8 @@
 //! Help > Keyboard Shortcuts: every shortcut in one panel over the page
 //! card. Like the command bar it is a pop-up window of its own, because the
 //! native web views cover anything GPUI draws over the card. Esc, ⌘W, a
-//! click elsewhere or its close button close it.
+//! click elsewhere or its close button close it; the arrow keys, Page Up,
+//! Page Down, Space, Home and End scroll it.
 
 use super::{
     UI_FONT,
@@ -14,23 +15,44 @@ use crate::app::BrowserApp;
 use gpui::{
     App, AppContext, Bounds, Context, Div, EventEmitter, FocusHandle, FontWeight,
     InteractiveElement, IntoElement, KeyBinding, ParentElement, Pixels, Point, Render,
-    StatefulInteractiveElement, Styled, Subscription, Window, WindowHandle, actions, div, point,
-    prelude::FluentBuilder, px, size,
+    ScrollHandle, StatefulInteractiveElement, Styled, Subscription, Window, WindowHandle, actions,
+    div, point, prelude::FluentBuilder, px, size,
 };
 
-actions!(shortcuts, [Close]);
+actions!(
+    shortcuts,
+    [Close, LineUp, LineDown, PageUp, PageDown, ToTop, ToBottom]
+);
 
 pub fn init(cx: &mut App) {
+    let context = Some("Shortcuts");
     cx.bind_keys([
-        KeyBinding::new("escape", Close, Some("Shortcuts")),
-        KeyBinding::new("cmd-w", Close, Some("Shortcuts")),
+        KeyBinding::new("escape", Close, context),
+        KeyBinding::new("cmd-w", Close, context),
+        KeyBinding::new("up", LineUp, context),
+        KeyBinding::new("down", LineDown, context),
+        KeyBinding::new("pageup", PageUp, context),
+        KeyBinding::new("pagedown", PageDown, context),
+        KeyBinding::new("shift-space", PageUp, context),
+        KeyBinding::new("space", PageDown, context),
+        KeyBinding::new("home", ToTop, context),
+        KeyBinding::new("end", ToBottom, context),
+        KeyBinding::new("cmd-up", ToTop, context),
+        KeyBinding::new("cmd-down", ToBottom, context),
     ]);
 }
 
 const WIDTH: f32 = 640.;
+/// Narrower panels list the groups in one column: in two, the longer
+/// descriptions would wrap.
+const TWO_COLUMNS_WIDTH: f32 = 600.;
 const TITLE_HEIGHT: f32 = 50.;
 const HEADER_HEIGHT: f32 = 28.;
+/// A row's height, unless its description wraps; it grows then.
 const ROW_HEIGHT: f32 = 24.;
+const LABEL_LINE: f32 = 18.;
+/// How far ↑ and ↓ scroll.
+const LINE_SCROLL: f32 = 2. * ROW_HEIGHT;
 const PADDING: f32 = 20.;
 const COLUMN_GAP: f32 = 28.;
 /// Transparent room around the panel for its shadow; X11 previews have no
@@ -80,7 +102,7 @@ const COLUMNS: [&[Group]; 2] = [
                 ("Settings", &["⌘,"]),
                 ("Hide Map Browser", &["⌘H"]),
                 ("Hide the other apps", &["⌥⌘H"]),
-                ("Minimise the window", &["⌘M"]),
+                ("Minimize the window", &["⌘M"]),
                 ("Quit", &["⌘Q"]),
             ],
         },
@@ -105,11 +127,12 @@ const COLUMNS: [&[Group]; 2] = [
         Group {
             title: "Menus",
             rows: &[
+                ("Open the selected tab's menu", &["⇧F10"]),
                 ("Move through a menu", &["↑", "↓"]),
                 ("First or last item", &["Home", "End"]),
                 ("Open or leave a submenu", &["→", "←"]),
                 ("Next or previous button", &["Tab", "⇧Tab"]),
-                ("Jump to an item", &["A–Z"]),
+                ("Jump to an item by its name", &["A–Z"]),
                 ("Choose", &["Return"]),
                 ("Delete, when asked", &["⌘⌫"]),
                 ("Close a menu or the command bar", &["Esc"]),
@@ -125,15 +148,23 @@ fn column_height(groups: &[Group]) -> f32 {
         .sum()
 }
 
-/// The panel's size: as tall as its longer column, but inside the card.
+fn two_columns(panel_width: f32) -> bool {
+    panel_width >= TWO_COLUMNS_WIDTH
+}
+
+/// The panel's size: as tall as its longer column, or its one column, but
+/// inside the card.
 fn panel_size(card: Bounds<Pixels>) -> gpui::Size<f32> {
-    let content = COLUMNS
-        .iter()
-        .map(|groups| column_height(groups))
-        .fold(0., f32::max);
     let (card_width, card_height) = (f32::from(card.size.width), f32::from(card.size.height));
+    let width = WIDTH.min(card_width - 2. * PADDING);
+    let heights = COLUMNS.iter().map(|groups| column_height(groups));
+    let content = if two_columns(width) {
+        heights.fold(0., f32::max)
+    } else {
+        heights.sum()
+    };
     gpui::Size {
-        width: WIDTH.min(card_width - 2. * PADDING),
+        width,
         height: (TITLE_HEIGHT + content + PADDING).min(card_height - 2. * PADDING),
     }
 }
@@ -161,6 +192,8 @@ pub enum ShortcutsEvent {
 pub struct ShortcutsPanel {
     theme: Theme,
     focus_handle: FocusHandle,
+    /// The list of shortcuts, which scrolls in a short window.
+    scroll: ScrollHandle,
     was_active: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -181,9 +214,33 @@ impl ShortcutsPanel {
         Self {
             theme,
             focus_handle,
+            scroll: ScrollHandle::new(),
             was_active: window.is_window_active(),
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Scrolls the list to `top`, its distance from the list's top, kept
+    /// between its ends.
+    fn scroll_to(&mut self, top: f32, cx: &mut Context<Self>) {
+        let offset = self.scroll.offset();
+        let end = f32::from(self.scroll.max_offset().height);
+        let y = px(-top.clamp(0., end));
+        if y != offset.y {
+            self.scroll.set_offset(point(offset.x, y));
+            cx.notify();
+        }
+    }
+
+    /// Scrolls the list by `distance`, down if positive.
+    fn scroll_by(&mut self, distance: f32, cx: &mut Context<Self>) {
+        let top = -f32::from(self.scroll.offset().y);
+        self.scroll_to(top + distance, cx);
+    }
+
+    /// A page: what shows of the list, less a line kept in sight.
+    fn page(&self) -> f32 {
+        (f32::from(self.scroll.bounds().size.height) - LINE_SCROLL).max(LINE_SCROLL)
     }
 
     fn render_group(&self, group: &Group) -> Div {
@@ -191,6 +248,7 @@ impl ShortcutsPanel {
         let key = |text: &'static str| {
             div()
                 .flex()
+                .flex_none()
                 .items_center()
                 .h(px(19.))
                 .px(px(6.))
@@ -198,6 +256,7 @@ impl ShortcutsPanel {
                 .bg(theme.control_hover())
                 .text_size(px(12.))
                 .text_color(theme.title())
+                .whitespace_nowrap()
                 .child(text)
         };
         div()
@@ -215,8 +274,10 @@ impl ShortcutsPanel {
                     .child(group.title),
             )
             .children(group.rows.iter().map(|(what, keys)| {
+                // A description too long for the row wraps, and the row
+                // grows with it; the keys keep their size.
                 div()
-                    .h(px(ROW_HEIGHT))
+                    .min_h(px(ROW_HEIGHT))
                     .flex()
                     .items_center()
                     .gap(px(8.))
@@ -224,7 +285,9 @@ impl ShortcutsPanel {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .py(px((ROW_HEIGHT - LABEL_LINE) / 2.))
                             .text_size(px(13.))
+                            .line_height(px(LABEL_LINE))
                             .text_color(theme.title())
                             .child(*what),
                     )
@@ -234,8 +297,9 @@ impl ShortcutsPanel {
 }
 
 impl Render for ShortcutsPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+        let panel_width = f32::from(window.viewport_size().width) - 2. * MARGIN;
         let hover = theme.hover();
         let title = div()
             .h(px(TITLE_HEIGHT))
@@ -263,22 +327,27 @@ impl Render for ShortcutsPanel {
                         cx.listener(|_, _, _, cx| cx.emit(ShortcutsEvent::Close { refocus: true })),
                     ),
             );
-        let columns =
+        let column = |groups: &mut dyn Iterator<Item = &Group>| {
             div()
-                .id("shortcuts-columns")
                 .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .child(div().flex().gap(px(COLUMN_GAP)).pb(px(PADDING)).children(
-                    COLUMNS.iter().map(|groups| {
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .children(groups.iter().map(|group| self.render_group(group)))
-                    }),
-                ));
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .children(groups.map(|group| self.render_group(group)))
+        };
+        let columns = div().flex().gap(px(COLUMN_GAP)).pb(px(PADDING));
+        let columns = if two_columns(panel_width) {
+            columns.children(COLUMNS.iter().map(|groups| column(&mut groups.iter())))
+        } else {
+            columns.child(column(&mut COLUMNS.iter().flat_map(|groups| groups.iter())))
+        };
+        let columns = div()
+            .id("shortcuts-columns")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .child(columns);
         let panel = div()
             .absolute()
             .left(px(MARGIN))
@@ -306,6 +375,12 @@ impl Render for ShortcutsPanel {
             .on_action(
                 cx.listener(|_, _: &Close, _, cx| cx.emit(ShortcutsEvent::Close { refocus: true })),
             )
+            .on_action(cx.listener(|this, _: &LineUp, _, cx| this.scroll_by(-LINE_SCROLL, cx)))
+            .on_action(cx.listener(|this, _: &LineDown, _, cx| this.scroll_by(LINE_SCROLL, cx)))
+            .on_action(cx.listener(|this, _: &PageUp, _, cx| this.scroll_by(-this.page(), cx)))
+            .on_action(cx.listener(|this, _: &PageDown, _, cx| this.scroll_by(this.page(), cx)))
+            .on_action(cx.listener(|this, _: &ToTop, _, cx| this.scroll_to(0., cx)))
+            .on_action(cx.listener(|this, _: &ToBottom, _, cx| this.scroll_to(f32::MAX, cx)))
             .when(!TRANSPARENT, |root| root.bg(theme.surface()))
             .child(panel)
     }
