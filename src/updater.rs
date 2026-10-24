@@ -235,6 +235,10 @@ fn agent() -> ureq::Agent {
             .user_agent(format!("MapBrowser/{}", env!("CARGO_PKG_VERSION")))
             .timeout_connect(Some(Duration::from_secs(20)))
             .timeout_recv_response(Some(Duration::from_secs(30)))
+            // A connection that dies without a word would otherwise hold
+            // the check, and every later one, forever. An hour fits the
+            // zip at 50 KB/s.
+            .timeout_recv_body(Some(Duration::from_secs(60 * 60)))
             .build(),
     )
 }
