@@ -309,7 +309,7 @@ impl BrowserApp {
     ) -> Self {
         let rename_input = cx.new(|cx| TextInput::new(window, cx));
         let tab_name_input = cx.new(|cx| TextInput::new(window, cx));
-        let notices = PageNotices::new(window, cx);
+        let notices = PageNotices::new(cx);
         let favicons = FaviconStore::new(state.root_dir());
         let history = History::load(state.root_dir());
         let restored = state
@@ -374,8 +374,6 @@ impl BrowserApp {
             restored,
             traffic_lights_hidden,
         };
-        let sign_in = this.notices.subscribe(window, cx);
-        this._subscriptions.extend(sign_in);
         this._subscriptions.extend([
             cx.subscribe_in(
                 &rename_input,
@@ -1661,7 +1659,14 @@ impl BrowserApp {
     ) {
         let open = self.command_bar.as_ref().map(|bar| bar.mode);
         self.close_command_bar(cx);
-        if open != Some(mode) && !self.fullscreen {
+        if open != Some(mode) {
+            // A page in fullscreen leaves it first, as in Chrome; the
+            // sidebar and insets return at once, so the bar goes over the
+            // card, and the page confirms later.
+            if self.fullscreen {
+                self.exit_page_fullscreen();
+                self.set_fullscreen(false, window, cx);
+            }
             self.open_command_bar(mode, window, cx);
         } else {
             window.activate_window();
@@ -2206,6 +2211,7 @@ impl BrowserApp {
             Shortcut::ZoomReset => self.zoom_page(ZoomStep::Reset, cx),
             Shortcut::Stop => {
                 if let Some(id) = active {
+                    self.stop_page_questions(id, window, cx);
                     self.engine.borrow().stop(id);
                 }
             }
@@ -2520,10 +2526,23 @@ impl BrowserApp {
                 id,
                 tab_id,
                 host,
+                port,
                 realm,
                 proxy,
                 secure,
-            } => self.sign_in_requested(id, tab_id, host, realm, proxy, secure, window, cx),
+                auth_scheme,
+            } => self.sign_in_requested(
+                id,
+                tab_id,
+                host,
+                port,
+                realm,
+                proxy,
+                secure,
+                auth_scheme,
+                window,
+                cx,
+            ),
             EngineEvent::CertificateError {
                 id,
                 tab_id,
@@ -2555,7 +2574,7 @@ impl BrowserApp {
             }
             EngineEvent::Unresponsive { tab_id } => self.page_responsive(tab_id, false, window, cx),
             EngineEvent::Responsive { tab_id } => self.page_responsive(tab_id, true, window, cx),
-            EngineEvent::PopupBlocked { tab_id, .. } => self.popup_blocked(tab_id, cx),
+            EngineEvent::PopupBlocked { tab_id, url } => self.popup_blocked(tab_id, url, cx),
             EngineEvent::Audible { tab_id, audible } => {
                 let Some(page) = self.pages.get_mut(&tab_id) else {
                     return;
@@ -2585,7 +2604,7 @@ impl BrowserApp {
 
     /// A page asked for a tab: it opens in the opener's space, behind the
     /// current tab for ⌘-clicks.
-    fn open_from_page(
+    pub(crate) fn open_from_page(
         &mut self,
         opener: TabId,
         url: &str,

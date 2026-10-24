@@ -16,8 +16,8 @@ mod protocols;
 mod site_data;
 
 use super::{
-    CrashReason, EditCommand, EngineEvent, PermissionDecision, edit_command, merge_features,
-    opens_in_tab,
+    CrashReason, EditCommand, EngineEvent, PermissionDecision, certificate_continue_allowed,
+    edit_command, merge_features, opens_in_tab,
     page::{LoadState, PageLoad, elide_middle, favicon_wait},
 };
 use crate::blocker::ContentBlocker;
@@ -162,8 +162,8 @@ struct PageState {
     load: PageLoad,
     /// The hovered link's address as last sent; empty for none.
     status: String,
-    /// The page's frames that play sound, by the token `audio` gives them.
-    audible_frames: HashSet<String>,
+    /// The page's frames that report their sound, and which play it.
+    audio: audio::PageAudio,
 }
 
 /// Identity and shared state the handlers of one browser report through.
@@ -407,17 +407,8 @@ wrap_display_handler! {
         }
         fn on_console_message(&self, _browser: Option<&mut Browser>, _level: LogSeverity, message: Option<&CefString>, _source: Option<&CefString>, _line: i32) -> i32 {
             // The audio script's reports; the page's own messages pass.
-            let Some((frame, audible)) = message.and_then(audio::report) else { return 0; };
-            let changed = {
-                let mut page = self.page.lock().expect("page state");
-                let before = !page.audible_frames.is_empty();
-                if audible {
-                    page.audible_frames.insert(frame);
-                } else {
-                    page.audible_frames.remove(&frame);
-                }
-                before != !page.audible_frames.is_empty()
-            };
+            let Some((token, audible)) = message.and_then(audio::report) else { return 0; };
+            let changed = self.page.lock().expect("page state").audio.report(&token, audible);
             if changed {
                 self.link.send(EngineEvent::Audible { tab_id: self.link.tab_id, audible });
             }
@@ -427,16 +418,35 @@ wrap_display_handler! {
 }
 
 /// A page's frames stopped playing: its document went, or its renderer.
+/// Their scripts' tokens end with them.
 fn page_silent(link: &BrowserLink, page: &Mutex<PageState>) {
-    let was_audible = {
-        let mut page = page.lock().expect("page state");
-        !std::mem::take(&mut page.audible_frames).is_empty()
-    };
+    let was_audible = page.lock().expect("page state").audio.clear();
     if was_audible {
         link.send(EngineEvent::Audible {
             tab_id: link.tab_id,
             audible: false,
         });
+    }
+}
+
+/// Watches the media of the document `frame` just loaded (`audio`).
+fn watch_audio(link: &BrowserLink, page: &Mutex<PageState>, frame: &Frame) {
+    let id = CefString::from(&frame.identifier()).to_string();
+    let url = frame_url(Some(frame));
+    let (script, went_quiet) = {
+        let mut page = page.lock().expect("page state");
+        let before = page.audio.is_audible();
+        let script = page.audio.loaded(id, &url);
+        (script, before && !page.audio.is_audible())
+    };
+    if went_quiet {
+        link.send(EngineEvent::Audible {
+            tab_id: link.tab_id,
+            audible: false,
+        });
+    }
+    if let Some(script) = script {
+        audio::run(frame, &script);
     }
 }
 
@@ -554,10 +564,25 @@ wrap_load_handler! {
                 }
             }
         }
-        fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _http_status_code: i32) {
+        fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, http_status_code: i32) {
             // Every frame's media may play sound.
             if let Some(frame) = frame.as_deref() {
-                audio::watch(frame);
+                watch_audio(&self.link, &self.page, frame);
+            }
+            // A web page back from the back-forward cache reports its main
+            // frame's load end only, with no HTTP status; OnLoadStart ended
+            // its frames' tokens, so each frame's script starts again.
+            if http_status_code == 0
+                && frame.as_deref().is_some_and(|frame| frame.is_main() != 0 && frame_url(Some(frame)).starts_with("http"))
+                && let Some(browser) = browser.as_deref()
+            {
+                let mut frames = CefStringList::new();
+                browser.frame_identifiers(Some(&mut frames));
+                for id in frames {
+                    if let Some(frame) = browser.frame_by_identifier(Some(&CefString::from(id.as_str()))).filter(|frame| frame.is_main() == 0) {
+                        watch_audio(&self.link, &self.page, &frame);
+                    }
+                }
             }
             if !frame.is_some_and(|frame| frame.is_main() != 0 && CefString::from(&frame.url()).to_string() != "about:blank") { return; }
             if !self.link.pending().initialized_surface.insert(self.link.instance) { return; }
@@ -715,7 +740,7 @@ wrap_request_handler! {
             if user_gesture != 0 {
                 request_tab(&self.link, frame.as_deref(), url, background);
             } else {
-                self.link.send(EngineEvent::PopupBlocked { tab_id: self.link.tab_id, url });
+                self.link.send(EngineEvent::PopupBlocked { tab_id: self.link.tab_id, url: popups::blocked_url(url, frame.as_deref()) });
             }
             1
         }
@@ -741,37 +766,35 @@ wrap_request_handler! {
             }
             0
         }
-        fn auth_credentials(&self, _browser: Option<&mut Browser>, origin_url: Option<&CefString>, is_proxy: i32, host: Option<&CefString>, port: i32, realm: Option<&CefString>, _scheme: Option<&CefString>, callback: Option<&mut AuthCallback>) -> i32 {
+        fn auth_credentials(&self, _browser: Option<&mut Browser>, origin_url: Option<&CefString>, is_proxy: i32, host: Option<&CefString>, port: i32, realm: Option<&CefString>, scheme: Option<&CefString>, callback: Option<&mut AuthCallback>) -> i32 {
             // On the IO thread: only the shared requests and the event
             // channel are used here. The card asks; Chromium keeps the
             // answer for the rest of the session.
             let Some(callback) = callback else { return 0; };
             let origin = origin_url.map(ToString::to_string).unwrap_or_default();
-            let proxy = is_proxy != 0;
-            let host = host.map(ToString::to_string).unwrap_or_default();
-            let usual_port = (origin.starts_with("https:") && port == 443) || (origin.starts_with("http:") && port == 80);
-            let host = if proxy || (port > 0 && !usual_port) { format!("{host}:{port}") } else { host };
             let id = self.link.requests.add(&self.link, Answer::SignIn(callback.clone()));
             self.link.send(EngineEvent::SignInRequest {
                 id,
                 tab_id: self.link.tab_id,
-                host,
+                host: host.map(ToString::to_string).unwrap_or_default(),
+                port: u16::try_from(port).unwrap_or(0),
                 realm: realm.map(ToString::to_string).unwrap_or_default(),
-                proxy,
+                proxy: is_proxy != 0,
                 secure: origin.starts_with("https:"),
+                auth_scheme: scheme.map(ToString::to_string).unwrap_or_default().to_ascii_lowercase(),
             });
             1
         }
         fn on_certificate_error(&self, _browser: Option<&mut Browser>, cert_error: Errorcode, request_url: Option<&CefString>, _ssl_info: Option<&mut Sslinfo>, callback: Option<&mut Callback>) -> i32 {
             // Main-frame loads only; Chromium refuses subresources itself.
             let Some(callback) = callback.filter(|_| !self.popup) else { return 0; };
-            let id = self.link.requests.add(&self.link, Answer::Certificate(callback.clone()));
-            self.link.send(EngineEvent::CertificateError {
-                id,
-                tab_id: self.link.tab_id,
-                url: request_url.map(ToString::to_string).unwrap_or_default(),
-                code: cert_error.get_raw(),
-            });
+            let url = request_url.map(ToString::to_string).unwrap_or_default();
+            let code = cert_error.get_raw();
+            // CEF doesn't say whether HSTS or pinning makes the error fatal
+            // for this host; only hosts that can have neither may go on.
+            let may_continue = certificate_continue_allowed(code, &url);
+            let id = self.link.requests.add(&self.link, Answer::Certificate { callback: callback.clone(), may_continue });
+            self.link.send(EngineEvent::CertificateError { id, tab_id: self.link.tab_id, url, code });
             1
         }
         fn on_render_process_terminated(&self, _browser: Option<&mut Browser>, status: TerminationStatus, _error_code: i32, _error_string: Option<&CefString>) {

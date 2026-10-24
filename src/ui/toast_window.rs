@@ -28,7 +28,7 @@ use gpui::{
     Styled, Task, Window, WindowHandle, WindowOptions, div, font, point, prelude::FluentBuilder,
     px, size,
 };
-use std::time::Duration;
+use std::{rc::Rc, time::Duration};
 
 /// The toast's distance from the card's left and bottom edges.
 const INSET: f32 = 10.;
@@ -41,6 +41,8 @@ const CHROME_WIDTH: f32 = 2. * 12. + 2. + ICON_SIZE + 8.;
 /// What a sidebar toast is narrower than the sidebar: its margins, then the
 /// same as `CHROME_WIDTH`.
 const SIDEBAR_CHROME_WIDTH: f32 = 2. * 8. + CHROME_WIDTH;
+/// A toast button's padding on either side of its label.
+const ACTION_PADDING: f32 = 8.;
 /// Transparent room around the toast for its shadow; X11 previews have no
 /// compositor, so there the window is exactly the toast.
 const MARGIN: f32 = if TRANSPARENT { 14. } else { 0. };
@@ -65,9 +67,17 @@ pub struct Toast {
     /// Says how to undo what was done ("Closed 3 tabs · ⇧⌘T reopens
     /// them"): the sidebar wraps it to two lines rather than cut the hint.
     undo: bool,
+    /// A button after the text, such as Open on "Pop-up blocked".
+    action: Option<ToastAction>,
     /// The text as the sidebar shows it, elided to fit `.0` points.
     fitted: Option<(f32, SharedString)>,
     _timer: Task<()>,
+}
+
+/// A toast's button: its label, and what it does.
+pub struct ToastAction {
+    label: SharedString,
+    run: Rc<dyn Fn(&mut BrowserApp, &mut Context<BrowserApp>)>,
 }
 
 impl Toast {
@@ -79,8 +89,8 @@ impl Toast {
     }
 }
 
-/// How long a toast that says how to undo something stays, long enough to
-/// read it and act.
+/// How long a toast that says how to undo something, or has a button,
+/// stays: long enough to read it and act.
 const UNDO_DURATION: Duration = Duration::from_secs(4);
 
 /// How long a toast stays: 1.5 s for a few words, longer for long ones and
@@ -205,13 +215,32 @@ impl BrowserApp {
     ) {
         let text = text.into();
         let duration = toast_duration(kind, &text);
-        self.set_toast(kind, text, duration, false, cx);
+        self.set_toast(kind, text, duration, false, None, cx);
     }
 
     /// Shows a ✓ toast that says how to undo what was done, for
     /// `UNDO_DURATION`.
     pub fn show_undo_toast(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.set_toast(ToastKind::Done, text.into(), UNDO_DURATION, true, cx);
+        self.set_toast(ToastKind::Done, text.into(), UNDO_DURATION, true, None, cx);
+    }
+
+    /// Shows a toast with a button `label` that runs `run`, for
+    /// `UNDO_DURATION`. Only the sidebar's toast has the button: the one
+    /// over the card lets clicks through to the page, and peeking at the
+    /// hidden sidebar brings the toast there.
+    pub fn show_action_toast(
+        &mut self,
+        kind: ToastKind,
+        text: impl Into<SharedString>,
+        label: &'static str,
+        run: impl Fn(&mut BrowserApp, &mut Context<BrowserApp>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let action = ToastAction {
+            label: label.into(),
+            run: Rc::new(run),
+        };
+        self.set_toast(kind, text.into(), UNDO_DURATION, false, Some(action), cx);
     }
 
     fn set_toast(
@@ -220,6 +249,7 @@ impl BrowserApp {
         text: SharedString,
         duration: Duration,
         undo: bool,
+        action: Option<ToastAction>,
         cx: &mut Context<Self>,
     ) {
         let timer = cx.spawn(async move |this, cx| {
@@ -233,6 +263,7 @@ impl BrowserApp {
             kind,
             text,
             undo,
+            action,
             fitted: None,
             _timer: timer,
         });
@@ -251,9 +282,14 @@ impl BrowserApp {
     /// Fits the toast to the sidebar, `width` wide; measured once per width.
     /// An undo toast wraps instead.
     pub(super) fn fit_toast(&mut self, width: f32, window: &Window) {
-        let room = (width - SIDEBAR_CHROME_WIDTH).max(0.);
-        if let Some(toast) = &mut self.toast
-            && !toast.undo
+        let Some(toast) = &mut self.toast else {
+            return;
+        };
+        let button = toast.action.as_ref().map_or(0., |action| {
+            text_width(&action.label, window) + 2. * ACTION_PADDING + 8.
+        });
+        let room = (width - SIDEBAR_CHROME_WIDTH - button).max(0.);
+        if !toast.undo
             && toast
                 .fitted
                 .as_ref()
@@ -299,6 +335,23 @@ impl BrowserApp {
                         .child(toast.text.clone())
                 } else {
                     truncated(toast.shown()).min_w_0()
+                })
+                .when_some(toast.action.as_ref(), |row, action| {
+                    let (run, control_hover) = (action.run.clone(), theme.control_hover());
+                    row.child(div().flex_1()).child(
+                        press_only(
+                            div()
+                                .id("toast-action")
+                                .flex_none()
+                                .px(px(ACTION_PADDING))
+                                .py(px(3.))
+                                .rounded(px(5.))
+                                .bg(theme.control())
+                                .hover(move |style| style.bg(control_hover))
+                                .child(action.label.clone()),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| run(this, cx))),
+                    )
                 })
         });
         // The reason may be long: the notice wraps, within a known width.

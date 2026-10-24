@@ -128,8 +128,9 @@ impl Engine {
 
 /// Requests waiting for the user, shared by every browser's handler and
 /// the engine. Callbacks run on the UI thread, where a prompt's answer can
-/// call straight back into the handler, so they are never answered with
-/// the lock held.
+/// call straight back into the handler, so they are never answered, nor
+/// dropped (an unanswered media request is refused then), with the lock
+/// held.
 #[derive(Clone, Default)]
 pub(super) struct PermissionRequests(Arc<Mutex<Requests>>);
 
@@ -263,12 +264,13 @@ wrap_permission_handler! {
             1
         }
         fn on_dismiss_permission_prompt(&self, _browser: Option<&mut Browser>, prompt_id: u64, _result: PermissionRequestResult) {
-            // Answered, or ended by Chromium (navigation, closing).
-            let ended: Vec<u64> = self.link.permissions.requests().pending
+            // Answered, or ended by Chromium (navigation, closing). What is
+            // left of a request goes once the lock is released.
+            let ended: Vec<(u64, Pending)> = self.link.permissions.requests().pending
                 .extract_if(|_, pending| pending.instance == self.link.instance && pending.prompt_id == Some(prompt_id))
-                .map(|(id, _)| id)
                 .collect();
-            for id in ended {
+            for (id, pending) in ended {
+                drop(pending);
                 self.link.send(EngineEvent::PermissionDismissed { id });
             }
         }

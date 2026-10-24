@@ -8,6 +8,7 @@
 use super::{
     UI_FONT,
     command_bar::{self, TRANSPARENT},
+    elide::{self, Cut},
     shadow,
     theme::Theme,
 };
@@ -104,32 +105,47 @@ impl Render for HintView {
     }
 }
 
-/// The note's width for `host`, on a card `card` wide at most.
-fn note_width(host: &str, card: Bounds<Pixels>, window: &Window) -> f32 {
-    let measure = |text: &str, weight| {
-        let run = TextRun {
-            len: text.len(),
-            font: Font {
-                weight,
-                ..font(UI_FONT)
-            },
-            color: gpui::black(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        f32::from(
-            window
-                .text_system()
-                .layout_line(text, px(FONT_SIZE), &[run], None)
-                .width,
-        )
+/// The width of `text` as the note draws it.
+fn measure(text: &str, weight: FontWeight, window: &Window) -> f32 {
+    let run = TextRun {
+        len: text.len(),
+        font: Font {
+            weight,
+            ..font(UI_FONT)
+        },
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
     };
+    f32::from(
+        window
+            .text_system()
+            .layout_line(text, px(FONT_SIZE), &[run], None)
+            .width,
+    )
+}
+
+/// The width of the note's text for `host`, the key cap's padding aside.
+fn text_width(host: &str, window: &Window) -> f32 {
     let [before, after] = text_parts(host);
-    let text = measure(&before, FontWeight::MEDIUM)
-        + measure(KEY, FontWeight::SEMIBOLD)
-        + measure(&after, FontWeight::MEDIUM);
-    (text + CHROME_WIDTH)
+    measure(&before, FontWeight::MEDIUM, window)
+        + measure(KEY, FontWeight::SEMIBOLD, window)
+        + measure(&after, FontWeight::MEDIUM, window)
+}
+
+/// `host` as the note on `card` shows it: a host too long for the line
+/// loses its start, so the domain that owns it and the way out stay.
+fn fitted_host(host: &str, card: Bounds<Pixels>, window: &Window) -> String {
+    let room = f32::from(card.size.width) - 2. * TOP - CHROME_WIDTH - text_width("", window);
+    elide::fit(host, room, Cut::Start, |host| {
+        measure(host, FontWeight::MEDIUM, window)
+    })
+}
+
+/// The note's width for `host`, already fitted to `card`.
+fn note_width(host: &str, card: Bounds<Pixels>, window: &Window) -> f32 {
+    (text_width(host, window) + CHROME_WIDTH)
         .ceil()
         .min(f32::from(card.size.width) - 2. * TOP)
 }
@@ -224,6 +240,7 @@ impl BrowserApp {
         else {
             return;
         };
+        let host: SharedString = fitted_host(&host, card, window).into();
         let width = note_width(&host, card, window);
         if !opened {
             let shown = self.open_hint_window(host, card, width, theme, window, cx);

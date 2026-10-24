@@ -82,6 +82,9 @@ impl Downloads {
         item: &DownloadItem,
         callback: Option<&DownloadItemCallback>,
     ) -> Option<EngineEvent> {
+        // A callback replaced, or left by the download that ended, goes once
+        // the lock is released, as every callback here is answered.
+        let released: Option<DownloadItemCallback>;
         let mut state = self.state();
         let active = state.active.get_mut(&key)?;
         let id = active.id;
@@ -103,7 +106,9 @@ impl Downloads {
             None
         };
         if let Some(end) = end {
-            state.active.remove(&key);
+            released = state.active.remove(&key).and_then(|active| active.callback);
+            drop(state);
+            drop(released);
             return Some(EngineEvent::DownloadFinished { id, end });
         }
         if let Some(callback) = callback {
@@ -114,17 +119,21 @@ impl Downloads {
                 callback.cancel();
                 return None;
             }
-            active.callback = Some(callback.clone());
+            released = active.callback.replace(callback.clone());
+        } else {
+            released = None;
         }
         let total = u64::try_from(item.total_bytes())
             .ok()
             .filter(|&total| total > 0);
         let now = Instant::now();
-        if !download_progress_worth_reporting(active.reported, now, received, total) {
-            return None;
+        let report = download_progress_worth_reporting(active.reported, now, received, total);
+        if report {
+            active.reported = Some((now, received));
         }
-        active.reported = Some((now, received));
-        Some(EngineEvent::DownloadProgress {
+        drop(state);
+        drop(released);
+        report.then_some(EngineEvent::DownloadProgress {
             id,
             received,
             total,

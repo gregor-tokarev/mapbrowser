@@ -65,13 +65,13 @@ Drag the sidebar's edge to resize it; double-click the edge to reset it. With th
 **The site menu.** The shield beside the address opens a menu for the site. Turn ad and tracker blocking off or on there, see which permissions the site was given or refused in this space and reset them, change the page zoom, or clear the site's cookies and stored data, which signs you out of it in this space only. Plain `http://` pages, and sites you went on to past a certificate warning, show **Not Secure** by the address. A page that isn't at 100 % shows its zoom level there; a click resets it.
 
 **When a page needs you.**
-- Sites and company proxies that ask for a username and password show a sign-in card on the page.
+- Sites and company proxies that ask for a username and password show a sign-in card on the page. Each card keeps what you typed while you look at other tabs, never shows it in another tab or space, and forgets it, password and all, once you answer or close the tab. Stop (⌘.) cancels it.
 - A page with unsaved changes, such as a half-written comment, asks **Leave site?** before you close, move or reload it. Clearing Today, unloading a space and quitting never wait on a page.
 - If a page crashes, runs out of memory or stops responding, the card says so and offers Reload (or Wait), and its tab shows a warning sign.
-- A site whose security certificate doesn't check out shows a full warning with Back to Safety; where it's reasonable you can still continue at your own risk.
+- A site whose security certificate doesn't check out shows a full warning with Back to Safety, which returns to the page before, or closes a tab opened just for that site. For servers on your Mac and devices you reach by their IP address you can still continue at your own risk; any other site may insist on a secure connection, so Map Browser never lets you past it there.
 - When a page can't load, because you're offline, the address doesn't exist or the site refuses, the card says why in plain words, with Try Again.
 - Tabs playing sound show a speaker; click it to mute the tab. Tabs using your camera or microphone show a red indicator.
-- Blocked pop-ups say so, and a page going full screen shows its site and that Esc leaves full screen.
+- Blocked pop-ups say so, with Open to open the pop-up as a tab. A page going full screen shows its site and that Esc leaves full screen; ⌘T and ⌘L leave it too and open the command bar.
 
 **Downloads.** Files go straight to your Downloads folder, numbered if a file with that name is already there. While they download, the library button at the bottom left shows their progress, or with the sidebar hidden, the bottom left of the page does. The library lists your recent downloads, also after you restart: × cancels one, ↻ downloads a failed or cancelled one again with its space's logins, and a click shows a finished one in Finder. A download that fails says why and marks the library button red. If files are still downloading when you quit, Map Browser asks first, as quitting cancels them.
 
