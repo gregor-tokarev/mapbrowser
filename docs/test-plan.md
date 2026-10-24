@@ -87,7 +87,7 @@ The redesign was built on a machine without macOS: it type-checks for macOS and 
 24. Narrow sidebar: drag the edge to the minimum. Back and Reload sit right of the toggle without overlapping it, and clicking the toggle hides the sidebar. Around 205 pt Forward comes back with tighter gaps. The address placeholder is cut short inside the pill.
 25. With about 20 tabs open, open a page that asks for the camera and scroll the list to the end: the last tab sits above the permission card.
 26. Hold a dragged tab within about 36 pt of the list's top or bottom edge (trackpad): the list scrolls steadily, the drop line follows, and the drop lands there. Held over the space buttons, the tab doesn't scroll the list.
-27. Hovering a tab whose title ends in "…" shows, after the usual delay, its full title and host; a tab whose title fits shows none. ×, – and Clear show "Close Tab ⌘W", "Unload Tab ⌘W" and "Clear Today ⇧⌘K". The library button shows "Library — Downloads and Recently Closed" without cutting it off.
+27. Hovering a tab whose title ends in "…" shows, after the usual delay, its full title and host; a tab whose title fits shows none. ×, – and Clear show "Close Tab ⌘W", "Unload Tab ⌘W" (without ⌘W on rows other than the selected one) and "Clear Today ⇧⌘K". The library button shows "Library — Downloads and Recently Closed" without cutting it off.
 
 ### Tabs
 
@@ -95,10 +95,19 @@ The redesign was built on a machine without macOS: it type-checks for macOS and 
 2. With a three-button mouse, middle-click a Today row: it closes. Middle-click a pinned tab or favorite: it unloads, with a faded icon.
 3. Go to Pinned Page: pin a page, follow a link elsewhere, right-click the tab and choose Go to Pinned Page: the pinned page loads again. Do the same on a sleeping pinned tab. On the pinned page itself the item is greyed out.
 4. A pinned tab's menu has Unload Tab ⌘W (greyed out while asleep) and Close Tab; a favorite's has Remove from Favorites ⌘D (moves it to Today) and Move to Pinned. Close Tab removes it; ⇧⌘T brings it back pinned (or as a favorite) at its old place. The menu bar follows the selected tab: File reads Close Tab or Unload Tab, Tab reads Pin Tab, Unpin Tab or Remove from Favorites.
-5. Clear 25 Today tabs: a two-line toast says "Closed 25 tabs · ⇧⌘T reopens them". ⇧⌘T restores all 25 in their order, and another space's Recently Closed is untouched (Library). Close Other Tabs and Close Tabs Below (Today tabs only, greyed out when nothing would close) do the same for their tabs. A Today tab from the middle of the list, closed with ⌘W, comes back at its old place.
+5. Clear 25 Today tabs: a two-line toast says "Closed 25 tabs · ⇧⌘T reopens them". ⇧⌘T restores all 25 in their order, the toast goes at once and the tab selected before Clear is selected again, and another space's Recently Closed is untouched (Library). Close Other Tabs and Close Tabs Below (Today tabs only, greyed out when nothing would close) do the same for their tabs. A Today tab from the middle of the list, closed with ⌘W, comes back at its old place.
 6. Relaunch: favorites and pinned tabs whose page isn't loaded show faded favicons. Selecting one shows "This tab is asleep. Press ⌘R or click it to load it."; loading it brings its icon back to full.
 7. With 30 tabs, ⌘9, ⌥⌘↓ past the visible rows, ⌃Tab, ⇧⌘T and Duplicate Tab scroll the list to the selected tab; the duplicate sits right below the original. A list scrolled by hand keeps its place across space switches and ⌘S.
 8. ⌃Tab cancel with a page focused: click into a page's text field, hold ⌃, press Tab twice, press Esc, release ⌃. You stay on the current tab and the outline is gone. Repeat with ⌃⇧Tab. During a walk a selected favorite loses its focus border, so only the target is outlined. Outside a walk, a page listening for ⌃Esc still receives it.
+9. A tab playing sound: move the pointer from the page straight onto its speaker and click. The tab mutes and stays; the speaker doesn't move when the pointer reaches the row, and × shows to its right. The same on a pinned tab with –.
+10. Select one tab, right-click another and press ⌘W, ⌘D, ⌘R or ⇧⌘C (each through the menu bar's key equivalent): the menu closes and the key acts on the right-clicked tab, never the selected one.
+11. Select a tab in the middle of Today, choose Close Other Tabs, then ⇧⌘T: that tab stays selected, its page doesn't reload, and the undo toast goes at once.
+12. Relaunch, then double-click a sleeping tab and type a name straight away: every key reaches the field and none reaches the page loading under it (try Gmail: no shortcut fires). Do the same on a page that asks for the camera while the name is typed: the card waits and the typing stays in the field.
+13. While a tab's name is edited, double-click the space title: the space's field opens and takes the typing, and the tab keeps the name typed so far. Scroll the selected tab out of sight and run ⌘T Rename Tab: its row scrolls into view with the field.
+14. Hide the sidebar, run ⌘T Rename Tab, then right-click a space dot: the menu works, and the sidebar with the traffic lights stays until the menu closes and the pointer moves onto the page. No menu is ever left over the page.
+15. With the sidebar hidden, hold ⌃ and press Tab a few times: the tab reached shows by name at the page's bottom left, changing with each Tab, and goes when ⌃ is released (you are on that tab) or ⌃Esc cancels.
+16. In a long list, select the last tab and press ⇧⌘C: the row rises above the "Copied URL" toast and settles back when it goes. A toast while a permission card waits appears above the card, which stays still under the pointer.
+17. Rest the pointer on a tab whose title ends in "…" until its tooltip shows, then open a tab with ⌘T without moving the pointer: the tooltip names the row now under the pointer.
 
 ### Spaces
 
@@ -111,6 +120,9 @@ The redesign was built on a machine without macOS: it type-checks for macOS and 
 7. Hover a dot: the tooltip reads "<name> ⌃N" with the real ⌃ glyph. Rename a space to a 60-character name: hovering its title shows a wrapped tooltip with the full name, and Delete Space… shows the whole name over several lines ending in "?".
 8. Right-click an inactive dot: the menu starts with that space's colour or icon and name, its "no icon" cell is in that space's colour, and the dot stays highlighted. Click several colours and icons: each applies at once and the menu stays open until Esc or a click outside.
 9. Double-click the space title to rename it. Right-click the title: the menu opens just below the title row, and stays there when the window resizes. Empty the rename field: it shows "Space name". Paste text containing a tab and a line break and press Return: the saved name has single spaces.
+10. A fresh profile's Personal and Work dots are plainly different colours (lavender and green), and new spaces take pink, teal and peach next.
+11. With 12 spaces, press ⌃9, then ⌃4 and ⌃6: the dots don't shift while the active space is in view, so each slot keeps its space. Drag a tab onto "…": the list of spaces opens, the row under the pointer tints, and dropping there moves the tab; letting go elsewhere closes the list and leaves the tab.
+12. With 40 recently closed tabs, open the Library: it ends above the bottom bar and scrolls, and a second click on the Library button closes it.
 
 ### Command bar
 

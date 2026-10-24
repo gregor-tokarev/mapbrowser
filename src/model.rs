@@ -29,6 +29,11 @@ const SCHEMA_VERSION: u32 = 2;
 const BLANK_URL: &str = "about:blank";
 /// Space themes are indices below this; the UI owns the palettes.
 pub const THEME_COUNT: u8 = 8;
+/// The order new spaces take the themes in: lavender, green, pink, teal,
+/// peach, periwinkle, amber, grey. Each differs plainly from the one before,
+/// so neighbouring dots in the switcher never look alike (lavender and
+/// periwinkle would).
+const THEME_ORDER: [u8; THEME_COUNT as usize] = [0, 2, 4, 5, 3, 1, 7, 6];
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 228.;
 pub const MIN_SIDEBAR_WIDTH: f32 = 180.;
 pub const MAX_SIDEBAR_WIDTH: f32 = 420.;
@@ -106,6 +111,10 @@ pub struct ClosedTab {
     /// id here, and ⇧⌘T reopens them together.
     #[serde(default)]
     pub batch: Option<TabId>,
+    /// It was its space's selected tab, and is again when ⇧⌘T undoes the
+    /// close.
+    #[serde(default)]
+    pub selected: bool,
 }
 
 /// Where a download stands.
@@ -350,8 +359,8 @@ impl Default for BrowserState {
         Self {
             schema_version: SCHEMA_VERSION,
             spaces: vec![
-                Space::new(1, "Personal".into(), 0),
-                Space::new(2, "Work".into(), 1),
+                Space::new(1, "Personal".into(), THEME_ORDER[0]),
+                Space::new(2, "Work".into(), THEME_ORDER[1]),
             ],
             selected_space_id: 1,
             next_id: 3,
@@ -786,12 +795,14 @@ impl BrowserState {
         }
     }
 
+    /// The theme fewest spaces have, the earliest in `THEME_ORDER` of those.
     fn least_used_theme(&self) -> u8 {
         let mut uses = [0usize; THEME_COUNT as usize];
         for space in &self.spaces {
             uses[usize::from(space.theme())] += 1;
         }
-        (0..THEME_COUNT)
+        THEME_ORDER
+            .into_iter()
             .min_by_key(|&theme| uses[usize::from(theme)])
             .unwrap_or(0)
     }
@@ -1122,18 +1133,26 @@ impl BrowserState {
             tab,
             index,
             batch: None,
+            selected: false,
         });
         self.trim_closed();
     }
 
     /// Remembers tabs closed together, each with its place in its section,
-    /// as one close that ⇧⌘T undoes at once. Pushed bottom first, so the
-    /// library, newest first, lists them in sidebar order.
-    pub fn remember_closed_together(&mut self, space_id: SpaceId, tabs: Vec<(Tab, usize)>) {
+    /// as one close that ⇧⌘T undoes at once, and which of them, if any, was
+    /// `selected`. Pushed bottom first, so the library, newest first, lists
+    /// them in sidebar order.
+    pub fn remember_closed_together(
+        &mut self,
+        space_id: SpaceId,
+        tabs: Vec<(Tab, usize)>,
+        selected: Option<TabId>,
+    ) {
         let batch = tabs.first().map(|(tab, _)| tab.id);
         self.closed
             .extend(tabs.into_iter().rev().map(|(tab, index)| ClosedTab {
                 space_id,
+                selected: Some(tab.id) == selected,
                 tab,
                 index: Some(index),
                 batch,
@@ -1966,13 +1985,13 @@ mod tests {
     fn new_spaces_are_empty_selected_and_use_the_least_used_theme() {
         let mut state = BrowserState::default();
         assert_eq!(state.spaces[0].theme(), 0);
-        assert_eq!(state.spaces[1].theme(), 1);
+        assert_eq!(state.spaces[1].theme(), 2);
         let research = state.create_space("  Research ");
         let space = state.space(research).unwrap();
         assert_eq!(space.name, "Research");
         assert!(space.tabs.is_empty());
         assert_eq!(space.selected_tab_id, None);
-        assert_eq!(space.theme(), 2);
+        assert_eq!(space.theme(), 4);
         assert_eq!(state.selected_space_id, research);
         assert_eq!(state.active_tab(), None);
 
@@ -1992,7 +2011,7 @@ mod tests {
             .map(Space::theme)
             .collect::<HashSet<_>>();
         assert_eq!(themes.len(), usize::from(THEME_COUNT));
-        // With every theme used once, the lowest index wins.
+        // With every theme used once, the first in the order wins.
         let ninth = state.create_space("Ninth");
         assert_eq!(state.space(ninth).unwrap().theme(), 0);
     }

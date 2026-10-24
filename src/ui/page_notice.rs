@@ -806,7 +806,7 @@ impl BrowserApp {
     /// and Esc answer it. A rename or menu in progress keeps it, and so
     /// does a sign-in field being typed in.
     pub(crate) fn focus_page_notice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.renaming.is_some() || self.menu.is_some() {
+        if self.naming() || self.menu.is_some() {
             return;
         }
         let Some(tab_id) = self.active_tab_id() else {
