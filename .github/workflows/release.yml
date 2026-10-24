@@ -27,6 +27,10 @@ jobs:
   build:
     name: Build (${{ matrix.arch }})
     runs-on: macos-15
+    env:
+      # The CEF runtime the build downloads, about 1 GB unpacked, kept
+      # outside target/: rust-cache prunes what it doesn't know there.
+      CEF_PATH: /Users/runner/cef
     strategy:
       fail-fast: false
       matrix:
@@ -56,8 +60,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-          # The CEF runtime the build downloads, about 1 GB unpacked.
-          cache-directories: target/cef
+
+      - name: Find the CEF version
+        id: cef
+        run: echo "version=$(grep -A1 '^name = "cef-dll-sys"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        with:
+          path: ${{ env.CEF_PATH }}
+          key: cef-${{ matrix.target }}-${{ steps.cef.outputs.version }}
 
       - name: Build the app
         env:
