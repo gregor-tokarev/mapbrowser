@@ -14,7 +14,8 @@
 //! takes neither focus nor clicks, and exists only while the toast does:
 //! nothing stays open, or draws, at rest.
 //!
-//! A failed save is the one lasting notice: it stays until a save succeeds.
+//! Two notices last: a failed save's, until a save succeeds, and in the
+//! sidebar a downloaded update's, until Restart or Later.
 
 use super::{
     UI_FONT,
@@ -438,8 +439,8 @@ impl BrowserApp {
         }
     }
 
-    /// The sidebar's toast and, below it, the failed save's notice, above
-    /// its bottom bar.
+    /// The sidebar's toast and, below it, the failed save's notice and the
+    /// update's, above its bottom bar.
     pub(super) fn render_toasts(
         &self,
         width: f32,
@@ -543,10 +544,59 @@ impl BrowserApp {
                         ),
                 )
         });
+        let update = self.update_ready().map(|version| {
+            let control_hover = theme.control_hover();
+            let button = |id: &'static str, label: &'static str| {
+                press_only(
+                    div()
+                        .id(id)
+                        .px(px(8.))
+                        .py(px(3.))
+                        .rounded(px(5.))
+                        .bg(theme.control())
+                        .hover(move |style| style.bg(control_hover))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.title())
+                        .child(label),
+                )
+            };
+            card()
+                .flex()
+                .gap(px(8.))
+                .child(div().pt(px(1.)).child(mark(ToastKind::Info, theme)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .gap(px(6.))
+                        .w(px(text_width.max(0.)))
+                        .child(
+                            div()
+                                .line_height(px(16.))
+                                .text_color(theme.title())
+                                .child(format!("Map Browser {version} is ready to install.")),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(6.))
+                                .child(button("restart-to-update", "Restart").on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.restart_to_update(window, cx)
+                                    }),
+                                ))
+                                .child(button("update-later", "Later").on_click(
+                                    cx.listener(|this, _, _, cx| this.dismiss_update(cx)),
+                                )),
+                        ),
+                )
+        });
         toast
             .map(IntoElement::into_any_element)
             .into_iter()
             .chain(save.map(IntoElement::into_any_element))
+            .chain(update.map(IntoElement::into_any_element))
             .collect()
     }
 

@@ -815,12 +815,13 @@ impl BrowserApp {
     }
 
     /// How far the tab list ends above the sidebar's bottom bar: clear of a
-    /// permission card, a failed save or a load error, which stay until
-    /// answered or fixed. Toasts go by themselves, above them, and may
-    /// cover the list for a moment (`toast_cover`).
+    /// permission card, a failed save, a load error or a downloaded update,
+    /// which stay until answered or fixed. Toasts go by themselves, above
+    /// them, and may cover the list for a moment (`toast_cover`).
     fn notice_inset(&self) -> f32 {
         let card = self.permission_shown().is_some()
             || self.save_failure.is_some()
+            || self.update_ready().is_some()
             || (self.error.is_some() && self.page_covers_card());
         if card {
             self.tab_lists.cards.get() + NOTICE_GAP

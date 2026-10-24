@@ -12,6 +12,12 @@ Your tabs live in a sidebar instead of across the top. Group them into spaces, o
 - **Separate spaces, separate accounts.** Each space keeps its own cookies and site data, so the same site can be signed in to different accounts in different spaces.
 - **Pages keep running.** Pages you've opened stay alive when you switch tabs or spaces, so chat and mail keep receiving messages. Map Browser never unloads them on its own.
 
+## Download
+
+[Download Map Browser](https://gregor-tokarev.github.io/mapbrowser/) for a Mac with Apple silicon or Intel, on macOS 12 or later. Open the disk image and drag Map Browser onto Applications. Map Browser isn't notarized by Apple yet, so the first time you open it macOS refuses: click Done, then Open Anyway in System Settings › Privacy & Security.
+
+Map Browser keeps itself up to date. New versions download in the background, and when one is ready the sidebar says so: Restart installs it, or it installs the next time you quit. Map Browser > Check for Updates… looks for one right away.
+
 ## Using Map Browser
 
 **Opening pages.** Press `⌘T` to open the command bar. Type an address or a search, pick an open tab from any space, a tab you just closed or a page you've visited before, or run an action such as Pin Tab, Mute Tab, Clear Today or Switch to Work. A tab appears once you pick a result. Type the name of an open tab or of a space, or the address of a tab open in this space, and Return goes there instead of searching. An address that's open only in another space opens here, with this space's logins, and the bar says so. `⌘L`, or a click on the address at the top of the sidebar, edits the current page's address; `⌘Return` opens the edited address in a new tab instead.
@@ -86,7 +92,7 @@ Spaces, tabs and selections come back when you reopen Map Browser, and the windo
 
 ## Status
 
-Map Browser is an early prototype for macOS. It has no extensions, split view, sync, bookmarks, password manager, private windows or tab folders yet, and it doesn't update itself. Battery life on par with Helium is the goal, but it hasn't been measured on a Mac yet.
+Map Browser is an early prototype for macOS. It has no extensions, split view, sync, bookmarks, password manager, private windows or tab folders yet. Battery life on par with Helium is the goal, but it hasn't been measured on a Mac yet.
 
 ## Credits
 

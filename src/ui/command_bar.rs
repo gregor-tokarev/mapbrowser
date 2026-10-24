@@ -11,6 +11,7 @@ use super::{
     placeholder_favicon, shadow, text_width,
     theme::Theme,
     truncated,
+    updates::UpdateOffer,
 };
 use crate::{
     engine::{Navigation, Shortcut, navigation_for},
@@ -157,6 +158,10 @@ pub enum Command {
     SearchWith(SearchEngine),
     SetDefaultBrowser,
     ShowShortcuts,
+    /// As Map Browser > Check for Updates… does, with toasts for what it
+    /// finds.
+    CheckForUpdates,
+    RestartToUpdate,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -279,6 +284,8 @@ pub struct CommandContext {
     pub sidebar_hidden: bool,
     pub has_today: bool,
     pub search_engine: SearchEngine,
+    /// Check for Updates, or Restart to Update once one is ready.
+    pub update: UpdateOffer,
 }
 
 impl CommandContext {
@@ -1039,6 +1046,7 @@ fn actions(context: &CommandContext) -> Vec<(CommandItem, &'static str)> {
         "preferences",
     ));
     actions.push((default_browser_action(), "links"));
+    actions.extend(update_action(context));
     actions.push((
         action(
             Command::ShowShortcuts,
@@ -1076,6 +1084,30 @@ fn site_actions(host: &str) -> [(CommandItem, &'static str); 2] {
             "cookies storage sign out",
         ),
     ]
+}
+
+/// Check for Updates, or Restart to Update once one is ready; neither in a
+/// copy that doesn't update itself.
+fn update_action(context: &CommandContext) -> Option<(CommandItem, &'static str)> {
+    let item = match &context.update {
+        UpdateOffer::None => return None,
+        UpdateOffer::Check => action(
+            Command::CheckForUpdates,
+            "Check for Updates",
+            Icon::Reload,
+            "",
+        ),
+        UpdateOffer::Restart(version) => CommandItem {
+            detail: Some(format!("Map Browser {version}")),
+            ..action(
+                Command::RestartToUpdate,
+                "Restart to Update",
+                Icon::Reload,
+                "",
+            )
+        },
+    };
+    Some((item, "update upgrade install new version"))
 }
 
 fn default_browser_action() -> CommandItem {
@@ -1538,6 +1570,7 @@ fn settings_results(query: &str, context: &CommandContext) -> Vec<CommandItem> {
     settings.push((sidebar_action(context), "toggle"));
     settings.push((clear_history_action(), "delete forget"));
     settings.push((default_browser_action(), "links"));
+    settings.extend(update_action(context));
     let words = query_words(query);
     let mut settings: Vec<(u32, CommandItem)> = settings
         .into_iter()
@@ -2291,6 +2324,7 @@ mod tests {
             sidebar_hidden: false,
             has_today: true,
             search_engine: SearchEngine::Google,
+            update: UpdateOffer::None,
         }
     }
 

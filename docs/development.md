@@ -34,6 +34,9 @@ The bundle used to be `Mapbrowser.app`. After switching, delete the old one: Lau
 | `MAPBROWSER_TRACE_CEF=1` | Trace native geometry, the first-paint workaround and content-blocker loading |
 | `MAPBROWSER_DEBUG_PORT=9223` | Enable Chromium's remote debugging endpoint. Use a separate data directory |
 | `MAPBROWSER_REDUCE_MOTION=1` | Linux only: stands in for the macOS Reduce Motion setting |
+| `MAPBROWSER_RELEASE=1` | At build time: the copy updates itself, as release builds do. Without it Check for Updates… isn't offered |
+| `MAPBROWSER_UPDATE_FEED=<url>` | Fetch the update manifest from `<url>` (and `<url>.minisig`) instead of the latest GitHub release, to try an update from a local server. The signature must still verify |
+| `MAPBROWSER_UPDATE_DEMO=1` | Linux only: a check finds the next minor version, "downloads" it in two seconds, and Restart starts the preview again |
 
 ```sh
 MAPBROWSER_DATA_DIR="$PWD/.test-data/manual" MAPBROWSER_TRACE_ANIMATION=1 make dev
@@ -83,7 +86,12 @@ Previews have no Launch Services and no menu bar: addresses and file paths on th
 | `src/engine/mac/site_data.rs` | Clear Site Data: one origin's cookies and storage in one space |
 | `src/native.rs` | AppKit bridge: CEF's message loop inside GPUI's application, window helpers, corner caps, default browser, About panel |
 | `vendor/gpui/` | GPUI 0.2.2 with Metal memory, frame-scheduling, native-view input, Dock reopen and Help menu changes; see `MAPBROWSER_PATCH.md` |
-| `scripts/bundle.py` | Builds and signs the bundle: Info.plist, document types, helpers, icon |
+| `src/updater.rs` | Updates: checks the signed manifest, downloads, verifies and stages the new app, installs it at quit |
+| `src/ui/updates.rs` | The update card, Check for Updates… and Restart to Update, the check schedule |
+| `scripts/bundle.py` | Builds and signs the bundle: Info.plist, document types, helpers, icon; `--target` for another architecture |
+| `scripts/package.py` | Packages a built bundle as the release's disk image and zip, and writes the update manifest |
+| `.github/workflows/` | `release.yml` builds and publishes releases; `pages.yml` publishes the download page |
+| `site/` | The download page on GitHub Pages |
 | `assets/AppIcon.svg` | The app icon's source; `scripts/make_icon.py` renders `assets/AppIcon.icns` |
 | `assets/icons/` | Sidebar icons (Lucide, ISC licence) |
 
@@ -124,6 +132,34 @@ Previews have no Launch Services and no menu bar: addresses and file paths on th
 - **Opening files.** `scripts/bundle.py` declares document types (Viewer, Alternate rank) for HTML, PDF, SVG, PNG, JPEG, GIF, WebP, AVIF, BMP, plain text and `.webloc`; helpers don't carry them. `app::opened_address` and `opened_file` are the only paths that accept file URLs (Finder, the Dock, `open -a`, sidebar drops); a `.webloc` opens its address, read with NSDictionary. At launch, links and files become tabs before the selected tab loads, so only the last one gets a page. Files refused on the open-URL path are dropped silently; sidebar drops say "Can't open". Links dragged from other apps aren't accepted: GPUI's window registers only for file drags.
 - **App identity.** The bundle is "Map Browser.app" and the menus say Map Browser. The executable and helpers keep the name `mapbrowser`, which CEF finds them by, and the helpers keep their bundle identifiers (`dev.mapbrowser.browser.helpergpu` and so on). The Alerts helper's display name is "Map Browser" and it carries the icon, so web notifications show both. To change the icon, edit `assets/AppIcon.svg` and run `python3 scripts/make_icon.py` (needs rsvg-convert or ImageMagick); the committed `AppIcon.icns` means builds need neither.
 - **Sidebar peek.** With the sidebar hidden, a 10 pt strip at the window's left edge starts a one-off 150 ms timer on hover, then shows the sidebar without changing the saved hidden state. The page narrows rather than being covered, since GPUI can't draw over it. The peek ends once the pointer is past the sidebar, unless a menu, rename, drag or the command bar needs it. A permission card, naming a space or tab, and the site menu opened from the command bar also show a hidden sidebar while they last; a menu opened in such a sidebar turns it into a peek, so it stays while the menu does. The traffic lights follow whatever is drawn (`sync_traffic_lights`).
+
+## Releases and updates
+
+Releases are built by GitHub Actions (`.github/workflows/release.yml`) on `macos-15`, for Apple silicon (`aarch64-apple-darwin`) and Intel (`x86_64-apple-darwin`, cross-compiled). To release:
+
+1. Set the new version in `Cargo.toml` (it is the bundle's version and what updates compare) and merge it to `main`.
+2. Optionally draft the release notes first: `gh release create v1.2.3 --draft --title "Map Browser 1.2.3" --notes-file notes.md`. A draft stays a draft once its files are up; publish it when ready. Without a draft, the workflow creates the release with generated notes and publishes it.
+3. Tag the merged commit and push the tag: `git tag v1.2.3 && git push origin v1.2.3`. The workflow fails if the tag and `Cargo.toml` disagree.
+
+Each architecture's build job runs `scripts/bundle.py --release --target <triple>` with `MAPBROWSER_RELEASE=1`, then `scripts/package.py app`, which writes `Map-Browser-mac-<arm64|x64>.dmg` (the app beside an Applications link, for people), `Map-Browser-mac-<arch>.zip` (`ditto --keepParent`, for updates) and the zip's size and SHA-256. The publish job writes `latest.json`, signs it with minisign into `latest.json.minisig`, checks the signature against the key in `src/updater.rs`, and uploads the disk images and zips, then the manifest last. Asset names carry no version, so `releases/latest/download/<name>` always serves the newest; the download page links there. Pull requests that change the workflow or the packaging scripts build both architectures without publishing.
+
+```json
+{
+  "version": "1.2.3",
+  "macos": {
+    "aarch64": { "url": "https://github.com/…/releases/download/v1.2.3/Map-Browser-mac-arm64.zip", "size": 141000000, "sha256": "…" },
+    "x86_64": { "url": "…/Map-Browser-mac-x64.zip", "size": 146000000, "sha256": "…" }
+  }
+}
+```
+
+**Signing key.** The minisign secret key is the repository secret `MINISIGN_SECRET_KEY` (unencrypted, made with `minisign -G -W`); its public half is `PUBLIC_KEY` in `src/updater.rs`. Keep a copy of the secret key outside GitHub: secrets can't be read back, and without the key no later release can update existing copies. A new key needs a release built with its public key, signed with the old one.
+
+**Updating.** Only builds with `MAPBROWSER_RELEASE` set update themselves, so `make run` bundles are never replaced. `src/ui/updates.rs` checks a minute after launch and every six hours (two timers a day, no polling), and Check for Updates… (Map Browser menu, command bar) checks at once and reports in toasts; automatic checks fail silently. A check (`src/updater.rs`, on its own thread, with `ureq`) fetches `latest.json` and its signature through `releases/latest/download/`, rejects any manifest whose signature doesn't verify against the built-in key, and takes the asset for `std::env::consts::ARCH` if the version is newer than the running one or the one already staged. A 404 means the latest release has no files yet, so no update. The zip downloads to `~/Library/Caches/MapBrowser/Updates/<version>/`, hashed as it arrives; size and SHA-256 must match. `ditto -x -k --noqtn` unpacks it; the bundle must have identifier `dev.mapbrowser.browser`, the manifest's version and a signature `codesign --verify --deep --strict` accepts. The app's own files are quarantined (`LSFileQuarantineEnabled`), so the staged bundle's quarantine flags are removed after the manifest's signature has vouched for it, as Sparkle does, and the check fails if the executable still has one. Copies that can't be replaced (App Translocation, a disk image, a folder the user can't write) don't download: Check for Updates… asks to move the app to Applications.
+
+**Installing.** The staged update waits in `updater::PENDING` and is installed by `updater::finish`, which `main` calls after CEF has shut down: Chromium starts helper processes from the bundle, so it must not change under a running browser. `renamex_np(RENAME_SWAP)` exchanges the staged bundle and the running one in one step, so a failure leaves the old app whole; the old bundle stays in the cache until the next launch's first check removes it. If the app is on another volume than the cache, the update is copied next to it as `.Map Browser.app.update` first. Restart to Update (the card's Restart, the menu, the command bar) goes through `request_quit`, so running downloads still ask; Cancel forgets the restart. On quit it sets `updater::RELAUNCH`, and `finish` starts `/bin/sh` to wait for this process to exit and `open` the app again. Each ad hoc–signed update is a new code identity to macOS, so the Keychain may ask again for "Chromium Safe Storage" (see [Keychain](keychain.md)); a Developer ID and notarization would avoid that and the first launch's Open Anyway.
+
+To try an update end to end on a Mac: build a bundle with `MAPBROWSER_RELEASE=1`, put it in `/Applications`, build a newer version, package it with `scripts/package.py app`, write a manifest whose `url` points at a local server (`python3 -m http.server`), sign it with a test key you build into `PUBLIC_KEY`, and launch the older copy with `MAPBROWSER_UPDATE_FEED=http://127.0.0.1:8000/latest.json`.
 
 ## Verify
 

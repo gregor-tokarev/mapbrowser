@@ -258,6 +258,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--release", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument("--target", help="Rust target triple to build for, such as x86_64-apple-darwin; the bundle goes to target/<triple>/bundle")
     parser.add_argument("--name", default="Map Browser")
     parser.add_argument("--identifier", default="dev.mapbrowser.browser")
     parser.add_argument("--sign-identity", help="Opt in with a valid installed identity's exact name or full SHA-1 fingerprint; requires --provisioning-profile")
@@ -270,9 +271,11 @@ def main():
     except SigningError as error:
         parser.error(str(error))
     if not args.skip_build:
-        run("cargo", "build", "--bins", *(["--release"] if args.release else []))
+        run("cargo", "build", "--bins", *(["--release"] if args.release else []), *(["--target", args.target] if args.target else []))
     metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version=1"], cwd=ROOT))
     target = Path(metadata["target_directory"])
+    if args.target:
+        target = target / args.target
     profile = target / ("release" if args.release else "debug")
     cef_dir = None
     outputs = sorted((profile / "build").glob("cef-dll-sys-*/output"), key=lambda p: p.stat().st_mtime, reverse=True)

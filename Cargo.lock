@@ -3466,7 +3466,7 @@ dependencies = [
 
 [[package]]
 name = "mapbrowser"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "adblock",
  "anyhow",
@@ -3477,6 +3477,8 @@ dependencies = [
  "dispatch2",
  "env_logger",
  "gpui",
+ "libc",
+ "minisign-verify",
  "objc2",
  "objc2-app-kit",
  "objc2-core-graphics",
@@ -3484,9 +3486,12 @@ dependencies = [
  "objc2-quartz-core",
  "psl",
  "raw-window-handle",
+ "semver",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "unicode-segmentation",
+ "ureq",
 ]
 
 [[package]]
@@ -3569,6 +3574,12 @@ name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
+name = "minisign-verify"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22f9645cb765ea72b8111f36c522475d2daa0d22c957a9826437e97534bc4e9e"
 
 [[package]]
 name = "miniz_oxide"
