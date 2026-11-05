@@ -87,11 +87,10 @@ pub struct Toast {
     pub kind: ToastKind,
     pub text: SharedString,
     subject: Option<Subject>,
-    /// Says how to undo what was done ("Closed 3 tabs · ⇧⌘T reopens
-    /// them"), with the batch of closed tabs it is about: the sidebar wraps
-    /// it to two lines rather than cut the hint, and it goes once they are
-    /// back.
-    undo: Option<TabId>,
+    /// The tabs closed together it offers to bring back ("Closed 3 tabs",
+    /// with Undo): the sidebar wraps it to two lines rather than cut it,
+    /// and it goes once they are back.
+    undo: Option<Undo>,
     /// A button after the text, such as Open on "Pop-up blocked".
     action: Option<ToastAction>,
     /// The text as the sidebar shows it, fitted to `.0` points.
@@ -109,10 +108,22 @@ pub struct Toast {
 /// happened on the first and its subject, cut to fit, on the second.
 type Lines = (SharedString, Option<SharedString>);
 
+/// What a toast's button does.
+type ActionFn = dyn Fn(&mut BrowserApp, &mut Window, &mut Context<BrowserApp>);
+
 /// A toast's button: its label, and what it does.
 pub struct ToastAction {
     label: SharedString,
-    run: Rc<dyn Fn(&mut BrowserApp, &mut Context<BrowserApp>)>,
+    run: Rc<ActionFn>,
+}
+
+/// What an undo toast is about.
+struct Undo {
+    /// The batch of closed tabs.
+    batch: TabId,
+    /// What the toast over the card says instead: it has no button, so it
+    /// names the key that undoes ("Closed 3 tabs · ⇧⌘T reopens them").
+    card_text: SharedString,
 }
 
 impl Toast {
@@ -312,21 +323,35 @@ impl BrowserApp {
         self.set_toast(kind, text.into(), Some(subject), duration, None, None, cx);
     }
 
-    /// Shows a ✓ toast that says how ⇧⌘T reopens the tabs closed together
-    /// as `batch`, for `UNDO_DURATION`.
-    pub fn show_undo_toast(
-        &mut self,
-        text: impl Into<SharedString>,
-        batch: TabId,
-        cx: &mut Context<Self>,
-    ) {
+    /// Shows a ✓ toast saying `count` tabs closed together as `batch`, for
+    /// `UNDO_DURATION`. In the sidebar its Undo brings them all back in one
+    /// click; over the card, which takes no clicks, it says ⇧⌘T does.
+    pub fn show_undo_toast(&mut self, count: usize, batch: TabId, cx: &mut Context<Self>) {
+        let (text, card_text) = if count == 1 {
+            (
+                "Closed 1 tab".to_owned(),
+                "Closed 1 tab · ⇧⌘T reopens it".to_owned(),
+            )
+        } else {
+            (
+                format!("Closed {count} tabs"),
+                format!("Closed {count} tabs · ⇧⌘T reopens them"),
+            )
+        };
+        let action = ToastAction {
+            label: "Undo".into(),
+            run: Rc::new(move |this, window, cx| this.undo_close(batch, window, cx)),
+        };
         self.set_toast(
             ToastKind::Done,
             text.into(),
             None,
             UNDO_DURATION,
-            Some(batch),
-            None,
+            Some(Undo {
+                batch,
+                card_text: card_text.into(),
+            }),
+            Some(action),
             cx,
         );
     }
@@ -336,7 +361,7 @@ impl BrowserApp {
         if self
             .toast
             .as_ref()
-            .is_some_and(|toast| toast.undo == Some(batch))
+            .is_some_and(|toast| toast.undo.as_ref().is_some_and(|undo| undo.batch == batch))
         {
             self.toast = None;
             cx.notify();
@@ -352,7 +377,7 @@ impl BrowserApp {
         kind: ToastKind,
         text: impl Into<SharedString>,
         label: &'static str,
-        run: impl Fn(&mut BrowserApp, &mut Context<BrowserApp>) + 'static,
+        run: impl Fn(&mut BrowserApp, &mut Window, &mut Context<BrowserApp>) + 'static,
         cx: &mut Context<Self>,
     ) {
         let action = ToastAction {
@@ -376,7 +401,7 @@ impl BrowserApp {
         text: SharedString,
         subject: Option<Subject>,
         duration: Duration,
-        undo: Option<TabId>,
+        undo: Option<Undo>,
         action: Option<ToastAction>,
         cx: &mut Context<Self>,
     ) {
@@ -502,7 +527,7 @@ impl BrowserApp {
                                 .hover(move |style| style.bg(control_hover))
                                 .child(action.label.clone()),
                         )
-                        .on_click(cx.listener(move |this, _, _, cx| run(this, cx))),
+                        .on_click(cx.listener(move |this, _, window, cx| run(this, window, cx))),
                     )
                 })
         });
@@ -615,9 +640,13 @@ impl BrowserApp {
             .and_then(|switch| self.state.tab(switch.target()))
             .map(|tab| (ToastKind::Info, tab.shown_title().to_owned().into(), None));
         walk.or_else(|| {
-            self.toast
-                .as_ref()
-                .map(|toast| (toast.kind, toast.text.clone(), toast.subject.clone()))
+            self.toast.as_ref().map(|toast| {
+                let text = toast
+                    .undo
+                    .as_ref()
+                    .map_or(&toast.text, |undo| &undo.card_text);
+                (toast.kind, text.clone(), toast.subject.clone())
+            })
         })
         .or_else(|| self.save_notice())
         .or_else(|| {

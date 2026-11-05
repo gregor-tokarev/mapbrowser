@@ -6,7 +6,9 @@ use crate::{
     favicons::{FaviconStore, host_of},
     history::{self, History},
     input::{InputEvent, InputStyle, TextInput},
-    model::{self, BrowserState, Pin, Recovery, SearchEngine, Space, SpaceId, Tab, TabId},
+    model::{
+        self, BrowserState, ClosedTab, Pin, Recovery, SearchEngine, Space, SpaceId, Tab, TabId,
+    },
     native,
     recent::{RecentTabs, TabSwitch},
     ui::{
@@ -950,17 +952,37 @@ impl BrowserApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut closed = match index {
+        let closed = match index {
             Some(index) => self.state.take_closed(Some(index)).into_iter().collect(),
             None => self.state.take_last_closed(),
         };
+        self.reopen_tabs(closed, index.is_none(), window, cx);
+    }
+
+    /// Undo on the toast after Clear, Close Other Tabs or Close Tabs Below:
+    /// reopens every tab closed as `batch`, as ⇧⌘T would, even if other
+    /// tabs closed since.
+    pub fn undo_close(&mut self, batch: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let closed = self.state.take_batch(batch);
+        self.reopen_tabs(closed, true, window, cx);
+    }
+
+    /// Puts `closed` back and selects one of them; with `undo`, a batch
+    /// among them is undone as a whole, as `reopen_closed` says.
+    fn reopen_tabs(
+        &mut self,
+        mut closed: Vec<ClosedTab>,
+        undo: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Top to bottom: each one's old place counts the ones above it.
         closed.sort_by_key(|closed| closed.index);
         let Some((space_id, batch)) = closed.first().map(|closed| (closed.space_id, closed.batch))
         else {
             return;
         };
-        let undo = batch.filter(|_| index.is_none());
+        let undo = batch.filter(|_| undo);
         if let Some(batch) = undo {
             self.dismiss_undo_toast(batch, cx);
         }
@@ -1036,7 +1058,7 @@ impl BrowserApp {
     }
 
     /// Tabs that closed together, each with its place in Today: their pages
-    /// go, and one ⇧⌘T brings them all back, as a toast says, with the
+    /// go, and the toast's Undo or one ⇧⌘T brings them all back, with the
     /// tab that was `selected` before if it was among them.
     fn closed_together(
         &mut self,
@@ -1062,12 +1084,7 @@ impl BrowserApp {
             self.error = None;
             self.show_selected();
         }
-        let toast = if count == 1 {
-            "Closed 1 tab · ⇧⌘T reopens it".to_owned()
-        } else {
-            format!("Closed {count} tabs · ⇧⌘T reopens them")
-        };
-        self.show_undo_toast(toast, batch, cx);
+        self.show_undo_toast(count, batch, cx);
         self.persist_later(cx);
         cx.notify();
     }

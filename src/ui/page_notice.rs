@@ -1127,7 +1127,7 @@ impl BrowserApp {
                 ToastKind::Info,
                 "Pop-up blocked",
                 "Open",
-                move |this, cx| this.open_blocked_popup(tab_id, cx),
+                move |this, _, cx| this.open_blocked_popup(tab_id, cx),
                 cx,
             );
         } else {

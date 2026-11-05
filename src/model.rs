@@ -1229,6 +1229,16 @@ impl BrowserState {
         self.closed.split_off(start)
     }
 
+    /// Takes every tab closed together as `batch` off the list, the most
+    /// recent last; none once they are back.
+    pub fn take_batch(&mut self, batch: TabId) -> Vec<ClosedTab> {
+        let (taken, kept) = std::mem::take(&mut self.closed)
+            .into_iter()
+            .partition(|closed| closed.batch == Some(batch));
+        self.closed = kept;
+        taken
+    }
+
     /// Puts a closed tab back in its space under a new id: in its section,
     /// at its old place there (or as near as the section allows), else where
     /// new tabs of that section go. The selection stays unless the space
